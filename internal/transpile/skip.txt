@@ -1,0 +1,43 @@
+# Patterns of quakeforge .c files NOT to feed to ccgo.
+# One ERE pattern per line. Lines starting with '#' or empty are ignored.
+# Tested with `grep -vEf skip.txt` against the candidate file list.
+#
+# Categories:
+#
+# 1) Renderers other than the software renderer
+#    (Q-1a targets soft only; GL waits for Q-1b)
+^libs/video/renderer/gl/
+^libs/video/renderer/glsl/
+^libs/video/renderer/vulkan/
+
+# 2) Windowing / input backends pulled in via SDL / X11 / Wayland
+#    (we replace with virtio-input + framebuffer scanout)
+^libs/video/targets/.*sdl
+^libs/video/targets/x11
+^libs/video/targets/wayland
+^libs/video/targets/win32
+^libs/input/in_sdl
+^libs/input/in_x11
+^libs/input/in_win
+
+# 3) Audio backends (we replace with virtio-sound)
+^libs/audio/targets/snd_(alsa|jack|oss|pulse|sdl|win|wasapi|sgi|sun)
+
+# 4) CD audio (deprecated category, not in scope)
+^libs/audio/targets/cd_
+
+# 5) Tools and applications outside the engine
+#    (we want libqfcc / qfvis / etc. as host-side tools only, not in-VM)
+^tools/
+
+# 6) Test mains that conflict with our own main()
+.*_test\.c$
+.*main\.c$
+
+# 7) Hot loops with x86 asm fallback files
+#    (ccgo generates the C fallback from the same source; .asm is skipped automatically)
+_x86\.
+
+# 8) Anything with a known-broken include chain on a Linux build that needs
+#    additional preprocessing -- patterns added here as the run.sh driver
+#    discovers them. Empty for now.

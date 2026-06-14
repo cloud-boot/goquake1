@@ -1,0 +1,25 @@
+# Build artifacts
+*.elf
+*.efi
+*.o
+*.go.gen
+engine/*.go
+!engine/.gitkeep
+
+# Local oracle harvest scratch dirs
+oracle/scratch/
+internal/livedoomboot/*.serial
+internal/livedoomboot/*.wav
+internal/livedoomboot/*.ppm
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Go test/coverage
+*.test
+*.out
+coverage.txt
