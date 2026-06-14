@@ -20,6 +20,13 @@
 
 set -euo pipefail
 
+# Make standard Go install locations visible without relying on the caller's
+# profile (non-interactive ssh sessions don't source ~/.profile etc.).
+for d in /usr/local/go/bin "$HOME/go/bin" /root/go/bin; do
+    [[ -d "$d" && ":$PATH:" != *":$d:"* ]] && PATH="$d:$PATH"
+done
+export PATH
+
 REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 QF_REF="${QF_REF:-master}"        # quakeforge git ref to transpile
 WORK="${WORK:-/tmp/goquake1-transpile}"
@@ -29,8 +36,26 @@ TR_DIR="$REPO_DIR/internal/transpile"
 
 mkdir -p "$WORK" "$ENGINE_DIR"
 
-# 1) prereqs
-for cmd in go ccgo gcc autoconf automake libtool make git; do
+# 1) prereqs. quakeforge master requires C23 #embed; gcc-14 lacks it but
+# clang-19 has it. Prefer an explicitly-set CC if the operator passed one,
+# otherwise probe for a #embed-capable compiler.
+if [[ -z "${CC:-}" ]]; then
+    for try in clang-19 clang-20 gcc-15; do
+        if command -v "$try" >/dev/null 2>&1; then
+            CC="$try"
+            break
+        fi
+    done
+    if [[ -z "${CC:-}" ]]; then
+        echo "no #embed-capable compiler found (need clang-19+, gcc-15+)" >&2
+        echo "install: sudo apt-get install -y clang-19" >&2
+        exit 1
+    fi
+fi
+export CC
+echo "[transpile] using CC=$CC" >&2
+
+for cmd in go ccgo "$CC" autoconf automake libtool make git; do
     command -v "$cmd" >/dev/null 2>&1 \
         || { echo "missing prerequisite: $cmd" >&2; exit 1; }
 done
@@ -51,25 +76,37 @@ if [[ ! -f "$QF_DIR/config.h" ]]; then
     # --with-clients=fbdev = framebuffer client only (closest analog to our
     # virtio-gpu scanout target; replaces the X11/SDL clients).
     # --with-servers="nq qw" = listenserver only (no dedicated host needed).
+    #
+    # NOTE on --disable-X flags: quakeforge's m4/quakeforge.m4 QF_REQUIRES
+    # macro on *linux* unconditionally REQUIRES libflac-dev / libogg-dev /
+    # libvorbis-dev / libxext-dev / libxxf86vm-dev / libvulkan-dev to be
+    # present AND detected; passing --disable-flac skips the AC detection,
+    # leaves HAVE_FLAC unset, then QF_REQUIRES fails the build. So we let
+    # configure detect them all (the apt-get prerequisite list in the
+    # Dockerfile installs them), and rely on skip.txt to keep the
+    # corresponding .c files out of ccgo. The transpiled engine never sees
+    # them.
     ( cd "$QF_DIR" && ./configure \
         --enable-static --disable-shared \
         --disable-asmopt \
-        --without-x --disable-vidmode --disable-vulkan \
         --with-clients=fbdev \
         --with-servers="nq qw" \
         --without-libcurl \
-        --disable-flac --disable-vorbis --disable-wildmidi \
         >&2 ) \
         || { echo "quakeforge configure failed" >&2; exit 2; }
 fi
 
 # 4) candidate .c file list = every .c under nq/, libs/, ruamoko/ that is
-#    NOT matched by skip.txt
+#    NOT matched by skip.txt. Strip comments + blank lines from skip.txt
+#    to a tempfile first -- an empty pattern in `grep -vEf` matches every
+#    line and would silently exclude the entire candidate set.
+SKIP_TMP="$WORK/skip.clean"
+grep -vE '^\s*(#|$)' "$TR_DIR/skip.txt" > "$SKIP_TMP"
 echo "[transpile] enumerating candidate .c files" >&2
 (
     cd "$QF_DIR"
     find nq libs ruamoko -name '*.c' -type f 2>/dev/null
-) | grep -vEf "$TR_DIR/skip.txt" | sort > "$TR_DIR/sources.txt"
+) | grep -vEf "$SKIP_TMP" | sort > "$TR_DIR/sources.txt"
 N=$(wc -l < "$TR_DIR/sources.txt")
 echo "[transpile] feeding ccgo $N .c files" >&2
 
