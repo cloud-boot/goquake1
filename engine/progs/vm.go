@@ -24,6 +24,7 @@ import (
 // not ported yet.
 type VM struct {
 	progs    *Progs
+	arena    *EdictArena    // edict pool, optional; required for LOAD_* / STORE_P_* / ADDRESS
 	globals  []byte         // writable copy of progs.Globals
 	stack    []frame        // return-frame stack
 	xFunc    int32          // currently-executing function index
@@ -35,6 +36,12 @@ type VM struct {
 	// follow-up CALL port.
 	argc int
 }
+
+// SetArena wires an EdictArena into the VM so the LOAD_*, STORE_P_*,
+// and ADDRESS opcodes can resolve entity pointers. The arena must
+// have been built from the same Progs (or another Progs with the
+// same EntityFields layout) -- the VM does not verify this.
+func (vm *VM) SetArena(a *EdictArena) { vm.arena = a }
 
 // MaxStackDepth caps the EnterFunction stack -- tyrquake's
 // MAX_STACK_DEPTH.
@@ -73,6 +80,7 @@ var (
 	ErrBadStatement     = errors.New("progs: VM: statement index out of range")
 	ErrGlobalOffset     = errors.New("progs: VM: global-pool offset out of range")
 	ErrDivByZero        = errors.New("progs: VM: division by zero")
+	ErrNoArena          = errors.New("progs: VM: entity-pointer opcode but no arena attached (call SetArena)")
 )
 
 // NewVM returns an interpreter ready to Run functions in p. The VM
@@ -385,13 +393,89 @@ func (vm *VM) execOne(st Statement, exitDepth int) (bool, error) {
 		}
 		return vm.depth == exitDepth, nil
 
+	// --- entity-pointer ops (need an arena attached via SetArena) -----------
+
+	case OP_ADDRESS:
+		if vm.arena == nil {
+			return false, ErrNoArena
+		}
+		edPtr, _ := vm.GlobalInt(int(uint16(st.A)))
+		slotOfs, _ := vm.GlobalInt(int(uint16(st.B)))
+		ed, _, err := vm.arena.ResolvePointer(edPtr)
+		if err != nil {
+			return false, err
+		}
+		idx := vm.arena.NumFor(ed)
+		// Result is the byte offset to (edict origin) + (slotOfs * 4).
+		out := vm.arena.MakePointer(idx, int(slotOfs))
+		return false, vm.SetGlobalInt(int(uint16(st.C)), out)
+
+	case OP_LOAD_F, OP_LOAD_FLD, OP_LOAD_ENT, OP_LOAD_S, OP_LOAD_FNC:
+		if vm.arena == nil {
+			return false, ErrNoArena
+		}
+		edPtr, _ := vm.GlobalInt(int(uint16(st.A)))
+		slotOfs, _ := vm.GlobalInt(int(uint16(st.B)))
+		ed, _, err := vm.arena.ResolvePointer(edPtr)
+		if err != nil {
+			return false, err
+		}
+		v, err := ed.FieldInt(int(slotOfs))
+		if err != nil {
+			return false, err
+		}
+		return false, vm.SetGlobalInt(int(uint16(st.C)), v)
+
+	case OP_LOAD_V:
+		if vm.arena == nil {
+			return false, ErrNoArena
+		}
+		edPtr, _ := vm.GlobalInt(int(uint16(st.A)))
+		slotOfs, _ := vm.GlobalInt(int(uint16(st.B)))
+		ed, _, err := vm.arena.ResolvePointer(edPtr)
+		if err != nil {
+			return false, err
+		}
+		v, err := ed.FieldVector(int(slotOfs))
+		if err != nil {
+			return false, err
+		}
+		return false, vm.SetGlobalVector(int(uint16(st.C)), v)
+
+	case OP_STOREP_F, OP_STOREP_S, OP_STOREP_ENT, OP_STOREP_FLD, OP_STOREP_FNC:
+		if vm.arena == nil {
+			return false, ErrNoArena
+		}
+		v, _ := vm.GlobalInt(int(uint16(st.A)))
+		ptr, _ := vm.GlobalInt(int(uint16(st.B)))
+		ed, fieldByteOfs, err := vm.arena.ResolvePointer(ptr)
+		if err != nil {
+			return false, err
+		}
+		if fieldByteOfs%globalSlotSize != 0 {
+			return false, ErrFieldOffset
+		}
+		return false, ed.FieldSetInt(fieldByteOfs/globalSlotSize, v)
+
+	case OP_STOREP_V:
+		if vm.arena == nil {
+			return false, ErrNoArena
+		}
+		v, _ := vm.GlobalVector(int(uint16(st.A)))
+		ptr, _ := vm.GlobalInt(int(uint16(st.B)))
+		ed, fieldByteOfs, err := vm.arena.ResolvePointer(ptr)
+		if err != nil {
+			return false, err
+		}
+		if fieldByteOfs%globalSlotSize != 0 {
+			return false, ErrFieldOffset
+		}
+		return false, ed.FieldSetVector(fieldByteOfs/globalSlotSize, v)
+
 	// --- not yet ported ------------------------------------------------------
 	//
 	// OP_CALL0..OP_CALL8        -- need engine/progs/builtins
 	// OP_STATE                  -- need sv.time + frame think dispatch
-	// OP_LOAD_*                 -- need byte-offset edict resolver
-	// OP_STORE_P_*              -- same
-	// OP_ADDRESS                -- same
 
 	default:
 		return false, fmt.Errorf("%w: %d", ErrUnsupportedOp, st.Op)

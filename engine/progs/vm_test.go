@@ -606,6 +606,264 @@ func TestRun_PropagatesReturnError(t *testing.T) {
 	}
 }
 
+// --- arena resolver tests (edict.go FieldBytes / MakePointer / ResolvePointer / PointerForEdict)
+
+func TestArena_PointerRoundTrip(t *testing.T) {
+	p := progsForVM(nil)
+	a := NewEdictArena(p, 4)
+	a.Reset()
+	if a.FieldBytes() != int(p.Header.EntityFields)*4 {
+		t.Errorf("FieldBytes: %d", a.FieldBytes())
+	}
+	// Edict 2, slot 5 -> pointer -> resolve back.
+	ptr := a.MakePointer(2, 5)
+	ed, off, err := a.ResolvePointer(ptr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ed != &a.edicts[2] {
+		t.Errorf("ResolvePointer: wrong edict")
+	}
+	if off != 5*4 {
+		t.Errorf("ResolvePointer offset: got %d want %d", off, 5*4)
+	}
+}
+
+func TestArena_PointerForEdict(t *testing.T) {
+	p := progsForVM(nil)
+	a := NewEdictArena(p, 4)
+	if a.PointerForEdict(&a.edicts[1]) != int32(a.FieldBytes()) {
+		t.Errorf("PointerForEdict(e1)")
+	}
+	if a.PointerForEdict(&Edict{}) != -1 {
+		t.Errorf("foreign edict should return -1")
+	}
+}
+
+func TestArena_ResolvePointer_OutOfRange(t *testing.T) {
+	p := progsForVM(nil)
+	a := NewEdictArena(p, 2)
+	if _, _, err := a.ResolvePointer(-1); !errors.Is(err, ErrEdictIndex) {
+		t.Error("negative ptr should fail")
+	}
+	if _, _, err := a.ResolvePointer(int32(a.FieldBytes() * 100)); !errors.Is(err, ErrEdictIndex) {
+		t.Error("ptr past arena should fail")
+	}
+}
+
+func TestArena_ResolvePointer_ZeroFieldBytes(t *testing.T) {
+	// EntityFields=0 makes FieldBytes=0; ResolvePointer must
+	// refuse rather than divide by zero.
+	p := &Progs{Header: Header{EntityFields: 0}, Globals: make([]byte, 4)}
+	a := NewEdictArena(p, 2)
+	if _, _, err := a.ResolvePointer(0); !errors.Is(err, ErrEdictIndex) {
+		t.Errorf("got %v want ErrEdictIndex on zero fieldbytes", err)
+	}
+}
+
+// --- VM with arena: LOAD_F, LOAD_V, STOREP_F, STOREP_V, ADDRESS -----------
+
+func vmWithArena(stmts []Statement) (*VM, *EdictArena) {
+	p := progsForVM(stmts)
+	a := NewEdictArena(p, 4)
+	a.Reset()
+	vm := NewVM(p)
+	vm.SetArena(a)
+	return vm, a
+}
+
+func TestRun_LOAD_F(t *testing.T) {
+	vm, a := vmWithArena(withStatements(Statement{Op: OP_LOAD_F, A: 10, B: 11, C: 12}))
+	// Pre-fill edict 1, field slot 2 = 99.5
+	e1, _ := a.Get(1)
+	_ = e1.FieldSetFloat(2, 99.5)
+	// Global 10 = pointer to edict 1; global 11 = field slot 2.
+	_ = vm.SetGlobalInt(10, a.PointerForEdict(e1))
+	_ = vm.SetGlobalInt(11, 2)
+	if err := vm.Run(1); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := vm.GlobalFloat(12); v != 99.5 {
+		t.Errorf("LOAD_F: got %v want 99.5", v)
+	}
+}
+
+func TestRun_LOAD_V(t *testing.T) {
+	vm, a := vmWithArena(withStatements(Statement{Op: OP_LOAD_V, A: 10, B: 11, C: 30}))
+	e1, _ := a.Get(1)
+	want := [3]float32{1, 2, 3}
+	_ = e1.FieldSetVector(4, want)
+	_ = vm.SetGlobalInt(10, a.PointerForEdict(e1))
+	_ = vm.SetGlobalInt(11, 4)
+	if err := vm.Run(1); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := vm.GlobalVector(30); v != want {
+		t.Errorf("LOAD_V: %v want %v", v, want)
+	}
+}
+
+func TestRun_STOREP_F(t *testing.T) {
+	vm, a := vmWithArena(withStatements(Statement{Op: OP_STOREP_F, A: 10, B: 11}))
+	e2, _ := a.Get(2)
+	_ = vm.SetGlobalFloat(10, 42)
+	_ = vm.SetGlobalInt(11, a.MakePointer(2, 5))
+	if err := vm.Run(1); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := e2.FieldFloat(5); v != 42 {
+		t.Errorf("STOREP_F: %v want 42", v)
+	}
+}
+
+func TestRun_STOREP_V(t *testing.T) {
+	vm, a := vmWithArena(withStatements(Statement{Op: OP_STOREP_V, A: 30, B: 11}))
+	e2, _ := a.Get(2)
+	want := [3]float32{7, 8, 9}
+	_ = vm.SetGlobalVector(30, want)
+	_ = vm.SetGlobalInt(11, a.MakePointer(2, 4))
+	if err := vm.Run(1); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := e2.FieldVector(4); v != want {
+		t.Errorf("STOREP_V: %v", v)
+	}
+}
+
+func TestRun_ADDRESS(t *testing.T) {
+	vm, a := vmWithArena(withStatements(Statement{Op: OP_ADDRESS, A: 10, B: 11, C: 12}))
+	e3, _ := a.Get(3)
+	_ = vm.SetGlobalInt(10, a.PointerForEdict(e3))
+	_ = vm.SetGlobalInt(11, 7) // slot 7 within e3
+	if err := vm.Run(1); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := vm.GlobalInt(12)
+	want := a.MakePointer(3, 7)
+	if got != want {
+		t.Errorf("ADDRESS: got %d want %d", got, want)
+	}
+}
+
+// --- error paths for arena-coupled opcodes --------------------------------
+
+func TestRun_LOAD_F_NoArena(t *testing.T) {
+	p := progsForVM(withStatements(Statement{Op: OP_LOAD_F, A: 10, B: 11, C: 12}))
+	vm := NewVM(p)
+	if err := vm.Run(1); !errors.Is(err, ErrNoArena) {
+		t.Errorf("got %v want ErrNoArena", err)
+	}
+}
+
+func TestRun_LOAD_V_NoArena(t *testing.T) {
+	p := progsForVM(withStatements(Statement{Op: OP_LOAD_V, A: 10, B: 11, C: 30}))
+	vm := NewVM(p)
+	if err := vm.Run(1); !errors.Is(err, ErrNoArena) {
+		t.Errorf("got %v want ErrNoArena", err)
+	}
+}
+
+func TestRun_STOREP_F_NoArena(t *testing.T) {
+	p := progsForVM(withStatements(Statement{Op: OP_STOREP_F, A: 10, B: 11}))
+	vm := NewVM(p)
+	if err := vm.Run(1); !errors.Is(err, ErrNoArena) {
+		t.Errorf("got %v want ErrNoArena", err)
+	}
+}
+
+func TestRun_STOREP_V_NoArena(t *testing.T) {
+	p := progsForVM(withStatements(Statement{Op: OP_STOREP_V, A: 30, B: 11}))
+	vm := NewVM(p)
+	if err := vm.Run(1); !errors.Is(err, ErrNoArena) {
+		t.Errorf("got %v want ErrNoArena", err)
+	}
+}
+
+func TestRun_ADDRESS_NoArena(t *testing.T) {
+	p := progsForVM(withStatements(Statement{Op: OP_ADDRESS, A: 10, B: 11, C: 12}))
+	vm := NewVM(p)
+	if err := vm.Run(1); !errors.Is(err, ErrNoArena) {
+		t.Errorf("got %v want ErrNoArena", err)
+	}
+}
+
+func TestRun_LOAD_F_BadPointer(t *testing.T) {
+	vm, _ := vmWithArena(withStatements(Statement{Op: OP_LOAD_F, A: 10, B: 11, C: 12}))
+	_ = vm.SetGlobalInt(10, -1) // negative -> ResolvePointer fails
+	if err := vm.Run(1); !errors.Is(err, ErrEdictIndex) {
+		t.Errorf("got %v want ErrEdictIndex", err)
+	}
+}
+
+func TestRun_LOAD_V_BadPointer(t *testing.T) {
+	vm, _ := vmWithArena(withStatements(Statement{Op: OP_LOAD_V, A: 10, B: 11, C: 30}))
+	_ = vm.SetGlobalInt(10, -1)
+	if err := vm.Run(1); !errors.Is(err, ErrEdictIndex) {
+		t.Errorf("got %v want ErrEdictIndex", err)
+	}
+}
+
+func TestRun_LOAD_F_BadFieldOffset(t *testing.T) {
+	vm, a := vmWithArena(withStatements(Statement{Op: OP_LOAD_F, A: 10, B: 11, C: 12}))
+	e1, _ := a.Get(1)
+	_ = vm.SetGlobalInt(10, a.PointerForEdict(e1))
+	_ = vm.SetGlobalInt(11, 1<<20) // slot far past field block
+	if err := vm.Run(1); !errors.Is(err, ErrFieldOffset) {
+		t.Errorf("got %v want ErrFieldOffset", err)
+	}
+}
+
+func TestRun_LOAD_V_BadFieldOffset(t *testing.T) {
+	vm, a := vmWithArena(withStatements(Statement{Op: OP_LOAD_V, A: 10, B: 11, C: 30}))
+	e1, _ := a.Get(1)
+	_ = vm.SetGlobalInt(10, a.PointerForEdict(e1))
+	_ = vm.SetGlobalInt(11, 1<<20)
+	if err := vm.Run(1); !errors.Is(err, ErrFieldOffset) {
+		t.Errorf("got %v want ErrFieldOffset", err)
+	}
+}
+
+func TestRun_STOREP_F_BadPointer(t *testing.T) {
+	vm, _ := vmWithArena(withStatements(Statement{Op: OP_STOREP_F, A: 10, B: 11}))
+	_ = vm.SetGlobalInt(11, -1)
+	if err := vm.Run(1); !errors.Is(err, ErrEdictIndex) {
+		t.Errorf("got %v want ErrEdictIndex", err)
+	}
+}
+
+func TestRun_STOREP_V_BadPointer(t *testing.T) {
+	vm, _ := vmWithArena(withStatements(Statement{Op: OP_STOREP_V, A: 30, B: 11}))
+	_ = vm.SetGlobalInt(11, -1)
+	if err := vm.Run(1); !errors.Is(err, ErrEdictIndex) {
+		t.Errorf("got %v want ErrEdictIndex", err)
+	}
+}
+
+func TestRun_STOREP_F_MisalignedFieldOfs(t *testing.T) {
+	vm, a := vmWithArena(withStatements(Statement{Op: OP_STOREP_F, A: 10, B: 11}))
+	// Make a pointer that lands one byte into a field (not a 4-byte slot boundary).
+	_ = vm.SetGlobalInt(11, a.MakePointer(1, 0)+1)
+	if err := vm.Run(1); !errors.Is(err, ErrFieldOffset) {
+		t.Errorf("got %v want ErrFieldOffset", err)
+	}
+}
+
+func TestRun_STOREP_V_MisalignedFieldOfs(t *testing.T) {
+	vm, a := vmWithArena(withStatements(Statement{Op: OP_STOREP_V, A: 30, B: 11}))
+	_ = vm.SetGlobalInt(11, a.MakePointer(1, 0)+1)
+	if err := vm.Run(1); !errors.Is(err, ErrFieldOffset) {
+		t.Errorf("got %v want ErrFieldOffset", err)
+	}
+}
+
+func TestRun_ADDRESS_BadPointer(t *testing.T) {
+	vm, _ := vmWithArena(withStatements(Statement{Op: OP_ADDRESS, A: 10, B: 11, C: 12}))
+	_ = vm.SetGlobalInt(10, -1)
+	if err := vm.Run(1); !errors.Is(err, ErrEdictIndex) {
+		t.Errorf("got %v want ErrEdictIndex", err)
+	}
+}
+
 // --- expose XFunction/XStatement/Depth/Globals accessors -------------------
 
 func TestVM_Accessors(t *testing.T) {

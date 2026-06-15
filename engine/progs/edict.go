@@ -201,6 +201,51 @@ func (a *EdictArena) clearFields(e *Edict) {
 	}
 }
 
+// FieldBytes returns the per-edict field-block size in bytes (=
+// Progs.Header.EntityFields * 4). The VM uses it to convert between
+// edict pointers (stored in QuakeC global slots as int32 byte
+// offsets relative to the start of the edict array) and (edict
+// index, field offset) pairs.
+func (a *EdictArena) FieldBytes() int { return int(a.progs.Header.EntityFields) * globalSlotSize }
+
+// MakePointer encodes an (edict index, field slot offset) pair as
+// the int32 byte offset the QuakeC OP_ADDRESS opcode writes into
+// the global pool. fieldSlotOfs is in 4-byte slots, not bytes.
+func (a *EdictArena) MakePointer(edictIdx int, fieldSlotOfs int) int32 {
+	return int32(edictIdx*a.FieldBytes() + fieldSlotOfs*globalSlotSize)
+}
+
+// ResolvePointer is the inverse of MakePointer. Returns the
+// addressed Edict plus the byte offset within its Fields slice the
+// pointer denotes. Errors when the pointer would land outside the
+// arena.
+func (a *EdictArena) ResolvePointer(byteOfs int32) (*Edict, int, error) {
+	if byteOfs < 0 {
+		return nil, 0, ErrEdictIndex
+	}
+	fb := a.FieldBytes()
+	if fb <= 0 {
+		return nil, 0, ErrEdictIndex
+	}
+	idx := int(byteOfs) / fb
+	off := int(byteOfs) % fb
+	if idx < 0 || idx >= len(a.edicts) {
+		return nil, 0, ErrEdictIndex
+	}
+	return &a.edicts[idx], off, nil
+}
+
+// PointerForEdict returns the QuakeC pointer (byte offset) that
+// addresses the START of e's field block (= MakePointer(NumFor(e),
+// 0)). Returns -1 when e is not in this arena.
+func (a *EdictArena) PointerForEdict(e *Edict) int32 {
+	idx := a.NumFor(e)
+	if idx < 0 {
+		return -1
+	}
+	return a.MakePointer(idx, 0)
+}
+
 // --- typed field accessors ---------------------------------------------------
 
 // FieldFloat reads the field at the byte offset (ofs * 4 bytes from
