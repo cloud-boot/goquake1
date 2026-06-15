@@ -447,9 +447,103 @@ func TestRun_StatementOutOfRange(t *testing.T) {
 	}
 }
 
-func TestRun_UnsupportedOpcode(t *testing.T) {
-	// OP_STATE is not implemented in this slice (needs sv.time + frame think dispatch).
+// --- OP_STATE -----------------------------------------------------------
+
+func TestRun_STATE_NoArena(t *testing.T) {
 	p := progsForVM(withStatements(Statement{Op: OP_STATE, A: 10, B: 11}))
+	vm := NewVM(p)
+	if err := vm.Run(1); !errors.Is(err, ErrNoArena) {
+		t.Errorf("got %v want ErrNoArena", err)
+	}
+}
+
+func TestRun_STATE_NoHooks(t *testing.T) {
+	vm, _ := vmWithArena(withStatements(Statement{Op: OP_STATE, A: 10, B: 11}))
+	// arena set, but hooks + field offsets not.
+	if err := vm.Run(1); !errors.Is(err, ErrNoStateHooks) {
+		t.Errorf("got %v want ErrNoStateHooks", err)
+	}
+}
+
+func TestRun_STATE_HooksPartial(t *testing.T) {
+	// timeSource + selfEdict set but not field offsets -> still
+	// ErrNoStateHooks.
+	vm, _ := vmWithArena(withStatements(Statement{Op: OP_STATE, A: 10, B: 11}))
+	vm.SetStateHooks(func() float32 { return 0 }, func() int32 { return 0 })
+	if err := vm.Run(1); !errors.Is(err, ErrNoStateHooks) {
+		t.Errorf("got %v want ErrNoStateHooks", err)
+	}
+}
+
+func TestRun_STATE_HappyPath(t *testing.T) {
+	vm, a := vmWithArena(withStatements(Statement{Op: OP_STATE, A: 10, B: 11}))
+	selfE, _ := a.Get(1)
+	// Hooks: server time = 5.0, self = edict 1.
+	vm.SetStateHooks(
+		func() float32 { return 5.0 },
+		func() int32 { return a.PointerForEdict(selfE) },
+	)
+	// Field offsets within the entity field block (in slots).
+	vm.SetStateFieldOffsets(0 /*nextthink*/, 1 /*frame*/, 2 /*think*/)
+	// Globals: A=10 holds the new frame number; B=11 holds the new think function index.
+	_ = vm.SetGlobalFloat(10, 23) // new frame
+	_ = vm.SetGlobalInt(11, 99)   // new think func index
+	if err := vm.Run(1); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := selfE.FieldFloat(0); v != 5.1 { // sv.time + 0.1
+		t.Errorf("nextthink: got %v want 5.1", v)
+	}
+	if v, _ := selfE.FieldFloat(1); v != 23 {
+		t.Errorf("frame: got %v want 23", v)
+	}
+	if v, _ := selfE.FieldInt(2); v != 99 {
+		t.Errorf("think: got %v want 99", v)
+	}
+}
+
+func TestRun_STATE_BadSelfPointer(t *testing.T) {
+	vm, _ := vmWithArena(withStatements(Statement{Op: OP_STATE, A: 10, B: 11}))
+	vm.SetStateHooks(
+		func() float32 { return 0 },
+		func() int32 { return -1 }, // bad self pointer
+	)
+	vm.SetStateFieldOffsets(0, 1, 2)
+	if err := vm.Run(1); !errors.Is(err, ErrEdictIndex) {
+		t.Errorf("got %v want ErrEdictIndex", err)
+	}
+}
+
+func TestRun_STATE_BadFieldOffset(t *testing.T) {
+	// Field offsets that point past the edict field block surface as
+	// ErrFieldOffset from each Field* call.
+	tests := []struct {
+		name    string
+		nextThink, frame, think int
+	}{
+		{"nextthink-far", 1 << 20, 0, 0},
+		{"frame-far", 0, 1 << 20, 0},
+		{"think-far", 0, 0, 1 << 20},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			vm, a := vmWithArena(withStatements(Statement{Op: OP_STATE, A: 10, B: 11}))
+			selfE, _ := a.Get(1)
+			vm.SetStateHooks(
+				func() float32 { return 0 },
+				func() int32 { return a.PointerForEdict(selfE) },
+			)
+			vm.SetStateFieldOffsets(tc.nextThink, tc.frame, tc.think)
+			if err := vm.Run(1); !errors.Is(err, ErrFieldOffset) {
+				t.Errorf("got %v want ErrFieldOffset", err)
+			}
+		})
+	}
+}
+
+func TestRun_UnsupportedOpcode(t *testing.T) {
+	// Synthesise an opcode value past every implemented case.
+	p := progsForVM(withStatements(Statement{Op: Op(9999), A: 10, B: 11}))
 	vm := NewVM(p)
 	if err := vm.Run(1); !errors.Is(err, ErrUnsupportedOp) {
 		t.Errorf("got %v want ErrUnsupportedOp", err)

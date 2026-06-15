@@ -38,6 +38,20 @@ type VM struct {
 	// builtins is the registry the OP_CALLn opcode dispatches into
 	// when the callee's first_statement is negative.
 	builtins map[int]Builtin
+
+	// stateHooks are the two server callbacks OP_STATE needs.
+	timeSource func() float32 // returns sv.time
+	selfEdict  func() int32   // returns pr_global_struct->self (an edict pointer)
+
+	// stateField{NextThink,Frame,Think} are the field-slot offsets
+	// OP_STATE writes into the self edict. Set via
+	// SetStateFieldOffsets so the upstream's hard-coded entvars_t
+	// layout becomes a per-Progs lookup the embedder does once at
+	// init time.
+	stateFieldNextThink int
+	stateFieldFrame     int
+	stateFieldThink     int
+	stateFieldsSet      bool
 }
 
 // SetArena wires an EdictArena into the VM so the LOAD_*, STORE_P_*,
@@ -72,6 +86,30 @@ func (vm *VM) RegisterBuiltin(idx int, fn Builtin) {
 // builtin was called with (= the n in OP_CALLn). The builtin reads
 // each argument from OfsParm0 + i*3.
 func (vm *VM) Argc() int { return vm.argc }
+
+// SetStateHooks wires the OP_STATE callbacks. timeSource returns
+// the current server tic (the upstream's sv.time); selfEdict
+// returns the QuakeC pointer to the "self" entity (the
+// pr_global_struct->self value). Both MUST be set before any
+// progs.dat code can execute OP_STATE; the absence of either
+// surfaces as ErrNoStateHooks at dispatch time.
+func (vm *VM) SetStateHooks(timeSource func() float32, selfEdict func() int32) {
+	vm.timeSource = timeSource
+	vm.selfEdict = selfEdict
+}
+
+// SetStateFieldOffsets tells the VM which entvars_t fields OP_STATE
+// updates on the self edict: nextthink (float, scheduled think tic),
+// frame (float, current animation frame), think (function, the next
+// callback). The embedder typically looks these up once via
+// (*Progs).FindField("nextthink") etc. and passes the .Ofs values
+// here. Without a call, OP_STATE surfaces ErrNoStateHooks.
+func (vm *VM) SetStateFieldOffsets(nextThink, frame, think int) {
+	vm.stateFieldNextThink = nextThink
+	vm.stateFieldFrame = frame
+	vm.stateFieldThink = think
+	vm.stateFieldsSet = true
+}
 
 // MaxStackDepth caps the EnterFunction stack -- tyrquake's
 // MAX_STACK_DEPTH.
@@ -113,6 +151,7 @@ var (
 	ErrNoArena          = errors.New("progs: VM: entity-pointer opcode but no arena attached (call SetArena)")
 	ErrNullCall         = errors.New("progs: VM: OP_CALLn target function index is 0 (null function)")
 	ErrBadBuiltin       = errors.New("progs: VM: OP_CALLn target builtin index not registered")
+	ErrNoStateHooks     = errors.New("progs: VM: OP_STATE needs SetStateHooks + SetStateFieldOffsets")
 )
 
 // NewVM returns an interpreter ready to Run functions in p. The VM
@@ -531,9 +570,31 @@ func (vm *VM) execOne(st Statement, exitDepth int) (bool, error) {
 		// continues from FirstStatement-1.
 		return false, vm.enterFunction(fnIdx)
 
-	// --- not yet ported ------------------------------------------------------
-	//
-	// OP_STATE                  -- need sv.time + frame think dispatch
+	// --- OP_STATE ------------------------------------------------------------
+
+	case OP_STATE:
+		if vm.arena == nil {
+			return false, ErrNoArena
+		}
+		if vm.timeSource == nil || vm.selfEdict == nil || !vm.stateFieldsSet {
+			return false, ErrNoStateHooks
+		}
+		ed, _, err := vm.arena.ResolvePointer(vm.selfEdict())
+		if err != nil {
+			return false, err
+		}
+		frame, _ := vm.GlobalFloat(int(uint16(st.A)))
+		think, _ := vm.GlobalInt(int(uint16(st.B)))
+		if err := ed.FieldSetFloat(vm.stateFieldNextThink, vm.timeSource()+0.1); err != nil {
+			return false, err
+		}
+		if err := ed.FieldSetFloat(vm.stateFieldFrame, frame); err != nil {
+			return false, err
+		}
+		if err := ed.FieldSetInt(vm.stateFieldThink, think); err != nil {
+			return false, err
+		}
+		return false, nil
 
 	default:
 		return false, fmt.Errorf("%w: %d", ErrUnsupportedOp, st.Op)
