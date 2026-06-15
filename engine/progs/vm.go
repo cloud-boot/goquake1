@@ -52,6 +52,11 @@ type VM struct {
 	stateFieldFrame     int
 	stateFieldThink     int
 	stateFieldsSet      bool
+
+	// randomSource is the float-in-[0,1) callback BuiltinFnRandom
+	// pulls from. nil means the random() builtin returns
+	// ErrRandomNotSeeded.
+	randomSource func() float32
 }
 
 // SetArena wires an EdictArena into the VM so the LOAD_*, STORE_P_*,
