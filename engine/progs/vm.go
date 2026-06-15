@@ -1,0 +1,479 @@
+// Copyright (c) 1996-1997 Id Software, Inc.
+// Copyright (c) 2026 the cloud-boot/goquake1 authors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package progs
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"math"
+)
+
+// VM is the QuakeC bytecode interpreter. tyrquake's pr_exec.c
+// expresses the same state via globals (pr_globals, pr_stack,
+// pr_depth, pr_xfunction, pr_xstatement); the Go port owns them as
+// fields so multiple VMs can coexist for tests + savegame loading.
+//
+// Scope of THIS commit: arithmetic, comparison, logical,
+// store-to-globals, jumps, DONE / RETURN, ENTER / LEAVE. CALL +
+// STATE + STOREP / LOAD / ADDRESS (the entity-pointer arithmetic
+// ops) are deferred to follow-ups -- they need a builtin function
+// table + entity-byte-offset resolution that depend on subsystems
+// not ported yet.
+type VM struct {
+	progs    *Progs
+	globals  []byte         // writable copy of progs.Globals
+	stack    []frame        // return-frame stack
+	xFunc    int32          // currently-executing function index
+	xStmt    int32          // currently-executing statement index
+	runaway  int            // runaway-loop budget (decremented per stmt)
+	depth    int            // = len(stack); cached for readability
+	// runtime parameter count carried across an OP_CALLn dispatch
+	// (callee reads its arguments from OfsParm0..). Kept for the
+	// follow-up CALL port.
+	argc int
+}
+
+// MaxStackDepth caps the EnterFunction stack -- tyrquake's
+// MAX_STACK_DEPTH.
+const MaxStackDepth = 32
+
+// MaxLocalstack caps the per-call local slot saves; the value
+// matches tyrquake's LOCALSTACK_SIZE (~2048 slots) but the Go port
+// uses a growable slice so the cap is only enforced when the
+// interpreter is in tracking-the-upstream mode.
+const MaxLocalstack = 2048
+
+// MaxRunaway is the runaway-loop guard count. tyrquake uses
+// 1,000,000 as the default; the Go port exposes it for tests that
+// want to detect infinite loops on a tighter budget.
+const MaxRunaway = 1000000
+
+type frame struct {
+	stmt int32 // pre-call statement index
+	fn   int32 // pre-call function index
+	// localStackSize is the size of the locals slice the callee
+	// can pop on return. Used by LeaveFunction to restore the
+	// pre-call locals.
+	localStackSize int
+	// savedLocals are the local-slot values the callee will
+	// stomp; restored by LeaveFunction.
+	savedLocals []byte
+}
+
+// VM-specific sentinels.
+var (
+	ErrRunaway          = errors.New("progs: VM: runaway loop budget exceeded")
+	ErrBadFunctionIndex = errors.New("progs: VM: function index out of range")
+	ErrStackOverflow    = errors.New("progs: VM: enter-function stack overflow")
+	ErrStackUnderflow   = errors.New("progs: VM: leave-function stack underflow")
+	ErrUnsupportedOp    = errors.New("progs: VM: opcode not implemented in this build")
+	ErrBadStatement     = errors.New("progs: VM: statement index out of range")
+	ErrGlobalOffset     = errors.New("progs: VM: global-pool offset out of range")
+	ErrDivByZero        = errors.New("progs: VM: division by zero")
+)
+
+// NewVM returns an interpreter ready to Run functions in p. The VM
+// owns a copy of p.Globals so concurrent VMs over the same Progs
+// stay isolated.
+func NewVM(p *Progs) *VM {
+	if p == nil {
+		panic("progs: NewVM: nil progs")
+	}
+	g := make([]byte, len(p.Globals))
+	copy(g, p.Globals)
+	return &VM{
+		progs:   p,
+		globals: g,
+		stack:   make([]frame, 0, MaxStackDepth),
+	}
+}
+
+// Globals returns the writable global-pool byte slice. Tests use
+// this to seed pre-condition values + assert post-conditions. The
+// returned slice IS the live storage; mutations persist.
+func (vm *VM) Globals() []byte { return vm.globals }
+
+// GlobalFloat reads the float at slot ofs (ofs is a 32-bit-slot
+// index, not a byte offset). Returns ErrGlobalOffset if ofs falls
+// outside the pool. tyrquake: G_FLOAT macro.
+func (vm *VM) GlobalFloat(ofs int) (float32, error) {
+	b := ofs * globalSlotSize
+	if ofs < 0 || b+4 > len(vm.globals) {
+		return 0, ErrGlobalOffset
+	}
+	return math.Float32frombits(binary.LittleEndian.Uint32(vm.globals[b : b+4])), nil
+}
+
+// SetGlobalFloat is the corresponding writer.
+func (vm *VM) SetGlobalFloat(ofs int, v float32) error {
+	b := ofs * globalSlotSize
+	if ofs < 0 || b+4 > len(vm.globals) {
+		return ErrGlobalOffset
+	}
+	binary.LittleEndian.PutUint32(vm.globals[b:b+4], math.Float32bits(v))
+	return nil
+}
+
+// GlobalInt reads the int32 at slot ofs.
+func (vm *VM) GlobalInt(ofs int) (int32, error) {
+	b := ofs * globalSlotSize
+	if ofs < 0 || b+4 > len(vm.globals) {
+		return 0, ErrGlobalOffset
+	}
+	return int32(binary.LittleEndian.Uint32(vm.globals[b : b+4])), nil
+}
+
+// SetGlobalInt is the corresponding writer.
+func (vm *VM) SetGlobalInt(ofs int, v int32) error {
+	b := ofs * globalSlotSize
+	if ofs < 0 || b+4 > len(vm.globals) {
+		return ErrGlobalOffset
+	}
+	binary.LittleEndian.PutUint32(vm.globals[b:b+4], uint32(v))
+	return nil
+}
+
+// GlobalVector reads the 3-component vector starting at slot ofs.
+func (vm *VM) GlobalVector(ofs int) ([3]float32, error) {
+	b := ofs * globalSlotSize
+	if ofs < 0 || b+12 > len(vm.globals) {
+		return [3]float32{}, ErrGlobalOffset
+	}
+	return [3]float32{
+		math.Float32frombits(binary.LittleEndian.Uint32(vm.globals[b : b+4])),
+		math.Float32frombits(binary.LittleEndian.Uint32(vm.globals[b+4 : b+8])),
+		math.Float32frombits(binary.LittleEndian.Uint32(vm.globals[b+8 : b+12])),
+	}, nil
+}
+
+// SetGlobalVector writes a 3-component vector starting at slot ofs.
+func (vm *VM) SetGlobalVector(ofs int, v [3]float32) error {
+	b := ofs * globalSlotSize
+	if ofs < 0 || b+12 > len(vm.globals) {
+		return ErrGlobalOffset
+	}
+	binary.LittleEndian.PutUint32(vm.globals[b:b+4], math.Float32bits(v[0]))
+	binary.LittleEndian.PutUint32(vm.globals[b+4:b+8], math.Float32bits(v[1]))
+	binary.LittleEndian.PutUint32(vm.globals[b+8:b+12], math.Float32bits(v[2]))
+	return nil
+}
+
+// XFunction / XStatement / Depth expose the interpreter's
+// runtime location for tests + debug dumps.
+func (vm *VM) XFunction() int32  { return vm.xFunc }
+func (vm *VM) XStatement() int32 { return vm.xStmt }
+func (vm *VM) Depth() int        { return vm.depth }
+
+// Run executes the function at index fn until OP_DONE / OP_RETURN
+// pops the frame the call entered. Function 0 is the empty-function
+// slot (tyrquake reserves it for "null function") and is rejected.
+// tyrquake: PR_ExecuteProgram.
+func (vm *VM) Run(fn int32) error {
+	if fn <= 0 || int(fn) >= len(vm.progs.Functions) {
+		return ErrBadFunctionIndex
+	}
+	exitDepth := vm.depth
+	vm.runaway = MaxRunaway
+
+	if err := vm.enterFunction(fn); err != nil {
+		return err
+	}
+
+	for {
+		if vm.runaway--; vm.runaway < 0 {
+			return ErrRunaway
+		}
+		vm.xStmt++
+		if vm.xStmt < 0 || int(vm.xStmt) >= len(vm.progs.Statements) {
+			return ErrBadStatement
+		}
+		st := vm.progs.Statements[vm.xStmt]
+		// pr_xfunction->profile++ -- skipped (profile is debug only)
+
+		done, err := vm.execOne(st, exitDepth)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+	}
+}
+
+// execOne runs one statement and reports (allDone, error).
+func (vm *VM) execOne(st Statement, exitDepth int) (bool, error) {
+	switch st.Op {
+
+	// --- arithmetic ----------------------------------------------------------
+
+	case OP_ADD_F:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		b, _ := vm.GlobalFloat(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), a+b)
+	case OP_ADD_V:
+		a, _ := vm.GlobalVector(int(uint16(st.A)))
+		b, _ := vm.GlobalVector(int(uint16(st.B)))
+		return false, vm.SetGlobalVector(int(uint16(st.C)),
+			[3]float32{a[0] + b[0], a[1] + b[1], a[2] + b[2]})
+	case OP_SUB_F:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		b, _ := vm.GlobalFloat(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), a-b)
+	case OP_SUB_V:
+		a, _ := vm.GlobalVector(int(uint16(st.A)))
+		b, _ := vm.GlobalVector(int(uint16(st.B)))
+		return false, vm.SetGlobalVector(int(uint16(st.C)),
+			[3]float32{a[0] - b[0], a[1] - b[1], a[2] - b[2]})
+	case OP_MUL_F:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		b, _ := vm.GlobalFloat(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), a*b)
+	case OP_MUL_V:
+		// vector dot product, returns float into C
+		a, _ := vm.GlobalVector(int(uint16(st.A)))
+		b, _ := vm.GlobalVector(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), a[0]*b[0]+a[1]*b[1]+a[2]*b[2])
+	case OP_MUL_FV:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		b, _ := vm.GlobalVector(int(uint16(st.B)))
+		return false, vm.SetGlobalVector(int(uint16(st.C)),
+			[3]float32{a * b[0], a * b[1], a * b[2]})
+	case OP_MUL_VF:
+		a, _ := vm.GlobalVector(int(uint16(st.A)))
+		b, _ := vm.GlobalFloat(int(uint16(st.B)))
+		return false, vm.SetGlobalVector(int(uint16(st.C)),
+			[3]float32{b * a[0], b * a[1], b * a[2]})
+	case OP_DIV_F:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		b, _ := vm.GlobalFloat(int(uint16(st.B)))
+		if b == 0 {
+			return false, ErrDivByZero
+		}
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), a/b)
+	case OP_BITAND:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		b, _ := vm.GlobalFloat(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), float32(int32(a)&int32(b)))
+	case OP_BITOR:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		b, _ := vm.GlobalFloat(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), float32(int32(a)|int32(b)))
+
+	// --- comparison ----------------------------------------------------------
+
+	case OP_GE, OP_LE, OP_GT, OP_LT:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		b, _ := vm.GlobalFloat(int(uint16(st.B)))
+		var r bool
+		switch st.Op {
+		case OP_GE:
+			r = a >= b
+		case OP_LE:
+			r = a <= b
+		case OP_GT:
+			r = a > b
+		case OP_LT:
+			r = a < b
+		}
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), boolToFloat(r))
+	case OP_AND:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		b, _ := vm.GlobalFloat(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), boolToFloat(a != 0 && b != 0))
+	case OP_OR:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		b, _ := vm.GlobalFloat(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), boolToFloat(a != 0 || b != 0))
+	case OP_EQ_F:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		b, _ := vm.GlobalFloat(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), boolToFloat(a == b))
+	case OP_EQ_V:
+		a, _ := vm.GlobalVector(int(uint16(st.A)))
+		b, _ := vm.GlobalVector(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)),
+			boolToFloat(a == b))
+	case OP_EQ_S:
+		a, _ := vm.GlobalInt(int(uint16(st.A)))
+		b, _ := vm.GlobalInt(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)),
+			boolToFloat(vm.progs.String(a) == vm.progs.String(b)))
+	case OP_EQ_E, OP_EQ_FNC:
+		a, _ := vm.GlobalInt(int(uint16(st.A)))
+		b, _ := vm.GlobalInt(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), boolToFloat(a == b))
+	case OP_NE_F:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		b, _ := vm.GlobalFloat(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), boolToFloat(a != b))
+	case OP_NE_V:
+		a, _ := vm.GlobalVector(int(uint16(st.A)))
+		b, _ := vm.GlobalVector(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), boolToFloat(a != b))
+	case OP_NE_S:
+		a, _ := vm.GlobalInt(int(uint16(st.A)))
+		b, _ := vm.GlobalInt(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)),
+			boolToFloat(vm.progs.String(a) != vm.progs.String(b)))
+	case OP_NE_E, OP_NE_FNC:
+		a, _ := vm.GlobalInt(int(uint16(st.A)))
+		b, _ := vm.GlobalInt(int(uint16(st.B)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), boolToFloat(a != b))
+
+	// --- logical NOT ---------------------------------------------------------
+
+	case OP_NOT_F:
+		a, _ := vm.GlobalFloat(int(uint16(st.A)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), boolToFloat(a == 0))
+	case OP_NOT_V:
+		a, _ := vm.GlobalVector(int(uint16(st.A)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)),
+			boolToFloat(a[0] == 0 && a[1] == 0 && a[2] == 0))
+	case OP_NOT_S:
+		a, _ := vm.GlobalInt(int(uint16(st.A)))
+		s := vm.progs.String(a)
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), boolToFloat(a == 0 || s == ""))
+	case OP_NOT_FNC, OP_NOT_ENT:
+		a, _ := vm.GlobalInt(int(uint16(st.A)))
+		return false, vm.SetGlobalFloat(int(uint16(st.C)), boolToFloat(a == 0))
+
+	// --- store-to-globals ----------------------------------------------------
+
+	case OP_STORE_F, OP_STORE_S, OP_STORE_ENT, OP_STORE_FLD, OP_STORE_FNC:
+		// Single-slot copy from A to B (the int32 form covers
+		// float / string / ent / field / function; the byte
+		// pattern is the same).
+		v, _ := vm.GlobalInt(int(uint16(st.A)))
+		return false, vm.SetGlobalInt(int(uint16(st.B)), v)
+	case OP_STORE_V:
+		v, _ := vm.GlobalVector(int(uint16(st.A)))
+		return false, vm.SetGlobalVector(int(uint16(st.B)), v)
+
+	// --- jumps ---------------------------------------------------------------
+
+	case OP_IFNOT:
+		a, _ := vm.GlobalInt(int(uint16(st.A)))
+		if a == 0 {
+			vm.xStmt += int32(st.B) - 1
+		}
+		return false, nil
+	case OP_IF:
+		a, _ := vm.GlobalInt(int(uint16(st.A)))
+		if a != 0 {
+			vm.xStmt += int32(st.B) - 1
+		}
+		return false, nil
+	case OP_GOTO:
+		vm.xStmt += int32(st.A) - 1
+		return false, nil
+
+	// --- function control ----------------------------------------------------
+
+	case OP_DONE, OP_RETURN:
+		// Copy A..A+2 into OfsReturn..OfsReturn+2 (a vector copy
+		// even for scalar returns -- the pool layout reserves the
+		// slot triple).
+		v, _ := vm.GlobalVector(int(uint16(st.A)))
+		if err := vm.SetGlobalVector(OfsReturn, v); err != nil {
+			return false, err
+		}
+		if err := vm.leaveFunction(); err != nil {
+			return false, err
+		}
+		return vm.depth == exitDepth, nil
+
+	// --- not yet ported ------------------------------------------------------
+	//
+	// OP_CALL0..OP_CALL8        -- need engine/progs/builtins
+	// OP_STATE                  -- need sv.time + frame think dispatch
+	// OP_LOAD_*                 -- need byte-offset edict resolver
+	// OP_STORE_P_*              -- same
+	// OP_ADDRESS                -- same
+
+	default:
+		return false, fmt.Errorf("%w: %d", ErrUnsupportedOp, st.Op)
+	}
+}
+
+// enterFunction pushes the current (xFunc, xStmt) onto the return
+// stack, saves the callee's locals, copies parameters from the
+// OfsParm* slots into the callee's parm_start, and returns the new
+// xStmt (= first_statement - 1; the dispatch loop's ++ undoes the -1).
+// tyrquake: PR_EnterFunction.
+func (vm *VM) enterFunction(fn int32) error {
+	if vm.depth >= MaxStackDepth {
+		return ErrStackOverflow
+	}
+	f := &vm.progs.Functions[fn]
+
+	// Save callee's locals so a recursive call doesn't clobber them.
+	localBytes := int(f.Locals) * globalSlotSize
+	saved := make([]byte, localBytes)
+	if int(f.ParmStart)*globalSlotSize+localBytes <= len(vm.globals) {
+		copy(saved, vm.globals[int(f.ParmStart)*globalSlotSize:int(f.ParmStart)*globalSlotSize+localBytes])
+	}
+
+	vm.stack = append(vm.stack, frame{
+		stmt:            vm.xStmt,
+		fn:              vm.xFunc,
+		localStackSize:  localBytes,
+		savedLocals:     saved,
+	})
+	vm.depth = len(vm.stack)
+
+	// Copy parameters: parm i is at OfsParm0 + 3*i in the global pool,
+	// and goes to parm_start + (cumulative parm_size so far) in the
+	// callee's local slot range.
+	dst := int(f.ParmStart)
+	for i := int32(0); i < f.NumParms; i++ {
+		for j := byte(0); j < f.ParmSize[i]; j++ {
+			src := OfsParm0 + int(i)*3 + int(j)
+			v, err := vm.GlobalInt(src)
+			if err != nil {
+				return err
+			}
+			if err := vm.SetGlobalInt(dst, v); err != nil {
+				return err
+			}
+			dst++
+		}
+	}
+
+	vm.xFunc = fn
+	vm.xStmt = f.FirstStatement - 1
+	return nil
+}
+
+// leaveFunction pops the return stack, restores the callee's locals,
+// and returns. tyrquake: PR_LeaveFunction.
+func (vm *VM) leaveFunction() error {
+	if vm.depth <= 0 {
+		return ErrStackUnderflow
+	}
+	top := vm.stack[len(vm.stack)-1]
+	vm.stack = vm.stack[:len(vm.stack)-1]
+	vm.depth = len(vm.stack)
+
+	// Restore locals into the callee's parm_start slot range.
+	f := &vm.progs.Functions[vm.xFunc]
+	if top.localStackSize > 0 {
+		copy(vm.globals[int(f.ParmStart)*globalSlotSize:int(f.ParmStart)*globalSlotSize+top.localStackSize], top.savedLocals)
+	}
+
+	vm.xFunc = top.fn
+	vm.xStmt = top.stmt
+	return nil
+}
+
+// boolToFloat mirrors the C `(int)(boolean expression)` idiom: 1.0
+// for true, 0.0 for false. tyrquake stores the result of every
+// comparison opcode this way.
+func boolToFloat(b bool) float32 {
+	if b {
+		return 1
+	}
+	return 0
+}
