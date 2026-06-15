@@ -448,8 +448,8 @@ func TestRun_StatementOutOfRange(t *testing.T) {
 }
 
 func TestRun_UnsupportedOpcode(t *testing.T) {
-	// OP_CALL0 is not implemented in this commit.
-	p := progsForVM(withStatements(Statement{Op: OP_CALL0, A: 10}))
+	// OP_STATE is not implemented in this slice (needs sv.time + frame think dispatch).
+	p := progsForVM(withStatements(Statement{Op: OP_STATE, A: 10, B: 11}))
 	vm := NewVM(p)
 	if err := vm.Run(1); !errors.Is(err, ErrUnsupportedOp) {
 		t.Errorf("got %v want ErrUnsupportedOp", err)
@@ -603,6 +603,140 @@ func TestRun_PropagatesReturnError(t *testing.T) {
 	vm := NewVM(p)
 	if err := vm.Run(1); !errors.Is(err, ErrGlobalOffset) {
 		t.Errorf("got %v want ErrGlobalOffset", err)
+	}
+}
+
+// --- CALL: builtin dispatch ---------------------------------------------
+
+func TestRun_CALL_BuiltinDispatch(t *testing.T) {
+	// Function 2 is a builtin: first_statement = -7 -> builtins[7].
+	// The QuakeC program calls Function 2 with no args, then DONE.
+	// The builtin writes its result into slot 100 (not OfsReturn)
+	// because the caller's final DONE clobbers OfsReturn with whatever
+	// its A operand reads -- the tested invariant here is that the
+	// builtin RAN, not the return-value plumbing (which Run_CALL_
+	// QuakeCFunctionDispatch covers separately).
+	p := progsForVM(withStatements(
+		Statement{Op: OP_CALL0, A: 10},
+	))
+	p.Functions = append(p.Functions, Function{
+		FirstStatement: -7, // builtin index 7
+		SName:          0,
+	})
+	vm := NewVM(p)
+	called := false
+	vm.RegisterBuiltin(7, func(v *VM) error {
+		called = true
+		if v.Argc() != 0 {
+			t.Errorf("Argc inside CALL0: got %d", v.Argc())
+		}
+		_ = v.SetGlobalFloat(100, 42)
+		return nil
+	})
+	_ = vm.SetGlobalInt(10, 2) // function index 2
+	if err := vm.Run(1); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Error("builtin not invoked")
+	}
+	if v, _ := vm.GlobalFloat(100); v != 42 {
+		t.Errorf("builtin output slot: got %v want 42", v)
+	}
+}
+
+func TestRun_CALL_ArgcArity(t *testing.T) {
+	// CALL3 expects argc=3 inside the builtin.
+	p := progsForVM(withStatements(Statement{Op: OP_CALL3, A: 10}))
+	p.Functions = append(p.Functions, Function{FirstStatement: -1, SName: 0})
+	vm := NewVM(p)
+	gotArgc := -1
+	vm.RegisterBuiltin(1, func(v *VM) error {
+		gotArgc = v.Argc()
+		return nil
+	})
+	_ = vm.SetGlobalInt(10, 2)
+	if err := vm.Run(1); err != nil {
+		t.Fatal(err)
+	}
+	if gotArgc != 3 {
+		t.Errorf("Argc: got %d want 3", gotArgc)
+	}
+}
+
+func TestRun_CALL_QuakeCFunctionDispatch(t *testing.T) {
+	// QuakeC function call: Function 2 is a non-builtin starting at
+	// Statement 3 which just RETURNs the vector in slot 50. The
+	// caller's final DONE uses A=OfsReturn so its A->OfsReturn copy
+	// is an identity write (matches what QuakeC compilers emit for
+	// "the function we just called returned a value; preserve it").
+	p := progsForVM(withStatements(
+		Statement{Op: OP_CALL0, A: 10},                    // 1
+		Statement{Op: OP_DONE, A: OfsReturn},              // 2 -- caller's DONE (identity write)
+		Statement{Op: OP_RETURN, A: 50},                   // 3 -- callee body
+	))
+	p.Functions = append(p.Functions, Function{FirstStatement: 3, SName: 0})
+	vm := NewVM(p)
+	_ = vm.SetGlobalInt(10, 2) // call function 2
+	_ = vm.SetGlobalVector(50, [3]float32{1, 2, 3})
+	if err := vm.Run(1); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := vm.GlobalVector(OfsReturn); v != [3]float32{1, 2, 3} {
+		t.Errorf("OfsReturn: %v want {1,2,3}", v)
+	}
+}
+
+func TestRun_CALL_NullFunction(t *testing.T) {
+	p := progsForVM(withStatements(Statement{Op: OP_CALL0, A: 10}))
+	vm := NewVM(p)
+	_ = vm.SetGlobalInt(10, 0) // null function index
+	if err := vm.Run(1); !errors.Is(err, ErrNullCall) {
+		t.Errorf("got %v want ErrNullCall", err)
+	}
+}
+
+func TestRun_CALL_BadFunctionIndex(t *testing.T) {
+	p := progsForVM(withStatements(Statement{Op: OP_CALL0, A: 10}))
+	vm := NewVM(p)
+	_ = vm.SetGlobalInt(10, 9999) // out of range
+	if err := vm.Run(1); !errors.Is(err, ErrBadFunctionIndex) {
+		t.Errorf("got %v want ErrBadFunctionIndex", err)
+	}
+	_ = vm.SetGlobalInt(10, -1)
+	if err := vm.Run(1); !errors.Is(err, ErrBadFunctionIndex) {
+		t.Errorf("neg fn: got %v want ErrBadFunctionIndex", err)
+	}
+}
+
+func TestRun_CALL_UnregisteredBuiltin(t *testing.T) {
+	p := progsForVM(withStatements(Statement{Op: OP_CALL0, A: 10}))
+	p.Functions = append(p.Functions, Function{FirstStatement: -99, SName: 0})
+	vm := NewVM(p)
+	_ = vm.SetGlobalInt(10, 2)
+	if err := vm.Run(1); !errors.Is(err, ErrBadBuiltin) {
+		t.Errorf("got %v want ErrBadBuiltin", err)
+	}
+}
+
+func TestRun_CALL_BuiltinErrorPropagates(t *testing.T) {
+	customErr := errors.New("builtin blew up")
+	p := progsForVM(withStatements(Statement{Op: OP_CALL0, A: 10}))
+	p.Functions = append(p.Functions, Function{FirstStatement: -1, SName: 0})
+	vm := NewVM(p)
+	vm.RegisterBuiltin(1, func(*VM) error { return customErr })
+	_ = vm.SetGlobalInt(10, 2)
+	if err := vm.Run(1); !errors.Is(err, customErr) {
+		t.Errorf("got %v want propagated builtin error", err)
+	}
+}
+
+func TestRegisterBuiltin_ZeroIgnored(t *testing.T) {
+	vm := NewVM(progsForVM(nil))
+	vm.RegisterBuiltin(0, func(*VM) error { return nil })
+	vm.RegisterBuiltin(-5, func(*VM) error { return nil })
+	if vm.builtins != nil && (vm.builtins[0] != nil || vm.builtins[-5] != nil) {
+		t.Error("zero / negative indices should not register")
 	}
 }
 

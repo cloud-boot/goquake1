@@ -32,9 +32,12 @@ type VM struct {
 	runaway  int            // runaway-loop budget (decremented per stmt)
 	depth    int            // = len(stack); cached for readability
 	// runtime parameter count carried across an OP_CALLn dispatch
-	// (callee reads its arguments from OfsParm0..). Kept for the
-	// follow-up CALL port.
+	// (callee reads its arguments from OfsParm0..).
 	argc int
+
+	// builtins is the registry the OP_CALLn opcode dispatches into
+	// when the callee's first_statement is negative.
+	builtins map[int]Builtin
 }
 
 // SetArena wires an EdictArena into the VM so the LOAD_*, STORE_P_*,
@@ -42,6 +45,33 @@ type VM struct {
 // have been built from the same Progs (or another Progs with the
 // same EntityFields layout) -- the VM does not verify this.
 func (vm *VM) SetArena(a *EdictArena) { vm.arena = a }
+
+// Builtin is the signature every native function exposed to QuakeC
+// implements. tyrquake's pr_builtins[] is an array of `void(void)`
+// functions that read arguments from OfsParm* slots and write the
+// result into OfsReturn. The Go port keeps the same shape but
+// returns an error instead of calling PR_RunError directly.
+type Builtin func(vm *VM) error
+
+// RegisterBuiltin associates idx with fn. The QuakeC OP_CALLn
+// opcode dispatches to the builtin at index `-function.FirstStatement`
+// when first_statement is negative. idx 0 is reserved (the upstream
+// pr_builtins[0] is "should never be called"); callers that pass 0
+// get a no-op registration.
+func (vm *VM) RegisterBuiltin(idx int, fn Builtin) {
+	if idx <= 0 {
+		return
+	}
+	if vm.builtins == nil {
+		vm.builtins = make(map[int]Builtin)
+	}
+	vm.builtins[idx] = fn
+}
+
+// Argc returns the number of arguments the currently-executing
+// builtin was called with (= the n in OP_CALLn). The builtin reads
+// each argument from OfsParm0 + i*3.
+func (vm *VM) Argc() int { return vm.argc }
 
 // MaxStackDepth caps the EnterFunction stack -- tyrquake's
 // MAX_STACK_DEPTH.
@@ -81,6 +111,8 @@ var (
 	ErrGlobalOffset     = errors.New("progs: VM: global-pool offset out of range")
 	ErrDivByZero        = errors.New("progs: VM: division by zero")
 	ErrNoArena          = errors.New("progs: VM: entity-pointer opcode but no arena attached (call SetArena)")
+	ErrNullCall         = errors.New("progs: VM: OP_CALLn target function index is 0 (null function)")
+	ErrBadBuiltin       = errors.New("progs: VM: OP_CALLn target builtin index not registered")
 )
 
 // NewVM returns an interpreter ready to Run functions in p. The VM
@@ -472,9 +504,35 @@ func (vm *VM) execOne(st Statement, exitDepth int) (bool, error) {
 		}
 		return false, ed.FieldSetVector(fieldByteOfs/globalSlotSize, v)
 
+	// --- function call -------------------------------------------------------
+
+	case OP_CALL0, OP_CALL1, OP_CALL2, OP_CALL3, OP_CALL4,
+		OP_CALL5, OP_CALL6, OP_CALL7, OP_CALL8:
+		argc := int(st.Op - OP_CALL0)
+		fnIdx, _ := vm.GlobalInt(int(uint16(st.A)))
+		if fnIdx == 0 {
+			return false, ErrNullCall
+		}
+		if fnIdx < 0 || int(fnIdx) >= len(vm.progs.Functions) {
+			return false, ErrBadFunctionIndex
+		}
+		callee := &vm.progs.Functions[fnIdx]
+		vm.argc = argc
+		if callee.FirstStatement < 0 {
+			// Negative => builtin.
+			bidx := int(-callee.FirstStatement)
+			fn, ok := vm.builtins[bidx]
+			if !ok {
+				return false, fmt.Errorf("%w: %d", ErrBadBuiltin, bidx)
+			}
+			return false, fn(vm)
+		}
+		// QuakeC function -- enter it; the dispatch loop's xStmt++
+		// continues from FirstStatement-1.
+		return false, vm.enterFunction(fnIdx)
+
 	// --- not yet ported ------------------------------------------------------
 	//
-	// OP_CALL0..OP_CALL8        -- need engine/progs/builtins
 	// OP_STATE                  -- need sv.time + frame think dispatch
 
 	default:
