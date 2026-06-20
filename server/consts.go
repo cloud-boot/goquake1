@@ -23,6 +23,19 @@ const (
 	MoveTypeBounce      MoveType = 10
 )
 
+// MoveMode is the trace-mode enum SV_TraceMove takes as its type
+// parameter. Distinct from [MoveType] (the entvars.movetype value).
+// The C upstream confusingly reuses the name movetype_t for both
+// enums; the Go port splits them. tyrquake: the MOVE_NORMAL /
+// MOVE_NOMONSTERS / MOVE_MISSILE enum in common/include/world.h.
+type MoveMode int32
+
+const (
+	MoveModeNormal     MoveMode = 0 // standard swept trace
+	MoveModeNoMonsters MoveMode = 1 // line of sight; skip non-BSP entities
+	MoveModeMissile    MoveMode = 2 // monster bounds widened to a 30-unit cube
+)
+
 // Solid is the value of an edict's entvars_t.solid field. It
 // selects how the entity participates in the SV_TraceMove broadphase
 // and which collision hull (BSP vs box) SV_HullForEntity picks.
