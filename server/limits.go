@@ -22,6 +22,23 @@ const (
 // tyrquake: NQ/protocol.h:302.
 const MaxClients = 16
 
+// MaxMsgLen is the reliable-message buffer size -- server.signon,
+// server.reliable_datagram, and client.message all sized to this.
+// Same numeric value as MaxDatagram (both 1 << 18) but semantically
+// distinct: MaxDatagram is the per-tick unreliable broadcast budget;
+// MaxMsgLen is the reliable-message ceiling.
+// tyrquake: NQ/quakedef.h:74.
+const MaxMsgLen = 1 << 18
+
+// NumPingTimes is the rolling-window size for the per-client
+// ping-rate sample buffer. tyrquake: NQ/server.h:71.
+const NumPingTimes = 16
+
+// NumSpawnParms is the carry-over slot count for level-transition
+// spawn parameters (HP, weapons, ammo, ...) per client.
+// tyrquake: NQ/server.h:72.
+const NumSpawnParms = 16
+
 // AreaTree caps -- the broadphase quadtree built by SV_ClearWorld.
 // AreaNodes is the maximum number of internal nodes (root + 4
 // subdivisions at each of AreaDepth levels = 1 + 2 + 4 + 8 + 16 =
