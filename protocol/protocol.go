@@ -165,6 +165,16 @@ const (
 	SndFitzLargeSound  = 1 << 4
 )
 
+// Default volume + attenuation values that svc_sound omits from
+// the wire (the receiver substitutes these when the field-mask
+// doesn't include SndVolume / SndAttenuation). tyrquake:
+// DEFAULT_SOUND_PACKET_VOLUME and DEFAULT_SOUND_PACKET_ATTENUATION
+// in common/include/sound.h.
+const (
+	DefaultSoundVolume      = 255
+	DefaultSoundAttenuation = 1.0
+)
+
 // B_FITZ_* extra spawnbaseline flag bits.
 const (
 	BFitzLargeModel = 1 << 0
