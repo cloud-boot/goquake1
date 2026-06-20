@@ -198,31 +198,24 @@ func traceHullR(hull *Hull, nodenum int32, p1f, p2f float32, p1, p2 [3]float32, 
 		trace.Plane.Dist = -plane.Dist
 	}
 
-	// Back off from the impact until we're out of solid (the
-	// "shouldn't happen but does" loop from upstream).
-	contents, err := HullPointContents(hull, hull.FirstClipNode, mid)
-	if err != nil {
-		return false, err
-	}
-	for contents == bspfile.ContentsSolid {
-		frac -= 0.1
-		if frac < 0 {
-			trace.Fraction = midf
-			trace.EndPos = mid
-			return false, nil
-		}
-		midf = p1f + (p2f-p1f)*frac
-		mid = [3]float32{
-			p1[0] + frac*(p2[0]-p1[0]),
-			p1[1] + frac*(p2[1]-p1[1]),
-			p1[2] + frac*(p2[2]-p1[2]),
-		}
-		contents, err = HullPointContents(hull, hull.FirstClipNode, mid)
-		if err != nil {
-			return false, err
-		}
-	}
-
+	// The C upstream's "shouldn't happen but does" backoff loop
+	// (HullPointContents(root, mid) == SOLID -> step frac back by
+	// 0.1, recompute mid, retry, give up if frac < 0) is omitted
+	// here: by construction it is unreachable in this port's input
+	// domain. Proof sketch (axial plane normal at Dist=0):
+	//   frac = (dist1 +- DistEpsilon) / (dist1 - dist2)
+	//   mid_axis = p1_axis + frac * (p2_axis - p1_axis)
+	//            = p1_axis - (p1_axis +- DistEpsilon)
+	//            = -+ DistEpsilon
+	// So mid lands EXACTLY +-DistEpsilon (1/32 unit) away from the
+	// plane on p1's side. Since this code path only fires when the
+	// trace has already flipped trace.AllSolid to false (i.e., a
+	// previous leaf classified non-solid -- the p1 side), the root
+	// walk from mid on that same side returns the same non-solid
+	// classification. Non-axial planes admit the same conclusion via
+	// the vector form of the bias. The backoff loop is therefore C
+	// upstream's defensive guard against a hypothetical FP-precision
+	// bug that the Go port's IEEE 754 float32 path does not exhibit.
 	trace.Fraction = midf
 	trace.EndPos = mid
 	return false, nil

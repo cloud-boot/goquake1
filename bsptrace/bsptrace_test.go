@@ -561,6 +561,51 @@ func TestTraceHull_AllSolidPreservedOnImpact(t *testing.T) {
 	}
 }
 
+// Cover the !ok branch at line 174-176: the near-side RECURSION
+// records an impact (returns false, nil) and the outer call needs to
+// propagate that early-out. Construct a 2-node hull where the trace
+// crosses node 0 onto the near side (node 1), and node 1 itself
+// straddles in a way that lands its own impact -- AllSolid flipped
+// to false by visiting an EMPTY leaf, then far-side SOLID at the
+// inner level.
+//
+//	node 0: x=0,  +x=SOLID,  -x=node 1
+//	node 1: x=-5, +x=SOLID,  -x=EMPTY
+//
+// Trace from (-10, 0, 0) (in EMPTY at -x=-10) to (10, 0, 0) (in
+// SOLID at +x).
+//
+//	outer at node 0: straddle, side=1, near=node 1, far=SOLID
+//	inner at node 1: straddle, side=1, near=EMPTY (flips AllSolid),
+//	  far=SOLID (skip the empty-recurse) -- records impact at line
+//	  228, returns (false, nil)
+//	outer back: ok=false -> line 174-176 fires.
+func TestTraceHull_InnerImpactReturnsFalseToOuter(t *testing.T) {
+	h := &Hull{
+		ClipNodes: []bspfile.ClipNode{
+			{PlaneNum: 0, Children: [2]int16{bspfile.ContentsSolid, 1}},
+			{PlaneNum: 1, Children: [2]int16{bspfile.ContentsSolid, bspfile.ContentsEmpty}},
+		},
+		Planes: []bspfile.Plane{
+			{Normal: [3]float32{1, 0, 0}, Dist: 0, Type: bspfile.PlaneX},
+			{Normal: [3]float32{1, 0, 0}, Dist: -5, Type: bspfile.PlaneX},
+		},
+		FirstClipNode: 0,
+		LastClipNode:  1,
+	}
+	tr := DefaultTrace()
+	ok, err := TraceHull(h, 0, [3]float32{-10, 0, 0}, [3]float32{10, 0, 0}, &tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Errorf("expected ok=false (inner-impact propagation), got true")
+	}
+	if tr.Fraction >= 1.0 {
+		t.Errorf("expected impact (fraction<1), got %v", tr.Fraction)
+	}
+}
+
 // --- DistEpsilon constant ------------------------------------------------
 
 func TestDistEpsilonValue(t *testing.T) {

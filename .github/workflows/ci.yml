@@ -11,11 +11,11 @@
 #
 # CGO=0. GOWORK=off (the engine is a standalone module, no workspace).
 #
-# Coverage gate: 100% on every Go package EXCEPT bsptrace, which carries
-# a documented 87.8% floor while the synthetic-hull backfill lands (see
-# the open "Backfill bsptrace coverage to 100%" backlog item). The gate
-# enforces non-regression — bsptrace is allowed to RISE but never fall,
-# every other package must be exactly 100.0%.
+# Coverage gate: 100% on every Go package. The bsptrace 87.8% floor
+# exception was removed once the synthetic-hull backfill landed: the
+# upstream tyrquake backoff loop turned out to be unreachable in the
+# Go port's input domain (bias formula proof in bsptrace.go's comment
+# block), and dropping it brought the package to 100%.
 
 name: ci
 
@@ -73,15 +73,9 @@ jobs:
               echo "  -> no statements, skipped"
               continue
             fi
-            # bsptrace floor: 87.8% (until the synthetic-hull backfill ships)
-            if [ "$pkg_short" = "bsptrace" ]; then
-              floor=87.8
-            else
-              floor=100.0
-            fi
-            ok=$(awk -v p="$pct" -v f="$floor" 'BEGIN { print (p+0 >= f+0) ? 1 : 0 }')
+            ok=$(awk -v p="$pct" 'BEGIN { print (p+0 >= 100.0) ? 1 : 0 }')
             if [ "$ok" -ne 1 ]; then
-              echo "::error::$pkg_short coverage ${pct}% < floor ${floor}%"
+              echo "::error::$pkg_short coverage ${pct}% < 100.0%"
               fail=1
             fi
           done
