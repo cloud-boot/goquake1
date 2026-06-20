@@ -24,7 +24,10 @@ const (
 
 // UserCmd is one client input frame: where the player is looking
 // (viewangles) and which direction they intend to move (forward /
-// side / up; in player-local "wishdir" units, NOT world vectors).
+// side / up; in player-local "wishdir" units, NOT world vectors),
+// plus the trigger-state bitfield (Buttons: BUTTON_ATTACK /
+// BUTTON_JUMP / ...) and the impulse byte ("+impulse N" -- weapon
+// switch + cheats + miscellaneous one-shot commands).
 // SV_RunClients reads UserCmds off the wire + feeds them to
 // sv_user's movement integrator. tyrquake: usercmd_t in NQ/client.h.
 type UserCmd struct {
@@ -32,6 +35,8 @@ type UserCmd struct {
 	ForwardMove float32
 	SideMove    float32
 	UpMove      float32
+	Buttons     uint8 // BUTTON_ATTACK / BUTTON_JUMP / ... bitmask
+	Impulse     uint8 // "+impulse N" weapon / cheat number
 }
 
 // Server is the per-map runtime state. Lives from SV_SpawnServer

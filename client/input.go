@@ -143,7 +143,12 @@ type MovementButtons struct {
 //
 // Returns the UserCmd with ForwardMove / SideMove / UpMove filled
 // from button axes; ViewAngles is NOT set here (mouse + [AdjustAngles]
-// own it).
+// own it). [server.UserCmd.Buttons] + [server.UserCmd.Impulse] are
+// also left at zero -- BaseMove is the keyboard-axis path, not the
+// trigger path. Callers that want clc_move to carry the +attack /
+// +jump bitmask or the in_impulse one-shot byte are responsible for
+// OR-ing those onto the returned cmd before handing it to
+// [EncodeClcMove].
 //
 // Upstream's CL_BaseMove also honors the +strafe modifier (which
 // re-routes the Left/Right turn keys into strafing) and +klook

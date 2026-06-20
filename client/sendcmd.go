@@ -122,14 +122,6 @@ func EncodeClcStringCmd(buf *sizebuf.Buffer, cmd string) error {
 //	byte    buttons               (BUTTON_ATTACK / BUTTON_JUMP / ...)
 //	byte    impulse               ("+impulse N" weapon-switch key etc.)
 //
-// DEVIATION from the per-task spec: [server.UserCmd] does NOT
-// currently carry Buttons / Impulse fields (it only has
-// ViewAngles + ForwardMove + SideMove + UpMove). Rather than mutate
-// state.go (owned by a sibling agent's commit window), the buttons
-// + impulse bitfields are passed as explicit uint8 parameters --
-// the caller threads them in from the +attack / +jump kbutton
-// states + the in_impulse global the way CL_SendMove does upstream.
-//
 // The FITZ protocol arm uses WriteAngle16 instead of WriteAngle
 // (common/cl_input.c L542); the vanilla NQ path here writes the
 // 1-byte form. The C source also has an optional 1-byte checksum
@@ -146,9 +138,16 @@ func EncodeClcStringCmd(buf *sizebuf.Buffer, cmd string) error {
 // nominal Quake range (+/- cl_forwardspeed * cl_movespeedkey ~=
 // 400 default) fits comfortably in int16.
 //
+// Buttons + Impulse ride on [server.UserCmd] (the bitmask + impulse
+// byte the caller OR-ed in from the +attack / +jump kbutton states +
+// the in_impulse global the way CL_SendMove does upstream). [BaseMove]
+// only fills the keyboard-axis path -- the caller is responsible for
+// merging Buttons / Impulse onto the returned cmd before invoking
+// this encoder.
+//
 // Returns [ErrSendNilBuf] if buf is nil; otherwise propagates the
 // first msg.Write* error verbatim.
-func EncodeClcMove(buf *sizebuf.Buffer, sendTime float32, cmd server.UserCmd, buttons, impulse uint8) error {
+func EncodeClcMove(buf *sizebuf.Buffer, sendTime float32, cmd server.UserCmd) error {
 	if buf == nil {
 		return ErrSendNilBuf
 	}
@@ -172,8 +171,8 @@ func EncodeClcMove(buf *sizebuf.Buffer, sendTime float32, cmd server.UserCmd, bu
 	if err := msg.WriteShort(buf, int(cmd.UpMove)); err != nil {
 		return err
 	}
-	if err := msg.WriteByte(buf, int(buttons)); err != nil {
+	if err := msg.WriteByte(buf, int(cmd.Buttons)); err != nil {
 		return err
 	}
-	return msg.WriteByte(buf, int(impulse))
+	return msg.WriteByte(buf, int(cmd.Impulse))
 }

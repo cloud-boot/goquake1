@@ -170,18 +170,20 @@ func TestEncodeClcStringCmd_StringOverflow(t *testing.T) {
 // --- EncodeClcMove --------------------------------------------------
 
 func TestEncodeClcMove_RoundTrip(t *testing.T) {
+	const buttons uint8 = 0b00000011 // attack + jump
+	const impulse uint8 = 5
 	cmd := server.UserCmd{
 		ViewAngles:  [3]float32{12, 45, -30}, // pitch / yaw / roll
 		ForwardMove: 320,
 		SideMove:    -175,
 		UpMove:      0,
+		Buttons:     buttons,
+		Impulse:     impulse,
 	}
 	const sendTime float32 = 17.5
-	const buttons uint8 = 0b00000011 // attack + jump
-	const impulse uint8 = 5
 
 	buf := sizebuf.New(make([]byte, 32))
-	if err := EncodeClcMove(buf, sendTime, cmd, buttons, impulse); err != nil {
+	if err := EncodeClcMove(buf, sendTime, cmd); err != nil {
 		t.Fatal(err)
 	}
 
@@ -235,18 +237,20 @@ func TestEncodeClcMove_RoundTrip(t *testing.T) {
 func TestEncodeClcMove_ByteLayout(t *testing.T) {
 	// Hand-roll a known UserCmd and compare the wire bytes verbatim,
 	// without going through the symmetric msg.Reader.
+	const buttons uint8 = 0x0A
+	const impulse uint8 = 0xFE
 	cmd := server.UserCmd{
 		ViewAngles:  [3]float32{0, 0, 0}, // all three angles -> byte 0
 		ForwardMove: 1,
 		SideMove:    2,
 		UpMove:      3,
+		Buttons:     buttons,
+		Impulse:     impulse,
 	}
 	const sendTime float32 = 0
-	const buttons uint8 = 0x0A
-	const impulse uint8 = 0xFE
 
 	buf := sizebuf.New(make([]byte, 16))
-	if err := EncodeClcMove(buf, sendTime, cmd, buttons, impulse); err != nil {
+	if err := EncodeClcMove(buf, sendTime, cmd); err != nil {
 		t.Fatal(err)
 	}
 
@@ -275,7 +279,7 @@ func TestEncodeClcMove_FloatSendTime(t *testing.T) {
 	cmd := server.UserCmd{}
 	const sendTime float32 = 3.14159
 	buf := sizebuf.New(make([]byte, 16))
-	if err := EncodeClcMove(buf, sendTime, cmd, 0, 0); err != nil {
+	if err := EncodeClcMove(buf, sendTime, cmd); err != nil {
 		t.Fatal(err)
 	}
 	bits := binary.LittleEndian.Uint32(buf.Bytes()[1:5])
@@ -285,7 +289,7 @@ func TestEncodeClcMove_FloatSendTime(t *testing.T) {
 }
 
 func TestEncodeClcMove_NilBuf(t *testing.T) {
-	err := EncodeClcMove(nil, 0, server.UserCmd{}, 0, 0)
+	err := EncodeClcMove(nil, 0, server.UserCmd{})
 	if !errors.Is(err, ErrSendNilBuf) {
 		t.Errorf("got %v want ErrSendNilBuf", err)
 	}
@@ -314,17 +318,19 @@ func TestEncodeClcMove_OverflowAtEveryField(t *testing.T) {
 		ForwardMove: 10,
 		SideMove:    20,
 		UpMove:      30,
+		Buttons:     0xAB,
+		Impulse:     0xCD,
 	}
 	for _, n := range []int{0, 1, 5, 6, 7, 8, 10, 12, 14, 15} {
 		buf := sizebuf.New(make([]byte, n))
-		err := EncodeClcMove(buf, 1.0, cmd, 0xAB, 0xCD)
+		err := EncodeClcMove(buf, 1.0, cmd)
 		if err == nil {
 			t.Errorf("cap=%d: expected overflow", n)
 		}
 	}
 	// And the 16-byte buf succeeds (cap == exact size).
 	buf := sizebuf.New(make([]byte, 16))
-	if err := EncodeClcMove(buf, 1.0, cmd, 0xAB, 0xCD); err != nil {
+	if err := EncodeClcMove(buf, 1.0, cmd); err != nil {
 		t.Errorf("cap=16: got %v, want success", err)
 	}
 }

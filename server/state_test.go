@@ -165,11 +165,16 @@ func TestUserCmd_FieldShape(t *testing.T) {
 		ForwardMove: 100,
 		SideMove:    -50,
 		UpMove:      25,
+		Buttons:     0x03, // attack + jump
+		Impulse:     9,
 	}
 	if cmd.ViewAngles[0] != 45 {
 		t.Errorf("ViewAngles[0]: got %v want 45", cmd.ViewAngles[0])
 	}
 	if cmd.ForwardMove != 100 || cmd.SideMove != -50 || cmd.UpMove != 25 {
 		t.Errorf("move drift: %+v", cmd)
+	}
+	if cmd.Buttons != 0x03 || cmd.Impulse != 9 {
+		t.Errorf("trigger drift: %+v", cmd)
 	}
 }
