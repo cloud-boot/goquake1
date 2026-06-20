@@ -12,13 +12,13 @@ Pure-Go [Quake](https://en.wikipedia.org/wiki/Quake_(video_game)) 1
 from the [tyrquake][tyr] NetQuake (single-player) branch and wrapped
 in [cloud-boot][cb] virtio adapters.
 
-Sibling of [cloud-boot/godoom][godoom] in the [DOOM → Quake roadmap][roadmap].
+Sibling of [go-doom/engine][godoom] in the [DOOM → Quake roadmap][roadmap].
 Family siblings: [go-quake2][gq2] (id Tech 2 — reserved) and
 [go-quake3][gq3] (id Tech 3 — reserved).
 
 [tyr]: https://github.com/sezero/tyrquake
 [cb]: https://github.com/cloud-boot
-[godoom]: https://github.com/cloud-boot/godoom
+[godoom]: https://github.com/go-doom/engine
 [roadmap]: https://github.com/cloud-boot/docs/blob/main/docs/architecture/quake-roadmap.md
 [gq2]: https://github.com/go-quake2
 [gq3]: https://github.com/go-quake3
