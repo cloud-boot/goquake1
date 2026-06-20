@@ -251,6 +251,26 @@ func (vm *VM) XFunction() int32  { return vm.xFunc }
 func (vm *VM) XStatement() int32 { return vm.xStmt }
 func (vm *VM) Depth() int        { return vm.depth }
 
+// Reset clears the per-execution state -- the return-frame stack,
+// the depth/xFunc/xStmt cursors, the runaway-loop budget, and the
+// carried builtin arg count. Globals, builtins, arena, and state
+// hooks survive. Useful after a Run() that returned an error left
+// the VM in a non-zero depth, or between tic boundaries where the
+// embedder wants to guarantee a fresh-start posture even if a
+// previous tic mis-exited.
+//
+// tyrquake: no direct analogue -- the upstream relies on
+// PR_ExecuteProgram never returning early, but the Go port surfaces
+// errors so callers need an explicit clear.
+func (vm *VM) Reset() {
+	vm.stack = vm.stack[:0]
+	vm.depth = 0
+	vm.xFunc = 0
+	vm.xStmt = 0
+	vm.runaway = 0
+	vm.argc = 0
+}
+
 // Run executes the function at index fn until OP_DONE / OP_RETURN
 // pops the frame the call entered. Function 0 is the empty-function
 // slot (tyrquake reserves it for "null function") and is rejected.

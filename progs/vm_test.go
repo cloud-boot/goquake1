@@ -1092,6 +1092,75 @@ func TestRun_ADDRESS_BadPointer(t *testing.T) {
 	}
 }
 
+// --- Reset clears per-execution state, preserves wiring -------------------
+
+func TestVM_Reset(t *testing.T) {
+	// Drive the VM into a non-zero-depth state by calling
+	// enterFunction without a matching leaveFunction (simulates the
+	// posture after a Run() that errored mid-flight).
+	vm := NewVM(progsForVM(nil))
+	if err := vm.enterFunction(1); err != nil {
+		t.Fatal(err)
+	}
+	if vm.Depth() == 0 {
+		t.Fatal("setup: depth should be non-zero after enterFunction")
+	}
+
+	// Wire some bits that Reset MUST preserve: builtins, arena,
+	// state hooks, and a globals write.
+	vm.RegisterBuiltin(1, func(*VM) error { return nil })
+	a := NewEdictArena(vm.progs, 4)
+	vm.SetArena(a)
+	vm.SetStateHooks(func() float32 { return 0 }, func() int32 { return 0 })
+	vm.SetStateFieldOffsets(0, 1, 2)
+	_ = vm.SetGlobalFloat(50, 7.5)
+
+	vm.Reset()
+
+	// Per-execution state cleared.
+	if vm.Depth() != 0 {
+		t.Errorf("Depth after Reset: got %d want 0", vm.Depth())
+	}
+	if vm.XFunction() != 0 {
+		t.Errorf("XFunction after Reset: got %d want 0", vm.XFunction())
+	}
+	if vm.XStatement() != 0 {
+		t.Errorf("XStatement after Reset: got %d want 0", vm.XStatement())
+	}
+	if vm.Argc() != 0 {
+		t.Errorf("Argc after Reset: got %d want 0", vm.Argc())
+	}
+
+	// Wiring preserved.
+	if vm.builtins[1] == nil {
+		t.Error("Reset dropped builtins")
+	}
+	if vm.arena != a {
+		t.Error("Reset dropped arena")
+	}
+	if vm.timeSource == nil || vm.selfEdict == nil || !vm.stateFieldsSet {
+		t.Error("Reset dropped state hooks")
+	}
+	if v, _ := vm.GlobalFloat(50); v != 7.5 {
+		t.Errorf("Reset clobbered globals: got %v want 7.5", v)
+	}
+
+	// After Reset the VM is usable again: a fresh Run works.
+	p2 := progsForVM(withStatements(Statement{Op: OP_STORE_F, A: 10, B: 11}))
+	vm2 := NewVM(p2)
+	if err := vm2.enterFunction(1); err != nil {
+		t.Fatal(err)
+	}
+	vm2.Reset()
+	_ = vm2.SetGlobalFloat(10, 11)
+	if err := vm2.Run(1); err != nil {
+		t.Fatalf("Run after Reset: %v", err)
+	}
+	if v, _ := vm2.GlobalFloat(11); v != 11 {
+		t.Errorf("Run after Reset: got %v want 11", v)
+	}
+}
+
 // --- expose XFunction/XStatement/Depth/Globals accessors -------------------
 
 func TestVM_Accessors(t *testing.T) {
