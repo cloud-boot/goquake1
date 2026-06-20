@@ -8,7 +8,8 @@
 // 873-972).
 //
 // Upstream pin:
-//   github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
+//
+//	github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
 //
 // Naming: the C "COM_" prefix is dropped; the package qualifier carries
 // the intent (qpath.SkipPath, qpath.FileBase). The package is named

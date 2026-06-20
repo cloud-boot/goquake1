@@ -24,11 +24,11 @@ type CacheUser struct {
 // parity with upstream; the full LRU logic is not yet ported (see
 // package doc).
 type cacheSystem struct {
-	size                int32
-	user                *CacheUser
-	name                [CacheNameLen]byte
-	prev, next          *cacheSystem
-	lruPrev, lruNext    *cacheSystem
+	size             int32
+	user             *CacheUser
+	name             [CacheNameLen]byte
+	prev, next       *cacheSystem
+	lruPrev, lruNext *cacheSystem
 }
 
 // Cache is the LRU cache layered on top of a Hunk. The full

@@ -110,16 +110,16 @@ const (
 // reserves 3 slots so it can carry a vec3); return value sits at
 // OfsReturn. tyrquake: OFS_* macros in pr_comp.h.
 const (
-	OfsNull   = 0
-	OfsReturn = 1
-	OfsParm0  = 4
-	OfsParm1  = 7
-	OfsParm2  = 10
-	OfsParm3  = 13
-	OfsParm4  = 16
-	OfsParm5  = 19
-	OfsParm6  = 22
-	OfsParm7  = 25
+	OfsNull     = 0
+	OfsReturn   = 1
+	OfsParm0    = 4
+	OfsParm1    = 7
+	OfsParm2    = 10
+	OfsParm3    = 13
+	OfsParm4    = 16
+	OfsParm5    = 19
+	OfsParm6    = 22
+	OfsParm7    = 25
 	OfsReserved = 28
 )
 

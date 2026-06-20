@@ -38,9 +38,9 @@ type buildSpec struct {
 	frames  []frameSpec
 }
 
-func putU32(b *bytes.Buffer, v uint32)   { _ = binary.Write(b, binary.LittleEndian, v) }
-func putI32(b *bytes.Buffer, v int32)    { _ = binary.Write(b, binary.LittleEndian, v) }
-func putF32(b *bytes.Buffer, v float32)  { _ = binary.Write(b, binary.LittleEndian, v) }
+func putU32(b *bytes.Buffer, v uint32)  { _ = binary.Write(b, binary.LittleEndian, v) }
+func putI32(b *bytes.Buffer, v int32)   { _ = binary.Write(b, binary.LittleEndian, v) }
+func putF32(b *bytes.Buffer, v float32) { _ = binary.Write(b, binary.LittleEndian, v) }
 
 func encodeSingle(b *bytes.Buffer, s singleSpec) {
 	putI32(b, s.originX)
@@ -67,8 +67,8 @@ func build(s buildSpec) ([]byte, int64) {
 	putI32(buf, s.width)
 	putI32(buf, s.height)
 	putI32(buf, int32(len(s.frames)))
-	putF32(buf, 0)  // beam length
-	putI32(buf, 0)  // sync type
+	putF32(buf, 0) // beam length
+	putI32(buf, 0) // sync type
 	for _, f := range s.frames {
 		putI32(buf, f.kind)
 		switch f.kind {
@@ -227,13 +227,15 @@ func TestLoad_TruncatedSingleHeader(t *testing.T) {
 	buf := &bytes.Buffer{}
 	putU32(buf, IDSpriteHeader)
 	putI32(buf, Version)
-	putI32(buf, 0)              // type
-	putF32(buf, 0)              // boundingradius
-	putI32(buf, 1); putI32(buf, 1)
-	putI32(buf, 1)              // numframes
-	putF32(buf, 0); putI32(buf, 0)
-	putI32(buf, FrameSingle)    // tag
-	putI32(buf, 0)              // origin_x only -- truncated here
+	putI32(buf, 0) // type
+	putF32(buf, 0) // boundingradius
+	putI32(buf, 1)
+	putI32(buf, 1)
+	putI32(buf, 1) // numframes
+	putF32(buf, 0)
+	putI32(buf, 0)
+	putI32(buf, FrameSingle) // tag
+	putI32(buf, 0)           // origin_x only -- truncated here
 	raw := buf.Bytes()
 	if _, err := Load(bytes.NewReader(raw), int64(len(raw))); !errors.Is(err, ErrSectionOutOfRange) {
 		t.Errorf("got %v want ErrSectionOutOfRange", err)
@@ -245,12 +247,18 @@ func TestLoad_TruncatedBitmap(t *testing.T) {
 	buf := &bytes.Buffer{}
 	putU32(buf, IDSpriteHeader)
 	putI32(buf, Version)
-	putI32(buf, 0); putF32(buf, 0)
-	putI32(buf, 4); putI32(buf, 4)
-	putI32(buf, 1); putF32(buf, 0); putI32(buf, 0)
+	putI32(buf, 0)
+	putF32(buf, 0)
+	putI32(buf, 4)
+	putI32(buf, 4)
+	putI32(buf, 1)
+	putF32(buf, 0)
+	putI32(buf, 0)
 	putI32(buf, FrameSingle)
-	putI32(buf, 0); putI32(buf, 0)
-	putI32(buf, 4); putI32(buf, 4)
+	putI32(buf, 0)
+	putI32(buf, 0)
+	putI32(buf, 4)
+	putI32(buf, 4)
 	buf.WriteByte(0xFF) // only 1 byte, need 16
 	raw := buf.Bytes()
 	if _, err := Load(bytes.NewReader(raw), int64(len(raw))); !errors.Is(err, ErrSectionOutOfRange) {
@@ -272,9 +280,13 @@ func TestLoad_TruncatedGroupHeader(t *testing.T) {
 	buf := &bytes.Buffer{}
 	putU32(buf, IDSpriteHeader)
 	putI32(buf, Version)
-	putI32(buf, 0); putF32(buf, 0)
-	putI32(buf, 1); putI32(buf, 1)
-	putI32(buf, 1); putF32(buf, 0); putI32(buf, 0)
+	putI32(buf, 0)
+	putF32(buf, 0)
+	putI32(buf, 1)
+	putI32(buf, 1)
+	putI32(buf, 1)
+	putF32(buf, 0)
+	putI32(buf, 0)
 	putI32(buf, FrameGroup) // tag
 	// no group header follows
 	raw := buf.Bytes()
@@ -287,9 +299,13 @@ func TestLoad_NegativeGroupCount(t *testing.T) {
 	buf := &bytes.Buffer{}
 	putU32(buf, IDSpriteHeader)
 	putI32(buf, Version)
-	putI32(buf, 0); putF32(buf, 0)
-	putI32(buf, 1); putI32(buf, 1)
-	putI32(buf, 1); putF32(buf, 0); putI32(buf, 0)
+	putI32(buf, 0)
+	putF32(buf, 0)
+	putI32(buf, 1)
+	putI32(buf, 1)
+	putI32(buf, 1)
+	putF32(buf, 0)
+	putI32(buf, 0)
 	putI32(buf, FrameGroup)
 	putI32(buf, -1) // negative numframes
 	raw := buf.Bytes()
@@ -302,9 +318,13 @@ func TestLoad_TruncatedGroupIntervals(t *testing.T) {
 	buf := &bytes.Buffer{}
 	putU32(buf, IDSpriteHeader)
 	putI32(buf, Version)
-	putI32(buf, 0); putF32(buf, 0)
-	putI32(buf, 1); putI32(buf, 1)
-	putI32(buf, 1); putF32(buf, 0); putI32(buf, 0)
+	putI32(buf, 0)
+	putF32(buf, 0)
+	putI32(buf, 1)
+	putI32(buf, 1)
+	putI32(buf, 1)
+	putF32(buf, 0)
+	putI32(buf, 0)
 	putI32(buf, FrameGroup)
 	putI32(buf, 3) // 3 intervals expected
 	// no intervals follow
@@ -318,11 +338,15 @@ func TestLoad_TruncatedGroupSubFrame(t *testing.T) {
 	buf := &bytes.Buffer{}
 	putU32(buf, IDSpriteHeader)
 	putI32(buf, Version)
-	putI32(buf, 0); putF32(buf, 0)
-	putI32(buf, 1); putI32(buf, 1)
-	putI32(buf, 1); putF32(buf, 0); putI32(buf, 0)
+	putI32(buf, 0)
+	putF32(buf, 0)
+	putI32(buf, 1)
+	putI32(buf, 1)
+	putI32(buf, 1)
+	putF32(buf, 0)
+	putI32(buf, 0)
 	putI32(buf, FrameGroup)
-	putI32(buf, 1) // 1 frame
+	putI32(buf, 1)   // 1 frame
 	putF32(buf, 0.1) // 1 interval
 	// no sub-frame header
 	raw := buf.Bytes()

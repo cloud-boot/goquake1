@@ -88,7 +88,7 @@ func TestGlobalAccessors_OutOfRange(t *testing.T) {
 	if _, err := vm.GlobalFloat(-1); !errors.Is(err, ErrGlobalOffset) {
 		t.Error("Float neg")
 	}
-	if _, err := vm.GlobalInt(1<<20); !errors.Is(err, ErrGlobalOffset) {
+	if _, err := vm.GlobalInt(1 << 20); !errors.Is(err, ErrGlobalOffset) {
 		t.Error("Int far")
 	}
 	if _, err := vm.GlobalVector(-1); !errors.Is(err, ErrGlobalOffset) {
@@ -189,9 +189,9 @@ func TestRun_Vector_DotAndScale(t *testing.T) {
 
 func TestRun_Comparison_Float(t *testing.T) {
 	cases := []struct {
-		op       Op
-		a, b     float32
-		want     float32
+		op   Op
+		a, b float32
+		want float32
 	}{
 		{OP_GE, 5, 5, 1}, {OP_GE, 4, 5, 0},
 		{OP_LE, 5, 5, 1}, {OP_LE, 6, 5, 0},
@@ -393,7 +393,7 @@ func TestRun_IfTakesBranch(t *testing.T) {
 
 func TestRun_IfNotFallsThrough(t *testing.T) {
 	p := progsForVM(withStatements(
-		Statement{Op: OP_IFNOT, A: 10, B: 2},   // a!=0 -> don't take branch
+		Statement{Op: OP_IFNOT, A: 10, B: 2},    // a!=0 -> don't take branch
 		Statement{Op: OP_STORE_F, A: 11, B: 12}, // runs
 		Statement{Op: OP_DONE},
 	))
@@ -518,7 +518,7 @@ func TestRun_STATE_BadFieldOffset(t *testing.T) {
 	// Field offsets that point past the edict field block surface as
 	// ErrFieldOffset from each Field* call.
 	tests := []struct {
-		name    string
+		name                    string
 		nextThink, frame, think int
 	}{
 		{"nextthink-far", 1 << 20, 0, 0},
@@ -765,9 +765,9 @@ func TestRun_CALL_QuakeCFunctionDispatch(t *testing.T) {
 	// is an identity write (matches what QuakeC compilers emit for
 	// "the function we just called returned a value; preserve it").
 	p := progsForVM(withStatements(
-		Statement{Op: OP_CALL0, A: 10},                    // 1
-		Statement{Op: OP_DONE, A: OfsReturn},              // 2 -- caller's DONE (identity write)
-		Statement{Op: OP_RETURN, A: 50},                   // 3 -- callee body
+		Statement{Op: OP_CALL0, A: 10},       // 1
+		Statement{Op: OP_DONE, A: OfsReturn}, // 2 -- caller's DONE (identity write)
+		Statement{Op: OP_RETURN, A: 50},      // 3 -- callee body
 	))
 	p.Functions = append(p.Functions, Function{FirstStatement: 3, SName: 0})
 	vm := NewVM(p)

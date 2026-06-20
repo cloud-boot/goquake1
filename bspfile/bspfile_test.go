@@ -16,13 +16,13 @@ import (
 // Only the lumps we ship typed decoders for need entries; others
 // default to empty.
 type buildSpec struct {
-	version  int32 // 0 -> Version29
-	vertices []Vertex
-	edges    []Edge
+	version   int32 // 0 -> Version29
+	vertices  []Vertex
+	edges     []Edge
 	surfedges []Surfedge
-	planes   []Plane
-	models   []Model
-	entities []byte // raw entity string
+	planes    []Plane
+	models    []Model
+	entities  []byte // raw entity string
 }
 
 // build serialises a buildSpec into a valid BSP byte stream. Returns
@@ -126,15 +126,15 @@ func build(s buildSpec) ([]byte, int64) {
 
 func TestOpen_MinimalValid(t *testing.T) {
 	raw, sz := build(buildSpec{
-		vertices: []Vertex{{1, 2, 3}, {-4, -5, -6}},
-		edges:    []Edge{{V0: 0, V1: 1}},
+		vertices:  []Vertex{{1, 2, 3}, {-4, -5, -6}},
+		edges:     []Edge{{V0: 0, V1: 1}},
 		surfedges: []Surfedge{1, -1},
 		planes: []Plane{{
 			Normal: [3]float32{1, 0, 0}, Dist: 5, Type: PlaneX,
 		}},
 		models: []Model{{
-			Mins: [3]float32{-16, -16, -32},
-			Maxs: [3]float32{16, 16, 32},
+			Mins:     [3]float32{-16, -16, -32},
+			Maxs:     [3]float32{16, 16, 32},
 			Headnode: [MaxMapHulls]int32{0, 1, 2, 3},
 			VisLeafs: 42, FirstFace: 5, NumFaces: 9,
 		}},

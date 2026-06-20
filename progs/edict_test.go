@@ -228,9 +228,9 @@ func TestEdict_FieldOutOfRange(t *testing.T) {
 	a.Reset()
 	e, _, _ := a.Alloc()
 	for name, fn := range map[string]func() error{
-		"float-neg":  func() error { return e.FieldSetFloat(-1, 0) },
-		"float-far":  func() error { return e.FieldSetFloat(100, 0) },
-		"int-far":    func() error { return e.FieldSetInt(100, 0) },
+		"float-neg":    func() error { return e.FieldSetFloat(-1, 0) },
+		"float-far":    func() error { return e.FieldSetFloat(100, 0) },
+		"int-far":      func() error { return e.FieldSetInt(100, 0) },
 		"vec-near-end": func() error { return e.FieldSetVector(1, [3]float32{}) }, // needs 12 bytes from ofs 4, but only 8 total
 	} {
 		if err := fn(); !errors.Is(err, ErrFieldOffset) {

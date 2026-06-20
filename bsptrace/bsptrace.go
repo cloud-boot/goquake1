@@ -14,12 +14,12 @@ import (
 // a valid-index range + a per-side bbox offset for asymmetric
 // swept-box traces. tyrquake: hull_t.
 type Hull struct {
-	ClipNodes      []bspfile.ClipNode
-	Planes         []bspfile.Plane
-	FirstClipNode  int32
-	LastClipNode   int32
-	ClipMins       [3]float32
-	ClipMaxs       [3]float32
+	ClipNodes     []bspfile.ClipNode
+	Planes        []bspfile.Plane
+	FirstClipNode int32
+	LastClipNode  int32
+	ClipMins      [3]float32
+	ClipMaxs      [3]float32
 }
 
 // DistEpsilon is the tyrquake "1/32 epsilon to keep floating point
@@ -30,24 +30,25 @@ const DistEpsilon = 0.03125
 
 // Sentinel errors.
 var (
-	ErrBadNodeIndex = errors.New("bsptrace: node index outside hull's clipnode range")
+	ErrBadNodeIndex  = errors.New("bsptrace: node index outside hull's clipnode range")
 	ErrBadPlaneIndex = errors.New("bsptrace: clipnode plane index outside hull's planes slice")
 )
 
 // Trace is the swept-trace result. Mirrors tyrquake's trace_t.
-//   AllSolid   -- true when the start AND end are both in solid
-//                 space (no impact plane is valid).
-//   StartSolid -- true when the start point was already in solid.
-//   InOpen     -- the trace passed through CONTENTS_EMPTY at some point.
-//   InWater    -- the trace passed through a liquid (water/slime/lava).
-//   Fraction   -- 1.0 = the trace completed without hitting anything;
-//                 < 1.0 = fraction of the (p2-p1) span at which the
-//                 first impact occurred.
-//   EndPos     -- the final position (= p1 + Fraction*(p2-p1) for an
-//                 impact; = p2 for a clean trace).
-//   Plane      -- the surface plane at the impact point (Normal +
-//                 Dist). Only meaningful when AllSolid is false AND
-//                 Fraction < 1.0.
+//
+//	AllSolid   -- true when the start AND end are both in solid
+//	              space (no impact plane is valid).
+//	StartSolid -- true when the start point was already in solid.
+//	InOpen     -- the trace passed through CONTENTS_EMPTY at some point.
+//	InWater    -- the trace passed through a liquid (water/slime/lava).
+//	Fraction   -- 1.0 = the trace completed without hitting anything;
+//	              < 1.0 = fraction of the (p2-p1) span at which the
+//	              first impact occurred.
+//	EndPos     -- the final position (= p1 + Fraction*(p2-p1) for an
+//	              impact; = p2 for a clean trace).
+//	Plane      -- the surface plane at the impact point (Normal +
+//	              Dist). Only meaningful when AllSolid is false AND
+//	              Fraction < 1.0.
 type Trace struct {
 	AllSolid   bool
 	StartSolid bool

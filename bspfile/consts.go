@@ -7,9 +7,9 @@ package bspfile
 // BSP version magic. Only Version29 is parsed by this package; the
 // BSP2 / BSP2RMQ extensions land alongside the renderer port.
 const (
-	Version29     = 29
-	Version2      = ('B' | ('S' << 8) | ('P' << 16) | ('2' << 24))
-	Version2RMQ   = (('B' << 24) | ('S' << 16) | ('P' << 8) | '2')
+	Version29   = 29
+	Version2    = ('B' | ('S' << 8) | ('P' << 16) | ('2' << 24))
+	Version2RMQ = (('B' << 24) | ('S' << 16) | ('P' << 8) | '2')
 )
 
 // LumpKind indexes a header slot. tyrquake: LUMP_*.
@@ -39,25 +39,25 @@ const (
 // counts against them so a corrupted file can't trigger absurd
 // allocations.
 const (
-	MaxMapHulls         = 4
-	MaxMapModels        = 256
-	MaxMapBrushes       = 4096
-	MaxMapEntities      = 1024
-	MaxMapEntString     = 65536
-	MaxMapPlanes        = 16384
-	MaxMapNodes         = 32767
-	MaxMapClipnodes     = 32767
-	MaxMapLeafs         = 32767
-	MaxMapVerts         = 65535
-	MaxMapFaces         = 65535
-	MaxMapMarksurfaces  = 65535
-	MaxMapTexInfo       = 4096
-	MaxMapEdges         = 256000
-	MaxMapSurfedges     = 512000
-	MaxMapTextures      = 512
-	MaxMapMipTex        = 0x200000
-	MaxMapLighting      = 0x100000
-	MaxMapVisibility    = 0x100000
+	MaxMapHulls        = 4
+	MaxMapModels       = 256
+	MaxMapBrushes      = 4096
+	MaxMapEntities     = 1024
+	MaxMapEntString    = 65536
+	MaxMapPlanes       = 16384
+	MaxMapNodes        = 32767
+	MaxMapClipnodes    = 32767
+	MaxMapLeafs        = 32767
+	MaxMapVerts        = 65535
+	MaxMapFaces        = 65535
+	MaxMapMarksurfaces = 65535
+	MaxMapTexInfo      = 4096
+	MaxMapEdges        = 256000
+	MaxMapSurfedges    = 512000
+	MaxMapTextures     = 512
+	MaxMapMipTex       = 0x200000
+	MaxMapLighting     = 0x100000
+	MaxMapVisibility   = 0x100000
 )
 
 // Plane type tags. 0..2 are axially-aligned planes (the fast path);
@@ -76,14 +76,14 @@ const (
 // tyrquake: CONTENTS_*. Values stay byte-equal to the C upstream so
 // negative-child encoding (-content) in nodes still works.
 const (
-	ContentsEmpty     = -1
-	ContentsSolid     = -2
-	ContentsWater     = -3
-	ContentsSlime     = -4
-	ContentsLava      = -5
-	ContentsSky       = -6
-	ContentsOrigin    = -7
-	ContentsClip      = -8
+	ContentsEmpty      = -1
+	ContentsSolid      = -2
+	ContentsWater      = -3
+	ContentsSlime      = -4
+	ContentsLava       = -5
+	ContentsSky        = -6
+	ContentsOrigin     = -7
+	ContentsClip       = -8
 	ContentsCurrent0   = -9
 	ContentsCurrent90  = -10
 	ContentsCurrent180 = -11

@@ -9,22 +9,23 @@
 // in engine/vfs (next port).
 //
 // Upstream pin:
-//   github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
+//
+//	github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
 //
 // On-disk layout (little-endian throughout):
 //
-//   header (12 bytes)
-//     [0:4]   id   = "PACK"
-//     [4:8]   dirofs (int32)  offset to directory table
-//     [8:12]  dirlen (int32)  byte length of directory table
+//	header (12 bytes)
+//	  [0:4]   id   = "PACK"
+//	  [4:8]   dirofs (int32)  offset to directory table
+//	  [8:12]  dirlen (int32)  byte length of directory table
 //
-//   each directory entry (64 bytes)
-//     [0:56]  name (NUL-padded, no NUL required if name fills 56 bytes)
-//     [56:60] filepos (int32) byte offset of payload in the .pak
-//     [60:64] filelen (int32) byte length of payload
+//	each directory entry (64 bytes)
+//	  [0:56]  name (NUL-padded, no NUL required if name fills 56 bytes)
+//	  [56:60] filepos (int32) byte offset of payload in the .pak
+//	  [60:64] filelen (int32) byte length of payload
 //
-//   payloads
-//     stored uncompressed at filepos, contiguous, in arbitrary order.
+//	payloads
+//	  stored uncompressed at filepos, contiguous, in arbitrary order.
 //
 // The shareware Episode 1 `pak0.pak` ID Software released into the
 // public-redistributable category contains 339 entries totalling

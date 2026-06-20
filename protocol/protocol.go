@@ -95,20 +95,20 @@ const (
 // servercmd byte; high bits (>= U_ANGLE1) come from a follow-up
 // short read in svc_update.
 const (
-	UMoreBits  = 1 << 0
-	UOrigin1   = 1 << 1
-	UOrigin2   = 1 << 2
-	UOrigin3   = 1 << 3
-	UAngle2    = 1 << 4
-	UNoLerp    = 1 << 5
-	UFrame     = 1 << 6
-	USignal    = 1 << 7
-	UAngle1    = 1 << 8
-	UAngle3    = 1 << 9
-	UModel     = 1 << 10
-	UColorMap  = 1 << 11
-	USkin      = 1 << 12
-	UEffects   = 1 << 13
+	UMoreBits   = 1 << 0
+	UOrigin1    = 1 << 1
+	UOrigin2    = 1 << 2
+	UOrigin3    = 1 << 3
+	UAngle2     = 1 << 4
+	UNoLerp     = 1 << 5
+	UFrame      = 1 << 6
+	USignal     = 1 << 7
+	UAngle1     = 1 << 8
+	UAngle3     = 1 << 9
+	UModel      = 1 << 10
+	UColorMap   = 1 << 11
+	USkin       = 1 << 12
+	UEffects    = 1 << 13
 	ULongEntity = 1 << 14
 
 	// FITZ extensions.
@@ -123,21 +123,21 @@ const (
 // SU_* are the svc_clientdata "shortbits" flags describing which
 // player-state fields the server is sending this frame.
 const (
-	SUViewHeight   = 1 << 0
-	SUIdealPitch   = 1 << 1
-	SUPunch1       = 1 << 2
-	SUPunch2       = 1 << 3
-	SUPunch3       = 1 << 4
-	SUVelocity1    = 1 << 5
-	SUVelocity2    = 1 << 6
-	SUVelocity3    = 1 << 7
+	SUViewHeight = 1 << 0
+	SUIdealPitch = 1 << 1
+	SUPunch1     = 1 << 2
+	SUPunch2     = 1 << 3
+	SUPunch3     = 1 << 4
+	SUVelocity1  = 1 << 5
+	SUVelocity2  = 1 << 6
+	SUVelocity3  = 1 << 7
 	// bit 8 is reserved (SU_AIMENT in some forks).
-	SUItems        = 1 << 9
-	SUOnGround     = 1 << 10
-	SUInWater      = 1 << 11
-	SUWeaponFrame  = 1 << 12
-	SUArmor        = 1 << 13
-	SUWeapon       = 1 << 14
+	SUItems       = 1 << 9
+	SUOnGround    = 1 << 10
+	SUInWater     = 1 << 11
+	SUWeaponFrame = 1 << 12
+	SUArmor       = 1 << 13
+	SUWeapon      = 1 << 14
 
 	// FITZ extensions.
 	SUFitzExtend1      = 1 << 15
@@ -233,41 +233,41 @@ const (
 
 // Server-to-client message-type tags. tyrquake: svc_*.
 const (
-	SvcBad             = 0
-	SvcNop             = 1
-	SvcDisconnect      = 2
-	SvcUpdateStat      = 3
-	SvcVersion         = 4
-	SvcSetView         = 5
-	SvcSound           = 6
-	SvcTime            = 7
-	SvcPrint           = 8
-	SvcStuffText       = 9
-	SvcSetAngle        = 10
-	SvcServerInfo      = 11
-	SvcLightStyle      = 12
-	SvcUpdateName      = 13
-	SvcUpdateFrags     = 14
-	SvcClientData      = 15
-	SvcStopSound       = 16
-	SvcUpdateColors    = 17
-	SvcParticle        = 18
-	SvcDamage          = 19
-	SvcSpawnStatic     = 20
+	SvcBad          = 0
+	SvcNop          = 1
+	SvcDisconnect   = 2
+	SvcUpdateStat   = 3
+	SvcVersion      = 4
+	SvcSetView      = 5
+	SvcSound        = 6
+	SvcTime         = 7
+	SvcPrint        = 8
+	SvcStuffText    = 9
+	SvcSetAngle     = 10
+	SvcServerInfo   = 11
+	SvcLightStyle   = 12
+	SvcUpdateName   = 13
+	SvcUpdateFrags  = 14
+	SvcClientData   = 15
+	SvcStopSound    = 16
+	SvcUpdateColors = 17
+	SvcParticle     = 18
+	SvcDamage       = 19
+	SvcSpawnStatic  = 20
 	// 21 (svc_spawnbinary) is unused.
-	SvcSpawnBaseline   = 22
-	SvcTempEntity      = 23
-	SvcSetPause        = 24
-	SvcSignonNum       = 25
-	SvcCenterPrint     = 26
-	SvcKilledMonster   = 27
-	SvcFoundSecret     = 28
+	SvcSpawnBaseline    = 22
+	SvcTempEntity       = 23
+	SvcSetPause         = 24
+	SvcSignonNum        = 25
+	SvcCenterPrint      = 26
+	SvcKilledMonster    = 27
+	SvcFoundSecret      = 28
 	SvcSpawnStaticSound = 29
-	SvcIntermission    = 30
-	SvcFinale          = 31
-	SvcCDTrack         = 32
-	SvcSellScreen      = 33
-	SvcCutscene        = 34
+	SvcIntermission     = 30
+	SvcFinale           = 31
+	SvcCDTrack          = 32
+	SvcSellScreen       = 33
+	SvcCutscene         = 34
 
 	// FITZ extensions.
 	SvcFitzSkybox            = 37

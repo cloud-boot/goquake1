@@ -66,7 +66,7 @@ func TestFileBase(t *testing.T) {
 		{"foo.mdl", "foo"},
 		{"id1/x.mdl", "?model?"}, // basename "x" is 1 char < 2 -> sentinel
 		{"x.mdl", "?model?"},
-		{"id1/", "?model?"},      // empty basename
+		{"id1/", "?model?"}, // empty basename
 		{"", "?model?"},
 		{"noext", "noext"},
 		{"longname", "longname"},
@@ -83,7 +83,7 @@ func TestDefaultExtension(t *testing.T) {
 		path, ext, want string
 	}{
 		{"foo", ".mdl", "foo.mdl"},
-		{"foo.mdl", ".bsp", "foo.mdl"}, // already has dot in basename
+		{"foo.mdl", ".bsp", "foo.mdl"},         // already has dot in basename
 		{"id1.x/foo", ".bsp", "id1.x/foo.bsp"}, // dot in dir, NOT basename
 		{"", ".txt", ".txt"},
 	}

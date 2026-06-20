@@ -292,7 +292,7 @@ func TestQGCD(t *testing.T) {
 		{12, 8, 4},
 		{8, 12, 4}, // order-independent
 		{17, 5, 1},
-		{0, 0, 1},  // tyrquake's `a ? a : 1` for the both-zero case
+		{0, 0, 1}, // tyrquake's `a ? a : 1` for the both-zero case
 		{0, 7, 7},
 		{42, 0, 42},
 		{100, 25, 25},
@@ -328,7 +328,7 @@ func TestFloorDivMod(t *testing.T) {
 		{10, 3, 3, 1},
 		{0, 3, 0, 0},
 		{9, 3, 3, 0},
-		{-10, 3, -4, 2},  // floor-based: -10 = -4*3 + 2
+		{-10, 3, -4, 2}, // floor-based: -10 = -4*3 + 2
 		{-9, 3, -3, 0},
 		{-1, 5, -1, 4},
 	}

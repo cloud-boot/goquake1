@@ -43,7 +43,7 @@ const (
 
 // Sentinel errors.
 var (
-	ErrBadMagic = errors.New("wad: not a WAD2 file (bad magic)")
+	ErrBadMagic  = errors.New("wad: not a WAD2 file (bad magic)")
 	ErrShortRead = errors.New("wad: short read")
 )
 
@@ -60,9 +60,9 @@ type Lump struct {
 
 // FS is the read-only [io/fs.FS] view of one WAD2 archive.
 type FS struct {
-	src     io.ReaderAt
-	lumps   []Lump
-	byName  map[string]int // canonical (lowercase) name -> index
+	src    io.ReaderAt
+	lumps  []Lump
+	byName map[string]int // canonical (lowercase) name -> index
 }
 
 // Open parses src and returns a queryable FS. src is retained for
@@ -226,14 +226,19 @@ type fileInfo struct {
 	dir  bool
 }
 
-func (i *fileInfo) Name() string                { return i.name }
-func (i *fileInfo) Size() int64                 { return i.size }
-func (i *fileInfo) Mode() fs.FileMode           { if i.dir { return fs.ModeDir | 0555 }; return 0444 }
-func (i *fileInfo) ModTime() time.Time          { return time.Time{} }
-func (i *fileInfo) IsDir() bool                 { return i.dir }
-func (i *fileInfo) Sys() any                    { return nil }
-func (i *fileInfo) Info() (fs.FileInfo, error)  { return i, nil }
-func (i *fileInfo) Type() fs.FileMode           { return i.Mode() & fs.ModeType }
+func (i *fileInfo) Name() string { return i.name }
+func (i *fileInfo) Size() int64  { return i.size }
+func (i *fileInfo) Mode() fs.FileMode {
+	if i.dir {
+		return fs.ModeDir | 0555
+	}
+	return 0444
+}
+func (i *fileInfo) ModTime() time.Time         { return time.Time{} }
+func (i *fileInfo) IsDir() bool                { return i.dir }
+func (i *fileInfo) Sys() any                   { return nil }
+func (i *fileInfo) Info() (fs.FileInfo, error) { return i, nil }
+func (i *fileInfo) Type() fs.FileMode          { return i.Mode() & fs.ModeType }
 
 // --- root directory ---------------------------------------------------------
 
@@ -247,9 +252,11 @@ func (f *FS) rootDir() fs.File {
 	return &rootDir{fs: f, stat: &fileInfo{name: ".", dir: true}}
 }
 
-func (d *rootDir) Stat() (fs.FileInfo, error)   { return d.stat, nil }
-func (d *rootDir) Read([]byte) (int, error)     { return 0, &fs.PathError{Op: "read", Path: ".", Err: fs.ErrInvalid} }
-func (d *rootDir) Close() error                 { return nil }
+func (d *rootDir) Stat() (fs.FileInfo, error) { return d.stat, nil }
+func (d *rootDir) Read([]byte) (int, error) {
+	return 0, &fs.PathError{Op: "read", Path: ".", Err: fs.ErrInvalid}
+}
+func (d *rootDir) Close() error { return nil }
 func (d *rootDir) ReadDir(int) ([]fs.DirEntry, error) {
 	if d.read {
 		return nil, io.EOF

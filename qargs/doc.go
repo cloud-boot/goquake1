@@ -7,7 +7,8 @@
 // common/common.c lines 979-1230.
 //
 // Upstream pin:
-//   github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
+//
+//	github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
 //
 // The engine consults this registry for boot-time configuration
 // switches (-game, -basedir, -hipnotic, -safe, -nosound, -window,

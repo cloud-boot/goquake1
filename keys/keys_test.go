@@ -91,7 +91,7 @@ func TestName_KnownKeys(t *testing.T) {
 		{KEscape, "escape"},
 		{KUpArrow, "uparrow"},
 		{KMouse1, "mouse1"},
-		{KMouse4, "mwheelup"},  // alias
+		{KMouse4, "mwheelup"}, // alias
 		{KMouse5, "mwheeldown"},
 		{KSemicolon, "semicolon"},
 	}

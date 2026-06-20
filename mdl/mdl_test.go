@@ -46,16 +46,16 @@ type frameSpec struct {
 }
 
 type buildSpec struct {
-	ident       uint32 // 0 -> IDPolyHeader
-	version     int32  // 0 -> Version
-	skinWidth   int32
-	skinHeight  int32
-	numVerts    int32
-	numTris     int32
-	skins       []skinSpec
-	stverts     []STVert
-	triangles   []Triangle
-	frames      []frameSpec
+	ident      uint32 // 0 -> IDPolyHeader
+	version    int32  // 0 -> Version
+	skinWidth  int32
+	skinHeight int32
+	numVerts   int32
+	numTris    int32
+	skins      []skinSpec
+	stverts    []STVert
+	triangles  []Triangle
+	frames     []frameSpec
 }
 
 func encodeSingleSkin(b *bytes.Buffer, s singleSkinSpec) { b.Write(s.pixels) }
@@ -92,12 +92,18 @@ func build(s buildSpec) ([]byte, int64) {
 	putU32(buf, ident)
 	putI32(buf, ver)
 	// scale
-	putF32(buf, 1); putF32(buf, 1); putF32(buf, 1)
+	putF32(buf, 1)
+	putF32(buf, 1)
+	putF32(buf, 1)
 	// scale_origin
-	putF32(buf, 0); putF32(buf, 0); putF32(buf, 0)
+	putF32(buf, 0)
+	putF32(buf, 0)
+	putF32(buf, 0)
 	putF32(buf, 16) // boundingradius
 	// eyeposition
-	putF32(buf, 0); putF32(buf, 0); putF32(buf, 32)
+	putF32(buf, 0)
+	putF32(buf, 0)
+	putF32(buf, 32)
 	putI32(buf, int32(len(s.skins)))
 	putI32(buf, s.skinWidth)
 	putI32(buf, s.skinHeight)
@@ -105,8 +111,8 @@ func build(s buildSpec) ([]byte, int64) {
 	putI32(buf, s.numTris)
 	putI32(buf, int32(len(s.frames)))
 	putI32(buf, SyncSync)
-	putI32(buf, 0)        // flags
-	putF32(buf, 1.0)      // size
+	putI32(buf, 0)   // flags
+	putF32(buf, 1.0) // size
 
 	// Skins.
 	for _, sk := range s.skins {
@@ -226,8 +232,8 @@ func TestLoad_GroupSkinAndGroupFrame(t *testing.T) {
 		}}},
 		stverts: []STVert{{OnSeam: 0, S: 0, T: 0}},
 		frames: []frameSpec{{kind: FrameGroup, group: groupFrameSpec{
-			bboxMin: TriVertx{V: [3]byte{1, 2, 3}},
-			bboxMax: TriVertx{V: [3]byte{4, 5, 6}},
+			bboxMin:   TriVertx{V: [3]byte{1, 2, 3}},
+			bboxMax:   TriVertx{V: [3]byte{4, 5, 6}},
 			intervals: []float32{0.5, 1.0},
 			frames: []singleFrameSpec{
 				{name: "f0", verts: []TriVertx{{V: [3]byte{0, 0, 0}}}},
@@ -346,7 +352,8 @@ func TestLoad_TruncatedSingleSkinPixels(t *testing.T) {
 	// SkinSingle tag is present but the file ends before the full
 	// pixel block.
 	buf := &bytes.Buffer{}
-	putU32(buf, IDPolyHeader); putI32(buf, Version)
+	putU32(buf, IDPolyHeader)
+	putI32(buf, Version)
 	for i := 0; i < (84-8)/4; i++ {
 		putI32(buf, 0)
 	}
@@ -364,7 +371,8 @@ func TestLoad_TruncatedSingleSkinPixels(t *testing.T) {
 
 func TestLoad_TruncatedGroupSkinIntervals(t *testing.T) {
 	buf := &bytes.Buffer{}
-	putU32(buf, IDPolyHeader); putI32(buf, Version)
+	putU32(buf, IDPolyHeader)
+	putI32(buf, Version)
 	for i := 0; i < (84-8)/4; i++ {
 		putI32(buf, 0)
 	}
@@ -384,7 +392,8 @@ func TestLoad_TruncatedGroupSkinIntervals(t *testing.T) {
 
 func TestLoad_NegativeGroupSkinCount(t *testing.T) {
 	buf := &bytes.Buffer{}
-	putU32(buf, IDPolyHeader); putI32(buf, Version)
+	putU32(buf, IDPolyHeader)
+	putI32(buf, Version)
 	for i := 0; i < (84-8)/4; i++ {
 		putI32(buf, 0)
 	}
@@ -427,10 +436,10 @@ func TestLoad_TruncatedFrameTag(t *testing.T) {
 func TestLoad_TruncatedSingleFrame(t *testing.T) {
 	// Header says NumVerts=3, but single-frame verts run off EOF.
 	raw, _ := build(buildSpec{
-		numVerts:  3,
-		stverts:   []STVert{{}, {}, {}}, // satisfy stvert section
+		numVerts: 3,
+		stverts:  []STVert{{}, {}, {}}, // satisfy stvert section
 		frames: []frameSpec{{kind: FrameSingle, single: singleFrameSpec{
-			name: "x",
+			name:  "x",
 			verts: []TriVertx{{}, {}, {}}, // produce a valid frame at build time
 		}}},
 	})
@@ -443,7 +452,8 @@ func TestLoad_TruncatedSingleFrame(t *testing.T) {
 
 func TestLoad_TruncatedGroupFrameHeader(t *testing.T) {
 	buf := &bytes.Buffer{}
-	putU32(buf, IDPolyHeader); putI32(buf, Version)
+	putU32(buf, IDPolyHeader)
+	putI32(buf, Version)
 	for i := 0; i < (84-8)/4; i++ {
 		putI32(buf, 0)
 	}
@@ -460,7 +470,8 @@ func TestLoad_TruncatedGroupFrameHeader(t *testing.T) {
 
 func TestLoad_NegativeGroupFrameCount(t *testing.T) {
 	buf := &bytes.Buffer{}
-	putU32(buf, IDPolyHeader); putI32(buf, Version)
+	putU32(buf, IDPolyHeader)
+	putI32(buf, Version)
 	for i := 0; i < (84-8)/4; i++ {
 		putI32(buf, 0)
 	}
@@ -479,7 +490,8 @@ func TestLoad_NegativeGroupFrameCount(t *testing.T) {
 
 func TestLoad_TruncatedGroupFrameIntervals(t *testing.T) {
 	buf := &bytes.Buffer{}
-	putU32(buf, IDPolyHeader); putI32(buf, Version)
+	putU32(buf, IDPolyHeader)
+	putI32(buf, Version)
 	for i := 0; i < (84-8)/4; i++ {
 		putI32(buf, 0)
 	}
@@ -501,7 +513,8 @@ func TestLoad_TruncatedGroupFrameIntervals(t *testing.T) {
 // the file ends right after the SkinGroup tag.
 func TestLoad_TruncatedGroupSkinCount(t *testing.T) {
 	buf := &bytes.Buffer{}
-	putU32(buf, IDPolyHeader); putI32(buf, Version)
+	putU32(buf, IDPolyHeader)
+	putI32(buf, Version)
 	for i := 0; i < (84-8)/4; i++ {
 		putI32(buf, 0)
 	}
@@ -520,7 +533,8 @@ func TestLoad_TruncatedGroupSkinCount(t *testing.T) {
 // decodeGroupSkin's inner loop.
 func TestLoad_TruncatedGroupSubSkin(t *testing.T) {
 	buf := &bytes.Buffer{}
-	putU32(buf, IDPolyHeader); putI32(buf, Version)
+	putU32(buf, IDPolyHeader)
+	putI32(buf, Version)
 	for i := 0; i < (84-8)/4; i++ {
 		putI32(buf, 0)
 	}
@@ -532,9 +546,10 @@ func TestLoad_TruncatedGroupSubSkin(t *testing.T) {
 	tail := &bytes.Buffer{}
 	putI32(tail, SkinGroup)
 	putI32(tail, 2) // 2 sub-skins
-	putF32(tail, 0.1); putF32(tail, 0.2) // 2 intervals
-	tail.Write([]byte{1, 1, 1, 1})        // first sub-skin OK (4 bytes)
-	tail.Write([]byte{2, 2})              // second sub-skin truncated (2 of 4)
+	putF32(tail, 0.1)
+	putF32(tail, 0.2)              // 2 intervals
+	tail.Write([]byte{1, 1, 1, 1}) // first sub-skin OK (4 bytes)
+	tail.Write([]byte{2, 2})       // second sub-skin truncated (2 of 4)
 	out = append(out, tail.Bytes()...)
 	if _, err := Load(bytes.NewReader(out), int64(len(out))); !errors.Is(err, ErrSectionOutOfRange) {
 		t.Errorf("got %v want ErrSectionOutOfRange", err)
@@ -545,7 +560,8 @@ func TestLoad_TruncatedGroupSubSkin(t *testing.T) {
 // header. Covers decodeGroupFrame's inner-loop error propagation.
 func TestLoad_TruncatedGroupSubFrame(t *testing.T) {
 	buf := &bytes.Buffer{}
-	putU32(buf, IDPolyHeader); putI32(buf, Version)
+	putU32(buf, IDPolyHeader)
+	putI32(buf, Version)
 	for i := 0; i < (84-8)/4; i++ {
 		putI32(buf, 0)
 	}
@@ -558,7 +574,8 @@ func TestLoad_TruncatedGroupSubFrame(t *testing.T) {
 	putI32(tail, 2) // 2 sub-frames
 	encodeTriVertx(tail, TriVertx{})
 	encodeTriVertx(tail, TriVertx{})
-	putF32(tail, 0.1); putF32(tail, 0.2) // 2 intervals
+	putF32(tail, 0.1)
+	putF32(tail, 0.2) // 2 intervals
 	// First sub-frame complete (24-byte header, 0 verts).
 	encodeSingleFrame(tail, singleFrameSpec{name: "f0"})
 	// Second sub-frame: write 10 bytes (less than the 24-byte header).

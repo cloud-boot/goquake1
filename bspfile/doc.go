@@ -11,15 +11,16 @@
 // actually traverses them.
 //
 // Upstream pin:
-//   github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
+//
+//	github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
 //
 // On-disk header (little-endian):
 //
-//   dheader_t
-//     [0:4]   version  (int32) -- BSPVERSION 29 / BSP2VERSION /
-//                                 BSP2RMQVERSION (only 29 parsed here)
-//     [4:124] lumps    [15]lump_t -- each lump_t is 8 bytes:
-//                                    fileofs (int32) + filelen (int32)
+//	dheader_t
+//	  [0:4]   version  (int32) -- BSPVERSION 29 / BSP2VERSION /
+//	                              BSP2RMQVERSION (only 29 parsed here)
+//	  [4:124] lumps    [15]lump_t -- each lump_t is 8 bytes:
+//	                                 fileofs (int32) + filelen (int32)
 //
 // The 15 lump kinds are numbered by LUMP_ENTITIES..LUMP_MODELS;
 // each names a typed section of the file. See per-lump decoders for

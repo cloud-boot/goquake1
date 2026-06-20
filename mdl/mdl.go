@@ -18,15 +18,15 @@ const (
 	IDPolyHeader = uint32('I') | uint32('D')<<8 | uint32('P')<<16 | uint32('O')<<24
 	Version      = 6
 
-	headerSize     = 84
-	frameTagSize   = 4
-	skinTagSize    = 4
-	groupCountSize = 4
-	intervalSize   = 4
-	triVertxSize   = 4  // byte v[3] + lightnormalindex
-	stVertSize     = 12 // 3 int32: onseam, s, t
-	triangleSize   = 16 // 4 int32: facesfront + vertindex[3]
-	frameNameLen   = 16
+	headerSize         = 84
+	frameTagSize       = 4
+	skinTagSize        = 4
+	groupCountSize     = 4
+	intervalSize       = 4
+	triVertxSize       = 4  // byte v[3] + lightnormalindex
+	stVertSize         = 12 // 3 int32: onseam, s, t
+	triangleSize       = 16 // 4 int32: facesfront + vertindex[3]
+	frameNameLen       = 16
 	singleFrameHdrSize = triVertxSize + triVertxSize + frameNameLen // bbox + name = 24
 )
 
@@ -96,7 +96,7 @@ type Triangle struct {
 // position + the index into the 162-entry anorms light-normal table
 // the renderer dot-products against the world light dir.
 type TriVertx struct {
-	V                 [3]byte
+	V                [3]byte
 	LightNormalIndex byte
 }
 
@@ -114,9 +114,9 @@ type GroupSkin struct {
 
 // Skin is one decoded skin record (tagged union).
 type Skin struct {
-	Type   int32       // SkinSingle or SkinGroup
-	Single SingleSkin  // valid when Type == SkinSingle
-	Group  *GroupSkin  // non-nil when Type == SkinGroup
+	Type   int32      // SkinSingle or SkinGroup
+	Single SingleSkin // valid when Type == SkinSingle
+	Group  *GroupSkin // non-nil when Type == SkinGroup
 }
 
 // SingleFrame is one daliasframe_t.

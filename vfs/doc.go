@@ -10,7 +10,8 @@
 // into a SearchPath value whose Open walks them first-hit-wins.
 //
 // Upstream pin:
-//   github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
+//
+//	github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
 //
 // Override semantics: tyrquake adds new sources to the HEAD of the
 // search list so they override earlier ones (the canonical pak1 over
@@ -20,12 +21,12 @@
 //
 // Composition: a typical bare-metal probe builds the search path as
 //
-//   sp := vfs.New()
-//   sp.Add(embedpak.PakFS)         // shareware pak0.pak in-tree
-//   if userPak != nil {
-//       sp.Add(userPak)            // operator's pak override
-//   }
-//   eng := engine.Run(sp, ...)
+//	sp := vfs.New()
+//	sp.Add(embedpak.PakFS)         // shareware pak0.pak in-tree
+//	if userPak != nil {
+//	    sp.Add(userPak)            // operator's pak override
+//	}
+//	eng := engine.Run(sp, ...)
 //
 // and the harvest tool on the host wraps an os.DirFS in the equivalent
 // shape. The engine itself never imports os; the FS abstraction does

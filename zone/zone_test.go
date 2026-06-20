@@ -417,7 +417,7 @@ func TestHunk_AllocTemp(t *testing.T) {
 	if b2 == nil {
 		t.Fatal("second AllocTemp returned nil")
 	}
-	want := baseHigh + ((300+hunkAlign-1)&^(hunkAlign-1)) + hunkHeaderSize
+	want := baseHigh + ((300 + hunkAlign - 1) &^ (hunkAlign - 1)) + hunkHeaderSize
 	if h.highbytes != want {
 		t.Fatalf("temp should overwrite, not stack: highbytes=%d want %d", h.highbytes, want)
 	}

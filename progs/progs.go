@@ -24,7 +24,7 @@ const (
 // Statement is one dstatement_t: a single bytecode instruction.
 // tyrquake: dstatement_t.
 type Statement struct {
-	Op   Op
+	Op      Op
 	A, B, C int16
 }
 
@@ -33,9 +33,9 @@ type Statement struct {
 // DefSaveGlobal)` before switching on Etype.
 // tyrquake: ddef_t.
 type Def struct {
-	Type   uint16
-	Ofs    uint16
-	SName  int32 // offset into the string table
+	Type  uint16
+	Ofs   uint16
+	SName int32 // offset into the string table
 }
 
 // Function is one dfunction_t: a callable QuakeC function.
@@ -56,21 +56,21 @@ type Function struct {
 // Header mirrors dprograms_t verbatim. Useful for diagnostic dumps
 // that compare two progs.dat layouts side by side.
 type Header struct {
-	Version        int32
-	CRC            int32
-	OfsStatements  int32
-	NumStatements  int32
-	OfsGlobalDefs  int32
-	NumGlobalDefs  int32
-	OfsFieldDefs   int32
-	NumFieldDefs   int32
-	OfsFunctions   int32
-	NumFunctions   int32
-	OfsStrings     int32
-	StringsSize    int32
-	OfsGlobals     int32
-	NumGlobals     int32
-	EntityFields   int32
+	Version       int32
+	CRC           int32
+	OfsStatements int32
+	NumStatements int32
+	OfsGlobalDefs int32
+	NumGlobalDefs int32
+	OfsFieldDefs  int32
+	NumFieldDefs  int32
+	OfsFunctions  int32
+	NumFunctions  int32
+	OfsStrings    int32
+	StringsSize   int32
+	OfsGlobals    int32
+	NumGlobals    int32
+	EntityFields  int32
 }
 
 // Progs is a parsed progs.dat ready for the interpreter to execute.
@@ -81,15 +81,15 @@ type Progs struct {
 	GlobalDefs []Def
 	FieldDefs  []Def
 	Functions  []Function
-	Strings    []byte    // NUL-separated; a string_t is a byte offset into this
-	Globals    []byte    // raw bytes; each global is a 4-byte slot; reinterpret as float/int/etc
+	Strings    []byte // NUL-separated; a string_t is a byte offset into this
+	Globals    []byte // raw bytes; each global is a 4-byte slot; reinterpret as float/int/etc
 }
 
 // Sentinel errors surfaced by Load.
 var (
-	ErrBadVersion       = errors.New("progs: unsupported version (need 6)")
+	ErrBadVersion        = errors.New("progs: unsupported version (need 6)")
 	ErrSectionOutOfRange = errors.New("progs: section offset/length outside file")
-	ErrShortRead        = errors.New("progs: short read")
+	ErrShortRead         = errors.New("progs: short read")
 )
 
 // Load parses a progs.dat from src. The caller retains ownership; src

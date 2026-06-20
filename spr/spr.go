@@ -18,11 +18,11 @@ const (
 	IDSpriteHeader = uint32('I') | uint32('D')<<8 | uint32('S')<<16 | uint32('P')<<24
 	Version        = 1
 
-	headerSize        = 9 * 4  // 9 int32 fields
-	frameHeaderSize   = 16     // origin[2] + width + height
-	frameTypeTagSize  = 4      // one int32 type tag
-	groupHeaderSize   = 4      // one int32 numframes
-	groupIntervalSize = 4      // one float32 interval per group entry
+	headerSize        = 9 * 4 // 9 int32 fields
+	frameHeaderSize   = 16    // origin[2] + width + height
+	frameTypeTagSize  = 4     // one int32 type tag
+	groupHeaderSize   = 4     // one int32 numframes
+	groupIntervalSize = 4     // one float32 interval per group entry
 )
 
 // SPR_* orientation tags. tyrquake: same names.
@@ -49,11 +49,11 @@ const (
 
 // Sentinel errors.
 var (
-	ErrBadMagic         = errors.New("spr: not a sprite file (bad IDSP magic)")
-	ErrBadVersion       = errors.New("spr: unsupported version (need 1)")
-	ErrShortRead        = errors.New("spr: short read")
+	ErrBadMagic          = errors.New("spr: not a sprite file (bad IDSP magic)")
+	ErrBadVersion        = errors.New("spr: unsupported version (need 1)")
+	ErrShortRead         = errors.New("spr: short read")
 	ErrSectionOutOfRange = errors.New("spr: frame payload extends past EOF")
-	ErrBadFrameType     = errors.New("spr: unknown frame-type tag")
+	ErrBadFrameType      = errors.New("spr: unknown frame-type tag")
 )
 
 // Header mirrors dsprite_t.
@@ -82,9 +82,9 @@ type FrameHeader struct {
 // Group is nil and Bitmap holds the bytes. For SPR_GROUP entries
 // Group is populated and Bitmap is nil.
 type Frame struct {
-	Type   int32          // FrameSingle or FrameGroup
-	Single SingleFrame    // valid when Type == FrameSingle
-	Group  *GroupFrame    // non-nil when Type == FrameGroup
+	Type   int32       // FrameSingle or FrameGroup
+	Single SingleFrame // valid when Type == FrameSingle
+	Group  *GroupFrame // non-nil when Type == FrameGroup
 }
 
 // SingleFrame is one (header + bitmap) pair.

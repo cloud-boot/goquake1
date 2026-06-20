@@ -73,12 +73,12 @@ func TestBuiltin_VecToYaw(t *testing.T) {
 		in   [3]float32
 		want float32
 	}{
-		{[3]float32{1, 0, 0}, 0},   // east
-		{[3]float32{0, 1, 0}, 90},  // north
+		{[3]float32{1, 0, 0}, 0},  // east
+		{[3]float32{0, 1, 0}, 90}, // north
 		{[3]float32{-1, 0, 0}, 180},
 		{[3]float32{0, -1, 0}, 270},
-		{[3]float32{0, 0, 0}, 0},   // null
-		{[3]float32{0, 0, 5}, 0},   // z-only -> yaw 0
+		{[3]float32{0, 0, 0}, 0}, // null
+		{[3]float32{0, 0, 5}, 0}, // z-only -> yaw 0
 	}
 	for _, c := range cases {
 		vm := builtinVM()
@@ -100,9 +100,9 @@ func TestBuiltin_VecToAngles(t *testing.T) {
 		in   [3]float32
 		want [3]float32 // pitch, yaw, 0
 	}{
-		{[3]float32{1, 0, 0}, [3]float32{0, 0, 0}},   // forward
-		{[3]float32{0, 1, 0}, [3]float32{0, 90, 0}},  // left
-		{[3]float32{0, 0, 1}, [3]float32{90, 0, 0}},  // up
+		{[3]float32{1, 0, 0}, [3]float32{0, 0, 0}},    // forward
+		{[3]float32{0, 1, 0}, [3]float32{0, 90, 0}},   // left
+		{[3]float32{0, 0, 1}, [3]float32{90, 0, 0}},   // up
 		{[3]float32{0, 0, -1}, [3]float32{270, 0, 0}}, // down
 	}
 	for _, c := range cases {

@@ -10,7 +10,8 @@
 // composes the same Hull struct.
 //
 // Upstream pin:
-//   github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
+//
+//	github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
 //
 // A Hull is a self-contained collision tree: a flat array of
 // ClipNodes (binary tree, indexed by child links), a flat array of
@@ -19,9 +20,9 @@
 // a ClipMins/ClipMaxs offset the swept-box trace applies to
 // asymmetric bounding boxes. A typical Quake map carries 3 hulls:
 //
-//   hull[0] -- BSP rendering tree (Mod_MakeHull0 reuses Nodes)
-//   hull[1] -- player size (-16,-16,-24) to (16,16,32)
-//   hull[2] -- crouch monster (-32,-32,-24) to (32,32,64)
+//	hull[0] -- BSP rendering tree (Mod_MakeHull0 reuses Nodes)
+//	hull[1] -- player size (-16,-16,-24) to (16,16,32)
+//	hull[2] -- crouch monster (-32,-32,-24) to (32,32,64)
 //
 // Building the 3 hulls from a [bspfile.File] is one Mod_MakeHull0 +
 // two Mod_LoadClipnodes-with-different-offsets passes that this

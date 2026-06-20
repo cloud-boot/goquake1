@@ -8,12 +8,14 @@
 // tyrquake: Mod_LoadModel in common/model.c.
 //
 // Upstream pin:
-//   github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
+//
+//	github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
 //
 // Detection rules:
-//   "IDPO" (0x4F504449 LE) -> alias model (.mdl)  -> engine/mdl.Load
-//   "IDSP" (0x50534449 LE) -> sprite       (.spr) -> engine/spr.Load
-//   anything else          -> BSP map      (.bsp) -> engine/bspfile.Open
+//
+//	"IDPO" (0x4F504449 LE) -> alias model (.mdl)  -> engine/mdl.Load
+//	"IDSP" (0x50534449 LE) -> sprite       (.spr) -> engine/spr.Load
+//	anything else          -> BSP map      (.bsp) -> engine/bspfile.Open
 //
 // The dispatcher reads only the first 4 bytes to decide; the chosen
 // loader then reads the full file independently. Returns a Model

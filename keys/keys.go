@@ -74,37 +74,37 @@ const (
 	KBackquote    Key = 96
 	// Lowercase alpha keys (the "skip uppercase, alpha keys passed
 	// as lowercase" upstream rule).
-	KA Key = 97
-	KB Key = 98
-	KC Key = 99
-	KD Key = 100
-	KE Key = 101
-	KF Key = 102
-	KG Key = 103
-	KH Key = 104
-	KI Key = 105
-	KJ Key = 106
-	KK Key = 107
-	KL Key = 108
-	KM Key = 109
-	KN Key = 110
-	KO Key = 111
-	KP Key = 112
-	KQ Key = 113
-	KR Key = 114
-	KS Key = 115
-	KT Key = 116
-	KU Key = 117
-	KV Key = 118
-	KW Key = 119
-	KX Key = 120
-	KY Key = 121
-	KZ Key = 122
-	KBraceLeft   Key = 123
-	KBar         Key = 124
-	KBraceRight  Key = 125
-	KAsciiTilde  Key = 126
-	KDel         Key = 127
+	KA          Key = 97
+	KB          Key = 98
+	KC          Key = 99
+	KD          Key = 100
+	KE          Key = 101
+	KF          Key = 102
+	KG          Key = 103
+	KH          Key = 104
+	KI          Key = 105
+	KJ          Key = 106
+	KK          Key = 107
+	KL          Key = 108
+	KM          Key = 109
+	KN          Key = 110
+	KO          Key = 111
+	KP          Key = 112
+	KQ          Key = 113
+	KR          Key = 114
+	KS          Key = 115
+	KT          Key = 116
+	KU          Key = 117
+	KV          Key = 118
+	KW          Key = 119
+	KX          Key = 120
+	KY          Key = 121
+	KZ          Key = 122
+	KBraceLeft  Key = 123
+	KBar        Key = 124
+	KBraceRight Key = 125
+	KAsciiTilde Key = 126
+	KDel        Key = 127
 
 	// Numeric keypad (256..272).
 	KKp0        Key = 256
@@ -154,21 +154,21 @@ const (
 	KF15 Key = 296
 
 	// Modifier keys (300..314).
-	KNumLock   Key = 300
-	KCapsLock  Key = 301
+	KNumLock    Key = 300
+	KCapsLock   Key = 301
 	KScrollLock Key = 302
-	KRShift    Key = 303
-	KLShift    Key = 304
-	KRCtrl     Key = 305
-	KLCtrl     Key = 306
-	KRAlt      Key = 307
-	KLAlt      Key = 308
-	KRMeta     Key = 309
-	KLMeta     Key = 310
-	KLSuper    Key = 311
-	KRSuper    Key = 312
-	KMode      Key = 313
-	KCompose   Key = 314
+	KRShift     Key = 303
+	KLShift     Key = 304
+	KRCtrl      Key = 305
+	KLCtrl      Key = 306
+	KRAlt       Key = 307
+	KLAlt       Key = 308
+	KRMeta      Key = 309
+	KLMeta      Key = 310
+	KLSuper     Key = 311
+	KRSuper     Key = 312
+	KMode       Key = 313
+	KCompose    Key = 314
 
 	// Misc function keys (315..322).
 	KHelp   Key = 315
@@ -276,7 +276,7 @@ var nameTable = map[Key]string{
 	KMouse6: "mouse6", KMouse7: "mouse7", KMouse8: "mouse8",
 	KJoy1: "joy1", KJoy2: "joy2", KJoy3: "joy3", KJoy4: "joy4",
 	KSemicolon: "semicolon", // not stored as the literal ';' so the
-	                          // bind parser doesn't trip on it
+	// bind parser doesn't trip on it
 }
 
 // Name returns the console-printable token for k (e.g. "enter",

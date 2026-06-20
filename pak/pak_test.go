@@ -61,7 +61,7 @@ func buildPAK(entries map[string][]byte) *bytes.Reader {
 
 func TestOpen_ReadBack(t *testing.T) {
 	src := buildPAK(map[string][]byte{
-		"foo.txt": []byte("hello"),
+		"foo.txt":        []byte("hello"),
 		"maps/start.bsp": []byte("BSP-bytes"),
 	})
 	p, err := Open(src)
@@ -184,8 +184,8 @@ func TestFile_StatAndRead(t *testing.T) {
 
 func TestRootDir_ReadDir(t *testing.T) {
 	src := buildPAK(map[string][]byte{
-		"b.txt": []byte("b"),
-		"a.txt": []byte("a"),
+		"b.txt":      []byte("b"),
+		"a.txt":      []byte("a"),
 		"maps/c.bsp": []byte("c"),
 	})
 	p, _ := Open(src)

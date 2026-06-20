@@ -126,8 +126,8 @@ func TestOpen_DirShortRead(t *testing.T) {
 	// Valid magic + infotableofs that points past EOF.
 	hdr := make([]byte, headerSize)
 	copy(hdr[0:4], magic)
-	binary.LittleEndian.PutUint32(hdr[4:8], 1)         // numlumps
-	binary.LittleEndian.PutUint32(hdr[8:12], 1<<20)    // way past EOF
+	binary.LittleEndian.PutUint32(hdr[4:8], 1)      // numlumps
+	binary.LittleEndian.PutUint32(hdr[8:12], 1<<20) // way past EOF
 	if _, err := Open(bytes.NewReader(hdr)); err == nil {
 		t.Error("expected dir short-read error")
 	}
@@ -282,8 +282,8 @@ func TestCleanName(t *testing.T) {
 		{"", ""},
 		{"FOO", "foo"},
 		{"MixedCase", "mixedcase"},
-		{"abc\x00trailing", "abc"},  // NUL truncates
-		{"123_-", "123_-"},          // non-alpha preserved
+		{"abc\x00trailing", "abc"}, // NUL truncates
+		{"123_-", "123_-"},         // non-alpha preserved
 	}
 	for _, c := range cases {
 		if got := cleanName(c.in); got != c.want {

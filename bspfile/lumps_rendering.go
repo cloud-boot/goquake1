@@ -16,12 +16,12 @@ import (
 
 // On-wire constants for the new lumps.
 const (
-	nodeSize       = 24 // bsp29_dnode_t  (planenum + 2*int16 + 6*int16 + 2*uint16)
-	clipnodeSize   = 8  // bsp29_dclipnode_t (int32 planenum + 2*int16 children)
-	leafSize       = 28 // bsp29_dleaf_t (contents + visofs + 6*int16 + 2*uint16 + 4*byte)
-	faceSize       = 20 // bsp29_dface_t (planenum + side + firstedge + numedges + texinfo + 4*byte + lightofs)
-	texInfoSize    = 40 // texinfo_t (2*4*float + miptex + flags)
-	marksurfaceSize = 2 // uint16
+	nodeSize        = 24 // bsp29_dnode_t  (planenum + 2*int16 + 6*int16 + 2*uint16)
+	clipnodeSize    = 8  // bsp29_dclipnode_t (int32 planenum + 2*int16 children)
+	leafSize        = 28 // bsp29_dleaf_t (contents + visofs + 6*int16 + 2*uint16 + 4*byte)
+	faceSize        = 20 // bsp29_dface_t (planenum + side + firstedge + numedges + texinfo + 4*byte + lightofs)
+	texInfoSize     = 40 // texinfo_t (2*4*float + miptex + flags)
+	marksurfaceSize = 2  // uint16
 )
 
 // Node is one bsp29_dnode_t. Children[i] >= 0 indexes Nodes
@@ -78,9 +78,9 @@ type Face struct {
 // the MipTexLump table; Flags is the TexSpecial bit.
 // tyrquake: texinfo_t.
 type TexInfo struct {
-	Vecs    [2][4]float32
-	MipTex  int32
-	Flags   int32
+	Vecs   [2][4]float32
+	MipTex int32
+	Flags  int32
 }
 
 // MarkSurface is one uint16 face index. tyrquake doesn't give it a

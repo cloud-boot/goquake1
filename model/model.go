@@ -35,8 +35,8 @@ type Model struct {
 
 // Sentinel errors.
 var (
-	ErrShortRead   = errors.New("model: source has fewer than 4 bytes -- cannot detect magic")
-	ErrLoaderFail  = errors.New("model: per-format loader rejected the file")
+	ErrShortRead  = errors.New("model: source has fewer than 4 bytes -- cannot detect magic")
+	ErrLoaderFail = errors.New("model: per-format loader rejected the file")
 )
 
 // Load reads the first 4 bytes of src to identify the format, then

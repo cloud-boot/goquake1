@@ -494,7 +494,7 @@ func TestTextures_NegativeNumMipTex(t *testing.T) {
 func TestTextures_OffsetsTableTruncated(t *testing.T) {
 	buf := &bytes.Buffer{}
 	_ = binary.Write(buf, binary.LittleEndian, int32(10)) // claims 10 entries
-	buf.Write([]byte{1, 2, 3, 4}) // only one int32 of offset table
+	buf.Write([]byte{1, 2, 3, 4})                         // only one int32 of offset table
 	raw, sz := buildExt(buildSpecExt{textures: buf.Bytes()})
 	f, _ := Open(bytes.NewReader(raw), sz)
 	if _, err := f.Textures(); !errors.Is(err, ErrSectionMisaligned) {

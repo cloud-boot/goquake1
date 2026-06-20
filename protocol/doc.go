@@ -11,7 +11,8 @@
 // numbers (NQ 15, FITZ 666, BJP 10000/10001/10002).
 //
 // Upstream pin:
-//   github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
+//
+//	github.com/sezero/tyrquake@653157915975b196e36980a1ef7146485509b69a
 //
 // Scope: only the NQ subset. QuakeWorld (clc_move with usercmd_t
 // deltas, full svc_qw_* set) is QW-only and out of scope for the

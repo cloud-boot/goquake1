@@ -20,12 +20,12 @@ func TestKnown(t *testing.T) {
 
 func TestMaxModelsFor(t *testing.T) {
 	cases := map[int]int{
-		VersionNQ:    min(256, MaxModels),
-		VersionFitz:  min(65536, MaxModels),
-		VersionBJP:   min(65536, MaxModels),
-		VersionBJP2:  min(65536, MaxModels),
-		VersionBJP3:  min(65536, MaxModels),
-		999:          0,
+		VersionNQ:   min(256, MaxModels),
+		VersionFitz: min(65536, MaxModels),
+		VersionBJP:  min(65536, MaxModels),
+		VersionBJP2: min(65536, MaxModels),
+		VersionBJP3: min(65536, MaxModels),
+		999:         0,
 	}
 	for v, want := range cases {
 		if got := MaxModelsFor(v); got != want {
@@ -36,12 +36,12 @@ func TestMaxModelsFor(t *testing.T) {
 
 func TestMaxSoundsStaticFor(t *testing.T) {
 	cases := map[int]int{
-		VersionNQ:    min(256, MaxSounds),
-		VersionBJP:   min(256, MaxSounds),
-		VersionBJP3:  min(256, MaxSounds),
-		VersionBJP2:  min(65536, MaxSounds),
-		VersionFitz:  min(65536, MaxSounds),
-		999:          0,
+		VersionNQ:   min(256, MaxSounds),
+		VersionBJP:  min(256, MaxSounds),
+		VersionBJP3: min(256, MaxSounds),
+		VersionBJP2: min(65536, MaxSounds),
+		VersionFitz: min(65536, MaxSounds),
+		999:         0,
 	}
 	for v, want := range cases {
 		if got := MaxSoundsStaticFor(v); got != want {
@@ -52,12 +52,12 @@ func TestMaxSoundsStaticFor(t *testing.T) {
 
 func TestMaxSoundsDynamicFor(t *testing.T) {
 	cases := map[int]int{
-		VersionNQ:    min(256, MaxSounds),
-		VersionBJP:   min(256, MaxSounds),
-		VersionBJP2:  min(65536, MaxSounds),
-		VersionBJP3:  min(65536, MaxSounds),
-		VersionFitz:  min(65536, MaxSounds),
-		999:          0,
+		VersionNQ:   min(256, MaxSounds),
+		VersionBJP:  min(256, MaxSounds),
+		VersionBJP2: min(65536, MaxSounds),
+		VersionBJP3: min(65536, MaxSounds),
+		VersionFitz: min(65536, MaxSounds),
+		999:         0,
 	}
 	for v, want := range cases {
 		if got := MaxSoundsDynamicFor(v); got != want {
@@ -169,24 +169,24 @@ func TestEntAlpha_RoundTripMidpoints(t *testing.T) {
 // break demo replay + savegames.
 func TestSvcInvariants(t *testing.T) {
 	cases := map[string]int{
-		"SvcBad":            SvcBad,
-		"SvcNop":            SvcNop,
-		"SvcDisconnect":     SvcDisconnect,
-		"SvcServerInfo":     SvcServerInfo,
-		"SvcSetView":        SvcSetView,
-		"SvcSound":          SvcSound,
-		"SvcTime":           SvcTime,
-		"SvcPrint":          SvcPrint,
-		"SvcStuffText":      SvcStuffText,
-		"SvcClientData":     SvcClientData,
-		"SvcSpawnBaseline":  SvcSpawnBaseline,
-		"SvcTempEntity":     SvcTempEntity,
+		"SvcBad":              SvcBad,
+		"SvcNop":              SvcNop,
+		"SvcDisconnect":       SvcDisconnect,
+		"SvcServerInfo":       SvcServerInfo,
+		"SvcSetView":          SvcSetView,
+		"SvcSound":            SvcSound,
+		"SvcTime":             SvcTime,
+		"SvcPrint":            SvcPrint,
+		"SvcStuffText":        SvcStuffText,
+		"SvcClientData":       SvcClientData,
+		"SvcSpawnBaseline":    SvcSpawnBaseline,
+		"SvcTempEntity":       SvcTempEntity,
 		"SvcSpawnStaticSound": SvcSpawnStaticSound,
-		"SvcIntermission":   SvcIntermission,
-		"SvcFinale":         SvcFinale,
-		"SvcCutscene":       SvcCutscene,
-		"SvcFitzSkybox":     SvcFitzSkybox,
-		"SvcFitzFog":        SvcFitzFog,
+		"SvcIntermission":     SvcIntermission,
+		"SvcFinale":           SvcFinale,
+		"SvcCutscene":         SvcCutscene,
+		"SvcFitzSkybox":       SvcFitzSkybox,
+		"SvcFitzFog":          SvcFitzFog,
 	}
 	wantOrder := []string{
 		"SvcBad", "SvcNop", "SvcDisconnect",

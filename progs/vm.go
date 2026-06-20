@@ -23,14 +23,14 @@ import (
 // table + entity-byte-offset resolution that depend on subsystems
 // not ported yet.
 type VM struct {
-	progs    *Progs
-	arena    *EdictArena    // edict pool, optional; required for LOAD_* / STORE_P_* / ADDRESS
-	globals  []byte         // writable copy of progs.Globals
-	stack    []frame        // return-frame stack
-	xFunc    int32          // currently-executing function index
-	xStmt    int32          // currently-executing statement index
-	runaway  int            // runaway-loop budget (decremented per stmt)
-	depth    int            // = len(stack); cached for readability
+	progs   *Progs
+	arena   *EdictArena // edict pool, optional; required for LOAD_* / STORE_P_* / ADDRESS
+	globals []byte      // writable copy of progs.Globals
+	stack   []frame     // return-frame stack
+	xFunc   int32       // currently-executing function index
+	xStmt   int32       // currently-executing statement index
+	runaway int         // runaway-loop budget (decremented per stmt)
+	depth   int         // = len(stack); cached for readability
 	// runtime parameter count carried across an OP_CALLn dispatch
 	// (callee reads its arguments from OfsParm0..).
 	argc int
@@ -625,10 +625,10 @@ func (vm *VM) enterFunction(fn int32) error {
 	}
 
 	vm.stack = append(vm.stack, frame{
-		stmt:            vm.xStmt,
-		fn:              vm.xFunc,
-		localStackSize:  localBytes,
-		savedLocals:     saved,
+		stmt:           vm.xStmt,
+		fn:             vm.xFunc,
+		localStackSize: localBytes,
+		savedLocals:    saved,
 	})
 	vm.depth = len(vm.stack)
 

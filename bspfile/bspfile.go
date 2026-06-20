@@ -14,20 +14,20 @@ import (
 
 // On-wire constants.
 const (
-	headerSize  = 4 + HeaderLumps*lumpEntrySize // 124 bytes
-	lumpEntrySize = 8                            // fileofs + filelen, int32 each
-	planeSize   = 20                             // 3*float + float + int32
-	vertexSize  = 12                             // 3*float
-	edgeSize    = 4                              // 2*uint16
-	surfedgeSize = 4                             // int32
-	modelSize   = 64                             // 3*3*float + 4*int32 + 3*int32
+	headerSize    = 4 + HeaderLumps*lumpEntrySize // 124 bytes
+	lumpEntrySize = 8                             // fileofs + filelen, int32 each
+	planeSize     = 20                            // 3*float + float + int32
+	vertexSize    = 12                            // 3*float
+	edgeSize      = 4                             // 2*uint16
+	surfedgeSize  = 4                             // int32
+	modelSize     = 64                            // 3*3*float + 4*int32 + 3*int32
 )
 
 // Sentinel errors.
 var (
-	ErrBadVersion       = errors.New("bspfile: unsupported BSP version (this build parses 29 only)")
+	ErrBadVersion        = errors.New("bspfile: unsupported BSP version (this build parses 29 only)")
 	ErrSectionOutOfRange = errors.New("bspfile: lump fileofs/len outside file")
-	ErrShortRead        = errors.New("bspfile: short read")
+	ErrShortRead         = errors.New("bspfile: short read")
 	ErrSectionMisaligned = errors.New("bspfile: lump length not a multiple of element size")
 )
 
@@ -79,11 +79,11 @@ type Plane struct {
 // models are brush entities (doors, lifts, etc.) whose origin is
 // relative to the world.
 type Model struct {
-	Mins     [3]float32
-	Maxs     [3]float32
-	Origin   [3]float32
-	Headnode [MaxMapHulls]int32
-	VisLeafs int32
+	Mins      [3]float32
+	Maxs      [3]float32
+	Origin    [3]float32
+	Headnode  [MaxMapHulls]int32
+	VisLeafs  int32
 	FirstFace int32
 	NumFaces  int32
 }

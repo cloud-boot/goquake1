@@ -14,14 +14,14 @@ import (
 // build constructs a minimal valid progs.dat from typed sections and
 // returns a bytes.Reader + the synthesised size.
 type buildSpec struct {
-	stmts []Statement
-	gdefs []Def
-	fdefs []Def
-	funs  []Function
-	strs  []byte
-	gvals []byte
+	stmts        []Statement
+	gdefs        []Def
+	fdefs        []Def
+	funs         []Function
+	strs         []byte
+	gvals        []byte
 	entityFields int32
-	version int32 // 0 -> default ProgVersion
+	version      int32 // 0 -> default ProgVersion
 }
 
 func build(spec buildSpec) ([]byte, int64) {
@@ -61,21 +61,21 @@ func build(spec buildSpec) ([]byte, int64) {
 	pos += int64(len(spec.gvals))
 
 	hdr := Header{
-		Version:        v,
-		CRC:            -559038737, // 0xdeadbeef reinterpreted as int32
-		OfsStatements:  int32(ofsStmts),
-		NumStatements:  int32(len(spec.stmts)),
-		OfsGlobalDefs:  int32(ofsGDefs),
-		NumGlobalDefs:  int32(len(spec.gdefs)),
-		OfsFieldDefs:   int32(ofsFDefs),
-		NumFieldDefs:   int32(len(spec.fdefs)),
-		OfsFunctions:   int32(ofsFuns),
-		NumFunctions:   int32(len(spec.funs)),
-		OfsStrings:     int32(ofsStrs),
-		StringsSize:    int32(len(spec.strs)),
-		OfsGlobals:     int32(ofsGlobals),
-		NumGlobals:     int32(len(spec.gvals) / globalSlotSize),
-		EntityFields:   spec.entityFields,
+		Version:       v,
+		CRC:           -559038737, // 0xdeadbeef reinterpreted as int32
+		OfsStatements: int32(ofsStmts),
+		NumStatements: int32(len(spec.stmts)),
+		OfsGlobalDefs: int32(ofsGDefs),
+		NumGlobalDefs: int32(len(spec.gdefs)),
+		OfsFieldDefs:  int32(ofsFDefs),
+		NumFieldDefs:  int32(len(spec.fdefs)),
+		OfsFunctions:  int32(ofsFuns),
+		NumFunctions:  int32(len(spec.funs)),
+		OfsStrings:    int32(ofsStrs),
+		StringsSize:   int32(len(spec.strs)),
+		OfsGlobals:    int32(ofsGlobals),
+		NumGlobals:    int32(len(spec.gvals) / globalSlotSize),
+		EntityFields:  spec.entityFields,
 	}
 	buf := &bytes.Buffer{}
 	_ = binary.Write(buf, binary.LittleEndian, &hdr)
@@ -128,8 +128,8 @@ func TestLoad_MinimalValid(t *testing.T) {
 		funs: []Function{
 			{FirstStatement: 0, ParmStart: 0, Locals: 0, SName: 1, NumParms: 0},
 		},
-		strs:  append([]byte{0}, []byte("hello\x00")...),
-		gvals: make([]byte, 4),
+		strs:         append([]byte{0}, []byte("hello\x00")...),
+		gvals:        make([]byte, 4),
 		entityFields: 64,
 	})
 	p, err := Load(bytes.NewReader(raw), sz)

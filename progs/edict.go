@@ -49,9 +49,9 @@ type EdictArena struct {
 
 // Sentinel errors.
 var (
-	ErrArenaFull    = errors.New("progs: edict arena exhausted (no free slot)")
-	ErrEdictIndex   = errors.New("progs: edict index out of range")
-	ErrFieldOffset  = errors.New("progs: field offset out of range for entity field block")
+	ErrArenaFull   = errors.New("progs: edict arena exhausted (no free slot)")
+	ErrEdictIndex  = errors.New("progs: edict index out of range")
+	ErrFieldOffset = errors.New("progs: field offset out of range for entity field block")
 )
 
 // NewEdictArena allocates an arena of cap edicts sized to the
