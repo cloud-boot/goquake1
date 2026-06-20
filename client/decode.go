@@ -253,14 +253,14 @@ type SvcReader struct {
 //   - (nil, ErrCorruptMessage) when a supported opcode's body is
 //     truncated mid-read (the reader's Bad flag tripped)
 //
-// Supported opcodes (21):
+// Supported opcodes (22):
 //
 //	svc_nop, svc_disconnect, svc_updatestat, svc_setview, svc_sound,
 //	svc_print, svc_stufftext, svc_serverinfo, svc_updatename,
 //	svc_updatefrags, svc_clientdata, svc_updatecolors, svc_particle,
 //	svc_spawnbaseline, svc_signonnum, svc_killedmonster,
 //	svc_foundsecret, svc_finale, svc_sellscreen, svc_cutscene,
-//	svc_update (the high-bit fast-update; cmd>=128).
+//	svc_temp_entity, svc_update (the high-bit fast-update; cmd>=128).
 //
 // The proto argument is the active protocol version (one of
 // protocol.Version*); it selects the per-protocol field widths in
@@ -321,6 +321,8 @@ func (sr *SvcReader) Next(proto int) (Decoded, error) {
 		return sr.decodeBaseline(proto)
 	case protocol.SvcClientData:
 		return sr.decodeClientData()
+	case protocol.SvcTempEntity:
+		return sr.decodeTempEntity()
 	}
 	return nil, fmt.Errorf("%w: cmd=%d", ErrUnknownSvc, cmd)
 }

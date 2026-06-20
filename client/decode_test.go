@@ -48,8 +48,10 @@ func TestNext_UnknownSvcByte(t *testing.T) {
 
 // Another opcode the engine has no encoder/decoder for in this commit.
 func TestNext_UnknownSvc_Skipped(t *testing.T) {
-	// svc_temp_entity (= 23) is explicitly deferred.
-	sr := newReader([]byte{protocol.SvcTempEntity})
+	// svc_time (= 7) is deferred (server-time stamp; folded into the
+	// host's per-frame state by the apply layer, not surfaced as a
+	// Decoded value).
+	sr := newReader([]byte{protocol.SvcTime})
 	if _, err := sr.Next(protocol.VersionNQ); !errors.Is(err, ErrUnknownSvc) {
 		t.Errorf("err: got %v want ErrUnknownSvc", err)
 	}
