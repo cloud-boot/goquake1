@@ -181,7 +181,7 @@ func TestReader_BasicReadBack(t *testing.T) {
 	_ = WriteString(b, "hi")
 	r := NewReader(b.Bytes())
 	r.Begin()
-	if r.ReadByte() != 1 {
+	if r.ReadU8() != 1 {
 		t.Error("ReadByte")
 	}
 	if r.ReadChar() != -1 {
@@ -209,7 +209,7 @@ func TestReader_BasicReadBack(t *testing.T) {
 
 func TestReader_EOFEachType(t *testing.T) {
 	r := NewReader(nil)
-	if r.ReadByte() != -1 || !r.Bad() {
+	if r.ReadU8() != -1 || !r.Bad() {
 		t.Error("ReadByte EOF")
 	}
 	r = NewReader(nil)
@@ -249,7 +249,7 @@ func TestReader_StringEmpty(t *testing.T) {
 	if r.Pos() != 1 {
 		t.Errorf("Pos after empty string: %d", r.Pos())
 	}
-	if r.ReadByte() != 'x' {
+	if r.ReadU8() != 'x' {
 		t.Error("ReadByte after empty string failed")
 	}
 }

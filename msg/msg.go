@@ -173,9 +173,12 @@ func (r *Reader) ReadChar() int {
 	return c
 }
 
-// ReadByte returns the next byte as an unsigned int (0..255). -1 +
-// Bad on EOF. tyrquake: MSG_ReadByte.
-func (r *Reader) ReadByte() int {
+// ReadU8 returns the next byte as an unsigned int (0..255). -1 +
+// Bad on EOF. tyrquake: MSG_ReadByte. Not named ReadByte so as not
+// to collide with the io.ByteReader interface's ReadByte() (byte,
+// error) signature -- the tyrquake API returns int with -1 as the
+// EOF sentinel, which cannot satisfy io.ByteReader.
+func (r *Reader) ReadU8() int {
 	if r.pos+1 > len(r.data) {
 		r.bad = true
 		return -1
