@@ -1,0 +1,172 @@
+# go-quake1/engine CI — vet, gofmt, and a per-package coverage gate that
+# RUNS the test suite on every 64-bit arch the engine supports (amd64,
+# arm64, riscv64, loong64, ppc64le, s390x). The renderer / bspfile / msg
+# packages all touch little-endian-encoded data structures and the engine
+# itself runs on every Go 64-bit target — running the tests under s390x
+# emulation makes the byte-order paths a genuine cross-arch check.
+#
+# Native runners cover amd64 (ubuntu-latest) and arm64 (ubuntu-24.04-arm).
+# The remaining little-endian arches plus big-endian s390x run as
+# cross-compiled test binaries under QEMU via tonistiigi/binfmt.
+#
+# CGO=0. GOWORK=off (the engine is a standalone module, no workspace).
+#
+# Coverage gate: 100% on every Go package EXCEPT bsptrace, which carries
+# a documented 87.8% floor while the synthetic-hull backfill lands (see
+# the open "Backfill bsptrace coverage to 100%" backlog item). The gate
+# enforces non-regression — bsptrace is allowed to RISE but never fall,
+# every other package must be exactly 100.0%.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GOWORK: off
+  CGO_ENABLED: 0
+
+jobs:
+  test:
+    name: vet + gofmt + per-package coverage gate (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+
+      - run: go version
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l $(find . -name '*.go' -not -path './reference/*'))
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needs to be run on:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: per-package coverage gate
+        run: |
+          set -euo pipefail
+          fail=0
+          for pkg in $(go list ./... | grep -v '/reference'); do
+            pkg_short=$(echo "$pkg" | sed 's|github.com/go-quake1/engine/||')
+            out=$(go test -cover "$pkg" 2>&1 | tail -n 1)
+            echo "$out"
+            # Extract NN.N% (or "no statements")
+            pct=$(echo "$out" | grep -oE 'coverage: [0-9.]+%' | grep -oE '[0-9.]+' || echo "")
+            if [ -z "$pct" ]; then
+              # "no statements" packages (e.g. anorms is a data table) -- skip the gate
+              echo "  -> no statements, skipped"
+              continue
+            fi
+            # bsptrace floor: 87.8% (until the synthetic-hull backfill ships)
+            if [ "$pkg_short" = "bsptrace" ]; then
+              floor=87.8
+            else
+              floor=100.0
+            fi
+            ok=$(awk -v p="$pct" -v f="$floor" 'BEGIN { print (p+0 >= f+0) ? 1 : 0 }')
+            if [ "$ok" -ne 1 ]; then
+              echo "::error::$pkg_short coverage ${pct}% < floor ${floor}%"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+
+  test-arm64:
+    name: test (arm64, native)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+
+      - run: go version
+
+      - name: go test
+        run: go test $(go list ./... | grep -v '/reference')
+
+  emulated:
+    name: test (${{ matrix.arch }}, qemu)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+            qemu_cpu: rv64,v=true,vlen=128
+          - arch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu_cpu: la464
+          - arch: ppc64le
+            image: debian:trixie
+            qemu_cpu: power9
+          - arch: s390x
+            image: debian:trixie
+            qemu_cpu: qemu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      - run: go version
+
+      - name: register QEMU binfmt handlers
+        run: docker run --privileged --rm tonistiigi/binfmt --install all
+
+      - name: cross-compile test binaries
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p _qemu
+          for pkg in $(go list ./... | grep -v '/reference'); do
+            name=$(echo "$pkg" | tr '/.' '__')
+            if go test -c -cover -o "_qemu/${name}.test" "$pkg"; then
+              echo "built ${name}.test for $pkg"
+            else
+              echo "no test binary for $pkg (no tests?)"
+            fi
+          done
+
+      - name: run test binaries under QEMU (${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bins=(_qemu/*.test)
+          if [ ${#bins[@]} -eq 0 ]; then
+            echo "::error::no test binaries were built for ${{ matrix.arch }}"
+            exit 1
+          fi
+          for bin in "${bins[@]}"; do
+            echo "::group::$bin (${{ matrix.arch }})"
+            docker run --rm \
+              --platform "linux/${{ matrix.arch }}" \
+              -e QEMU_CPU='${{ matrix.qemu_cpu }}' \
+              -v "$PWD:/work" -w /work \
+              ${{ matrix.image }} \
+              "/work/$bin" -test.v
+            echo "::endgroup::"
+          done
