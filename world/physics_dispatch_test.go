@@ -50,8 +50,10 @@ func dispatchProgs() *progs.Progs {
 	avelocity := add("avelocity")
 	mins := add("mins")
 	maxs := add("maxs")
+	gravity := add("gravity")
+	vAngle := add("v_angle")
 	return &progs.Progs{
-		Header:  progs.Header{EntityFields: 24},
+		Header:  progs.Header{EntityFields: 28},
 		Strings: strs,
 		FieldDefs: []progs.Def{
 			{Type: uint16(progs.EvFloat), Ofs: 1, SName: nextthink},
@@ -65,6 +67,8 @@ func dispatchProgs() *progs.Progs {
 			{Type: uint16(progs.EvVector), Ofs: 15, SName: avelocity},
 			{Type: uint16(progs.EvVector), Ofs: 18, SName: mins},
 			{Type: uint16(progs.EvVector), Ofs: 21, SName: maxs},
+			{Type: uint16(progs.EvFloat), Ofs: 24, SName: gravity},
+			{Type: uint16(progs.EvVector), Ofs: 25, SName: vAngle},
 		},
 	}
 }
@@ -445,8 +449,9 @@ func TestRunPhysics_DispatchesFlyMissile(t *testing.T) {
 // surfaced ErrNoThinkCaller via their RunThink call).
 func TestRunPhysics_SkipsUnsupportedMovetypes(t *testing.T) {
 	cases := []server.MoveType{
-		server.MoveTypeWalk,
-		server.MoveTypeStep,
+		// Walk + Step now WIRED through PhysicsWalk + PhysicsStep
+		// (post-batch10); only Push / Angle* / unknown stay in the
+		// silent-skip default arm.
 		server.MoveTypePush,
 		server.MoveTypeAngleClip,
 		server.MoveTypeAngleNoClip,
@@ -793,5 +798,102 @@ func TestRunPhysics_MixedPool(t *testing.T) {
 	)
 	if err != nil {
 		t.Errorf("RunPhysics mixed pool: err=%v want nil", err)
+	}
+}
+
+// MoveTypeStep + MoveTypeWalk are wired (post-batch10). These tests
+// just confirm the new dispatch arms route to the handlers without
+// erroring; the handlers' detailed behaviour is exercised in
+// physics_ground_test.go.
+
+func TestRunPhysics_DispatchesStep(t *testing.T) {
+	p := dispatchProgs()
+	a := progs.NewEdictArena(p, 2)
+	a.Reset()
+	e := dispatchEntity(t, p, a, server.MoveTypeStep, server.SolidBBox)
+	ev, _ := progs.NewEntVars(p, e)
+	_ = ev.WriteVec3("origin", [3]float32{0, 0, 100})
+	_ = ev.WriteVec3("velocity", [3]float32{0, 0, 0})
+
+	ctx := PhysicsContext{
+		Worldmodel:  flyMoveEmptyWorld(),
+		Now:         1,
+		Dt:          0.1,
+		ThinkCaller: dispatchNoThink(t),
+	}
+	pool := []*progs.Edict{e}
+	if err := RunPhysics(
+		len(pool),
+		server.DefaultPhysParams(),
+		ctx,
+		func(i int) *progs.Edict { return pool[i] },
+		dispatchNoCmd,
+		dispatchKey,
+		p,
+	); err != nil {
+		t.Fatalf("RunPhysics Step: err=%v want nil", err)
+	}
+}
+func TestRunPhysics_DispatchesWalk(t *testing.T) {
+	p := dispatchProgs()
+	a := progs.NewEdictArena(p, 2)
+	a.Reset()
+	e := dispatchEntity(t, p, a, server.MoveTypeWalk, server.SolidSlideBox)
+	ev, _ := progs.NewEntVars(p, e)
+	_ = ev.WriteVec3("origin", [3]float32{0, 0, 100})
+	_ = ev.WriteVec3("velocity", [3]float32{0, 0, 0})
+	_ = ev.WriteVec3("v_angle", [3]float32{0, 0, 0})
+	_ = ev.WriteFloat("gravity", 1)
+	_ = ev.WriteFloat("flags", float32(server.FlagOnGround))
+
+	ctx := PhysicsContext{
+		Worldmodel:  flyMoveEmptyWorld(),
+		Now:         1,
+		Dt:          0.1,
+		ThinkCaller: dispatchNoThink(t),
+	}
+	pool := []*progs.Edict{e}
+	if err := RunPhysics(
+		len(pool),
+		server.DefaultPhysParams(),
+		ctx,
+		func(i int) *progs.Edict { return pool[i] },
+		dispatchNoCmd,
+		dispatchKey,
+		p,
+	); err != nil {
+		t.Fatalf("RunPhysics Walk: err=%v want nil", err)
+	}
+}
+
+// Step + Walk error propagation: drop a required field so the
+// handler's read fails, verify the dispatcher surfaces the error.
+func TestRunPhysics_StepErrorPropagates(t *testing.T) {
+	p := dispatchDropField("velocity")
+	a := progs.NewEdictArena(p, 2)
+	a.Reset()
+	e := dispatchEntity(t, p, a, server.MoveTypeStep, server.SolidBBox)
+	ctx := PhysicsContext{Now: 1, Dt: 0.1, ThinkCaller: dispatchNoThink(t)}
+	pool := []*progs.Edict{e}
+	err := RunPhysics(len(pool), server.DefaultPhysParams(), ctx,
+		func(i int) *progs.Edict { return pool[i] },
+		dispatchNoCmd, dispatchKey, p)
+	if err == nil {
+		t.Error("expected error from PhysicsStep")
+	}
+}
+
+func TestRunPhysics_WalkErrorPropagates(t *testing.T) {
+	p := dispatchDropField("velocity")
+	a := progs.NewEdictArena(p, 2)
+	a.Reset()
+	e := dispatchEntity(t, p, a, server.MoveTypeWalk, server.SolidSlideBox)
+	ctx := PhysicsContext{Now: 1, Dt: 0.1, ThinkCaller: dispatchNoThink(t)}
+	pool := []*progs.Edict{e}
+	err := RunPhysics(len(pool), server.DefaultPhysParams(), ctx,
+		func(i int) *progs.Edict { return pool[i] },
+		dispatchNoCmd, dispatchKey, p)
+	if err == nil {
+		t.Error("expected error from PhysicsWalk")
 	}
 }

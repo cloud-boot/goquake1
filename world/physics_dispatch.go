@@ -126,7 +126,6 @@ func RunPhysics(
 	keyAt PhysicsKeyResolver,
 	progsHandle *progs.Progs,
 ) error {
-	_ = cmdAt // reserved for the future PhysicsWalk handler; the
 	// shape is locked in now so a follow-up that wires Walk in
 	// does not have to change the dispatcher signature.
 
@@ -193,14 +192,20 @@ func RunPhysics(
 			if _, err := PhysicsBounce(ent, ev, key, params, ctx); err != nil {
 				return err
 			}
+		case server.MoveTypeStep:
+			if _, err := PhysicsStep(ent, ev, key, params, ctx); err != nil {
+				return err
+			}
+		case server.MoveTypeWalk:
+			if _, err := PhysicsWalk(ent, ev, key, cmdAt(i), params, ctx); err != nil {
+				return err
+			}
 		default:
-			// Push / Walk / Step / AngleClip / AngleNoClip /
-			// any unknown value -- silent skip. The C upstream
-			// Sys_Error's on a genuinely-unknown movetype; the Go
-			// port treats every non-dispatched movetype the same
-			// way until the missing handlers land, so the test
-			// matrix doesn't have to track a slowly-shrinking
-			// "known-unsupported" list.
+			// Push / AngleClip / AngleNoClip / any unknown value
+			// -- silent skip. The C upstream Sys_Error's on a
+			// genuinely-unknown movetype; the Go port treats
+			// non-dispatched movetypes the same way until the
+			// missing handlers land.
 		}
 	}
 
