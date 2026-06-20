@@ -5,25 +5,13 @@
 package server
 
 import (
-	"errors"
-
 	"github.com/go-quake1/engine/msg"
 	"github.com/go-quake1/engine/protocol"
 	"github.com/go-quake1/engine/sizebuf"
 )
 
-// ErrNilBuf fires when EncodeUpdate is handed a nil sizebuf. tyrquake
-// silently segfaults; the Go port surfaces the misuse.
-var ErrNilBuf = errors.New("server: nil sizebuf")
-
-// ErrEntityNumRange fires when EncodeUpdate is asked to pack an
-// entity index outside the 16-bit wire slot. tyrquake silently
-// truncates via MSG_WriteShort's int->short cast on the long-entity
-// branch and via the byte cast on the short-entity branch; the Go
-// port refuses so the caller routes the bug instead of shipping a
-// corrupted snapshot. tyrquake: SV_WriteEntitiesToClient's
-// MSG_WriteShort(msg, e) / MSG_WriteByte(msg, e) call sites.
-var ErrEntityNumRange = errors.New("server: entityNum outside [0, 0xffff]")
+// ErrNilBuf + ErrEntityNumRange are shared with encoders_misc.go
+// (defined there); EncodeUpdate uses the same sentinels.
 
 // EntityUpdate is the per-entity per-tick delta the server sends
 // to one client. Caller computes which fields differ from the
