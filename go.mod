@@ -1,4 +1,4 @@
-module github.com/cloud-boot/goquake1
+module github.com/go-quake1/engine
 
 go 1.26.4
 

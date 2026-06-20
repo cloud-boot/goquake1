@@ -1,4 +1,4 @@
-Copyright (c) 2026, the cloud-boot/goquake1 authors. All rights reserved.
+Copyright (c) 2026, the go-quake1/engine authors. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -29,7 +29,7 @@ POSSIBILITY OF SUCH DAMAGE.
 ================================================================================
 SCOPE OF THIS BSD-3-CLAUSE LICENSE
 
-The BSD-3-Clause license above governs only the cloud-boot/goquake1 wrapper
+The BSD-3-Clause license above governs only the go-quake1/engine wrapper
 code authored fresh for this repository: the bare-metal probe glue, virtio
 adapters in backend/tamago/, the embedpak shareware archive loader, the
 provable-test harness, the harvest-reference oracle generator, the transpile

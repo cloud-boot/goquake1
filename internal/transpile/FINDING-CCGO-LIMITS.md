@@ -100,7 +100,7 @@ alternatives, ranked by how soon a working Q-1a probe could land:
 The scaffolding committed for the ccgo path is NOT wasted even if we
 pivot away from ccgo for Q-1a:
 
-- The `cloud-boot/goquake1` repo + BSD-3/GPL-2.0 license split.
+- The `go-quake1/engine` repo + BSD-3/GPL-2.0 license split.
 - The `internal/transpile/Dockerfile` (any future C-to-Go work needs
   the same clang-19 + apt deps + Go toolchain).
 - The `internal/transpile/run.sh` driver shape (clone -> bootstrap ->
