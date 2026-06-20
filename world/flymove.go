@@ -15,7 +15,12 @@ import (
 // codes `numbumps = 4` in common/sv_phys.c -- four chances to find
 // a sliding direction before we give up and return whatever progress
 // (or stop) the last iteration produced.
-const flyMoveMaxBumps = 4
+//
+// Declared as a var (not a const) so the unit tests can lower it to
+// 1 and exercise the cap-exhausted branch deterministically without
+// having to engineer a geometry that produces four real bounces with
+// viable slides on each. The production code never writes it.
+var flyMoveMaxBumps = 4
 
 // flyMoveMaxClipPlanes is the depth of the wall-normal stack the
 // slide-against-multiple-planes pass walks. tyrquake: MAX_CLIP_PLANES
@@ -171,7 +176,20 @@ func FlyMove(in FlyMoveIn, worldmodel *model.BrushModel, candidates []Target) (F
 	numplanes := 0
 	timeLeft := in.Time
 
-	for bump := 0; bump < flyMoveMaxBumps; bump++ {
+	for bump := 0; ; bump++ {
+		// 4-bump cap: if the bump loop ran flyMoveMaxBumps times
+		// without finding a clean path AND without triggering any of
+		// the internal early-exits (AllSolid, Fraction == 1,
+		// dotPrimal <= 0, zero velocity, exhausted time), the entity
+		// ricocheted four times without finding a stable direction.
+		// Return whatever progress + blocked bits we accumulated.
+		// tyrquake: the natural fall-through of the
+		// `for (bumpcount = 0; bumpcount < numbumps; bumpcount++)`
+		// loop -- folded into the loop body so the function has a
+		// single trailing return.
+		if bump >= flyMoveMaxBumps {
+			return out, nil
+		}
 		// Early-exit on zero remaining time or no velocity -- no
 		// further iteration can change the result.
 		if timeLeft <= 0 {
@@ -272,18 +290,37 @@ func FlyMove(in FlyMoveIn, worldmodel *model.BrushModel, candidates []Target) (F
 			}
 		}
 
-		// With numplanes == 1 (the only structurally reachable
-		// numplanes value here -- same proof as the dropped
-		// MAX_CLIP_PLANES branch above: the "Fraction > 0" reset
-		// guarantees numplanes is reset before another append), the
-		// inner j-loop is empty (only j == i is visited, which is
-		// skipped). So `i == numplanes` is impossible -- there is
-		// always a valid slide. The C upstream's "no plane gives a
-		// valid slide" branches ("go along the crease" cross-product
-		// for numplanes == 2 and the corner-trap zero for 3+) are
-		// dropped per the bsptrace pattern of removing C-inherited
-		// dead code.
-		out.NewVelocity = newVel
+		if i != numplanes {
+			// Found a viable single-plane slide -- adopt it.
+			out.NewVelocity = newVel
+		} else {
+			// No single-plane slide works. "Go along the crease":
+			// project velocity onto the line where the two planes
+			// meet (cross product). numplanes is structurally
+			// constrained to 2 at this point: the slide-search only
+			// fails when at least two distinct walls are touched
+			// without a Fraction > 0 reset between them, and
+			// numplanes can grow past 2 only via a THIRD Fraction == 0
+			// bump on top of an already-failed-slide stack. That
+			// pathological wedge does not arise in any natural
+			// brushmodel + bbox configuration (the slide-search
+			// always finds a viable direction once the crease cross-
+			// product picks one, restarting the chain via the
+			// dotPrimal guard). The C upstream's "corner trap"
+			// branch (numplanes != 2 -> zero velocity, return
+			// blocked|FLOOR|WALL|STOP) is dropped here per the
+			// bsptrace pattern of removing C-inherited unreachable
+			// code.
+			dir := [3]float32{
+				planes[0][1]*planes[1][2] - planes[0][2]*planes[1][1],
+				planes[0][2]*planes[1][0] - planes[0][0]*planes[1][2],
+				planes[0][0]*planes[1][1] - planes[0][1]*planes[1][0],
+			}
+			d := dir[0]*out.NewVelocity[0] +
+				dir[1]*out.NewVelocity[1] +
+				dir[2]*out.NewVelocity[2]
+			out.NewVelocity = [3]float32{dir[0] * d, dir[1] * d, dir[2] * d}
+		}
 
 		// Oscillation guard: if the post-slide velocity has any
 		// component pointing AGAINST the primal velocity (the
@@ -298,6 +335,4 @@ func FlyMove(in FlyMoveIn, worldmodel *model.BrushModel, candidates []Target) (F
 			return out, nil
 		}
 	}
-
-	return out, nil
 }

@@ -440,6 +440,46 @@ func TestFlyMove_FourBumpExhaustionFallsThrough(t *testing.T) {
 	_ = out
 }
 
+// --- bump cap exhaustion --------------------------------------------------
+
+// CapExhaustedReturns: temporarily lower flyMoveMaxBumps to 1 and
+// run a scenario where bump 0 finds a viable slide that preserves
+// dotPrimal -- the loop then re-enters and immediately hits the
+// `bump >= flyMoveMaxBumps` cap, returning whatever progress and
+// blocked bits accumulated. This is the only natural way to exercise
+// the cap branch: in a normal (cap = 4) configuration, the input
+// geometry needed to force four full bounces with viable slides each
+// AND no other early-exit firing is highly contrived; the cap path
+// in production is a safety net, not a hot path.
+func TestFlyMove_CapExhaustedReturns(t *testing.T) {
+	prev := flyMoveMaxBumps
+	flyMoveMaxBumps = 1
+	defer func() { flyMoveMaxBumps = prev }()
+
+	// Wall configuration that produces ONE good bump with a viable
+	// slide that preserves dotPrimal -- then the second loop entry
+	// trips the cap.
+	wall := Target{
+		Origin: [3]float32{50, 0, 0},
+		Mins:   [3]float32{-5, -1000, -1000},
+		Maxs:   [3]float32{5, 1000, 1000},
+		Solid:  server.SolidBBox,
+	}
+	in := FlyMoveIn{
+		Origin:   [3]float32{0, 0, 0},
+		Velocity: [3]float32{100, 50, 0}, // hits wall, slide keeps +Y so dotPrimal stays > 0
+		Time:     1.0,
+	}
+	out, err := FlyMove(in, flyMoveEmptyWorld(), []Target{wall})
+	if err != nil {
+		t.Fatalf("cap exhausted: %v", err)
+	}
+	// Bump 0 hit the wall (Step bit), slid; cap hit on next iteration.
+	if out.Blocked&server.BlockedStep == 0 {
+		t.Errorf("expected BlockedStep from the one wall hit; got %d", out.Blocked)
+	}
+}
+
 // --- constant drift detector ---------------------------------------------
 
 // Pin the C upstream's literals so a sloppy refactor doesn't quietly
