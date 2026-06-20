@@ -4,7 +4,7 @@
 
 package server
 
-import "math"
+import "github.com/go-quake1/engine/mathlib"
 
 // StopEpsilon is the magnitude below which post-clip velocity
 // components are snapped to zero -- prevents trembling along a
@@ -67,34 +67,64 @@ func ClipVelocity(velocity, normal [3]float32, overbounce float32) ([3]float32, 
 	return out, blocked
 }
 
-// WallFriction reduces velocity by the component perpendicular to
-// the wall normal (i.e. the part pushing INTO the wall). Used by
-// SV_UserFriction when the player is brushing against a vertical
-// surface to keep wallrunning slow. tyrquake: SV_WallFriction in
-// NQ/sv_user.c (NOT in common/sv_phys.c despite the helper's
-// generality -- the only caller is the user-input integrator).
+// WallFriction returns the post-friction velocity for a player
+// brushing against a wall, matching the C upstream verbatim.
+// tyrquake: SV_WallFriction in common/sv_phys.c (NOT NQ/sv_user.c
+// -- the SV_ prefix and the older spec docs misplace it).
 //
-// The early-return when the unit-velocity dot is non-positive
-// covers both "already moving away from the wall" (dot < 0) and
-// "zero velocity" (the normalize step produces a zero vector,
-// dot == 0). dt == 0 or friction == 0 also produces no change
-// because the scale factor collapses to zero -- but the formula
-// still runs unconditionally past the dot-sign guard.
-func WallFriction(velocity, normal [3]float32, friction, dt float32) [3]float32 {
-	speed := float32(math.Sqrt(float64(velocity[0]*velocity[0] + velocity[1]*velocity[1] + velocity[2]*velocity[2])))
-	if speed == 0 {
-		return velocity
-	}
-	invSpeed := 1 / speed
-	d := velocity[0]*normal[0]*invSpeed + velocity[1]*normal[1]*invSpeed + velocity[2]*normal[2]*invSpeed
-	if d <= 0 {
+// Shape:
+//
+//	forward, _, _ = AngleVectors(viewangles)
+//	d = dot(normal, forward) + 0.5
+//	if d >= 0:    return velocity unchanged
+//	              (player isn't facing INTO the wall enough; the
+//	              wall normal points AWAY from the wall surface,
+//	              so a player walking into the wall has a negative
+//	              forward.normal; the +0.5 sets the activation
+//	              threshold at ~120deg of facing)
+//	i = dot(normal, velocity)
+//	side = velocity - normal*i            (the wall-tangential part)
+//	velocity[0] = side[0] * (1 + d)
+//	velocity[1] = side[1] * (1 + d)
+//	velocity[2] stays as-is               (C only writes [0]/[1];
+//	                                       gravity component is
+//	                                       preserved verbatim)
+//
+// The (1+d) factor is in [0, 0.5] when the early-return doesn't
+// fire (d in [-1, -0.5]), so the tangential XY velocity is
+// scaled DOWN -- this is the "stick to the wall" feel when the
+// player runs face-first into a surface.
+//
+// Divergence from this port's earlier prompt-spec: the C takes
+// no dt and no friction scalar; the only inputs are the player's
+// facing angles, the wall normal, and the player's velocity. The
+// formula is a pure geometric rescaling, not a per-tick exponential
+// decay. We follow the C; the prompt's documented version was a
+// generic friction shape that didn't exist upstream.
+//
+// Parameters:
+//
+//	velocity    current world velocity ([vx, vy, vz])
+//	normal      outward wall normal from the collision trace
+//	viewangles  player's facing angles (pitch, yaw, roll) in degrees
+func WallFriction(velocity, normal, viewangles [3]float32) [3]float32 {
+	forward, _, _ := mathlib.AngleVectors(mathlib.Vec3(viewangles))
+
+	d := normal[0]*forward[0] + normal[1]*forward[1] + normal[2]*forward[2]
+	d += 0.5
+	if d >= 0 {
 		return velocity
 	}
 
-	scale := d * dt * friction
+	// cut the tangential velocity
+	i := normal[0]*velocity[0] + normal[1]*velocity[1] + normal[2]*velocity[2]
+	sideX := velocity[0] - normal[0]*i
+	sideY := velocity[1] - normal[1]*i
+
+	scale := 1 + d
 	return [3]float32{
-		velocity[0] - normal[0]*scale,
-		velocity[1] - normal[1]*scale,
-		velocity[2] - normal[2]*scale,
+		sideX * scale,
+		sideY * scale,
+		velocity[2], // upstream leaves v[2] untouched
 	}
 }

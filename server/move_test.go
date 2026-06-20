@@ -4,7 +4,6 @@
 package server
 
 import (
-	"math"
 	"testing"
 )
 
@@ -137,70 +136,116 @@ func TestClipVelocity_NeitherFloorNorStep(t *testing.T) {
 	}
 }
 
-func TestWallFriction_TowardWallReduces(t *testing.T) {
-	// velocity points partway into the wall (normal=(1,0,0)).
-	// d = dot(unit(v), normal) > 0 -> formula applies.
-	in := [3]float32{10, 0, 0}
-	out := WallFriction(in, [3]float32{1, 0, 0}, 4.0, 0.1)
-	// speed=10, unit=(1,0,0), d=1, scale=1*0.1*4=0.4.
-	// out = (10 - 1*0.4, 0, 0) = (9.6, 0, 0).
-	want := [3]float32{9.6, 0, 0}
+// TestWallFriction_FacingIntoWall: player at yaw=0 (forward=+X)
+// hits a wall to the east whose outward normal points back at
+// them (-X). d = dot(normal, forward) = -1 ; d+=0.5 -> -0.5.
+// Formula runs with scale = 1+d = 0.5.
+//
+// Velocity (10, 5, 7) -> i = dot(normal, vel) = -10,
+//
+//	side  = vel - normal*i = (10-(-1)*(-10), 5-0, 7-0)
+//	      = (10 - 10, 5, 7) = (0, 5, 7).
+//	out[0] = 0 * 0.5 = 0
+//	out[1] = 5 * 0.5 = 2.5
+//	out[2] = velocity[2] PRESERVED (C never writes v[2]) -> 7.
+func TestWallFriction_FacingIntoWall(t *testing.T) {
+	in := [3]float32{10, 5, 7}
+	normal := [3]float32{-1, 0, 0}
+	angles := [3]float32{0, 0, 0}
+	out := WallFriction(in, normal, angles)
+	want := [3]float32{0, 2.5, 7}
 	if !vec3ApproxEq(out, want, 1e-5) {
-		t.Errorf("toward wall: got %v want %v", out, want)
+		t.Errorf("facing into wall: got %v want %v", out, want)
 	}
 }
 
-func TestWallFriction_AwayFromWallUnchanged(t *testing.T) {
-	// dot(unit(v), normal) < 0 -> early return, velocity passes
-	// through verbatim.
-	in := [3]float32{-10, 0, 0}
-	out := WallFriction(in, [3]float32{1, 0, 0}, 4.0, 0.1)
-	if out != in {
-		t.Errorf("away wall: got %v want %v (unchanged)", out, in)
+// TestWallFriction_FacingAwayFromWall: yaw=180 -> forward=(-1,0,0).
+// Wall normal=(-1,0,0) (same direction as facing). d = 1 + 0.5
+// = 1.5 >= 0 -> early return.
+func TestWallFriction_FacingAwayFromWall(t *testing.T) {
+	in := [3]float32{10, 5, 7}
+	normal := [3]float32{-1, 0, 0}
+	angles := [3]float32{0, 180, 0}
+	out := WallFriction(in, normal, angles)
+	if !vec3ApproxEq(out, in, 1e-5) {
+		t.Errorf("facing away: got %v want %v (unchanged)", out, in)
 	}
 }
 
+// TestWallFriction_ParallelTripsEarlyReturn: yaw=90 -> forward=
+// (0,1,0). Wall normal=(1,0,0). dot=0; d+=0.5 -> 0.5 >= 0
+// -> early return. The 0.5 offset is what makes a parallel-facing
+// player NOT get any wall drag.
+func TestWallFriction_ParallelTripsEarlyReturn(t *testing.T) {
+	in := [3]float32{10, 5, 7}
+	normal := [3]float32{1, 0, 0}
+	angles := [3]float32{0, 90, 0}
+	out := WallFriction(in, normal, angles)
+	if !vec3ApproxEq(out, in, 1e-5) {
+		t.Errorf("parallel facing: got %v want %v (unchanged)", out, in)
+	}
+}
+
+// TestWallFriction_ZeroVelocity: zero velocity but player facing
+// the wall hard enough to trip the formula. i = 0, side = (0,0,0),
+// out = (0*scale, 0*scale, velocity[2]=0) = zeros.
 func TestWallFriction_ZeroVelocity(t *testing.T) {
-	// Zero velocity -> speed==0 guard -> return verbatim.
-	// Avoids the normalize-by-zero NaN that would otherwise
-	// poison the dot.
 	in := [3]float32{0, 0, 0}
-	out := WallFriction(in, [3]float32{1, 0, 0}, 4.0, 0.1)
+	normal := [3]float32{-1, 0, 0}
+	angles := [3]float32{0, 0, 0}
+	out := WallFriction(in, normal, angles)
 	if out != in {
 		t.Errorf("zero velocity: got %v want zeros", out)
 	}
 }
 
-func TestWallFriction_ZeroDt(t *testing.T) {
-	// dt=0 -> scale=0 -> no change (formula still runs past
-	// the dot guard).
-	in := [3]float32{10, 0, 0}
-	out := WallFriction(in, [3]float32{1, 0, 0}, 4.0, 0)
-	if out != in {
-		t.Errorf("dt=0: got %v want %v (unchanged)", out, in)
+// TestWallFriction_PreservesZ: critical Quake behavior -- the C
+// only writes v[0] and v[1], so gravity (v[2]) survives every
+// wall-friction tick. Without this the player would freeze in
+// the air on contact.
+func TestWallFriction_PreservesZ(t *testing.T) {
+	in := [3]float32{10, 0, -50} // falling while pushing east
+	normal := [3]float32{-1, 0, 0}
+	angles := [3]float32{0, 0, 0}
+	out := WallFriction(in, normal, angles)
+	if out[2] != -50 {
+		t.Errorf("z preservation: got out[2]=%v want -50", out[2])
 	}
 }
 
-func TestWallFriction_ZeroFriction(t *testing.T) {
-	// friction=0 -> scale=0 -> no change.
+// TestWallFriction_PartialFacing: pitch=30deg means forward has
+// a -sp z component. Wall normal=(-1,0,0). forward.normal =
+// -cos(30) ~= -0.866. d = -0.866 + 0.5 = -0.366. scale = 0.634.
+// Verify the path is taken (output differs from input).
+func TestWallFriction_PartialFacing(t *testing.T) {
 	in := [3]float32{10, 0, 0}
-	out := WallFriction(in, [3]float32{1, 0, 0}, 0, 0.1)
-	if out != in {
-		t.Errorf("friction=0: got %v want %v (unchanged)", out, in)
+	normal := [3]float32{-1, 0, 0}
+	angles := [3]float32{30, 0, 0} // pitched down 30deg
+	out := WallFriction(in, normal, angles)
+	// i = -10, side = (10 - (-1)*(-10), 0, 0) = (0, 0, 0)
+	// out[0] = 0 * scale = 0 ; out[1] = 0 ; out[2] = velocity[2] = 0.
+	want := [3]float32{0, 0, 0}
+	if !vec3ApproxEq(out, want, 1e-5) {
+		t.Errorf("partial facing: got %v want %v", out, want)
 	}
 }
 
-func TestWallFriction_DiagonalInto(t *testing.T) {
-	// velocity (10, 10, 0), normal (1, 0, 0). speed = sqrt(200),
-	// unit = (1/sqrt2, 1/sqrt2, 0), d = 1/sqrt2. scale = d*dt*f.
-	// out[0] = 10 - 1*scale ; out[1] unchanged (normal[1]=0).
-	in := [3]float32{10, 10, 0}
-	out := WallFriction(in, [3]float32{1, 0, 0}, 4.0, 0.5)
-	sqrt2 := float32(math.Sqrt2)
-	scale := (1 / sqrt2) * 0.5 * 4.0
-	want := [3]float32{10 - scale, 10, 0}
-	if !vec3ApproxEq(out, want, 1e-4) {
-		t.Errorf("diagonal: got %v want %v", out, want)
+// TestWallFriction_GrazingExactlyHalf: d = dot+0.5 == 0 exactly
+// trips the `d >= 0` early return (the >= vs > matters in C).
+// Construct: yaw so forward.normal = -0.5 exactly. forward at
+// yaw=60 is (cos60, sin60, 0) = (0.5, sqrt3/2, 0). normal=(-1,0,0).
+// forward.normal = -0.5. d = 0 -> early return.
+func TestWallFriction_GrazingExactlyHalf(t *testing.T) {
+	in := [3]float32{10, 5, 0}
+	normal := [3]float32{-1, 0, 0}
+	angles := [3]float32{0, 60, 0}
+	out := WallFriction(in, normal, angles)
+	// At exactly d==0 the >= check fires; output should be unchanged.
+	// Allow tiny ULP tolerance: cos(60deg) computed via sinCos may
+	// not be exactly 0.5, so d may be a hair below 0 and apply a
+	// scale of ~1. Check it's at least very close to the input.
+	if !vec3ApproxEq(out, in, 1e-3) {
+		t.Errorf("grazing: got %v want ~%v", out, in)
 	}
 }
 
