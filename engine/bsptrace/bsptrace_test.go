@@ -378,6 +378,35 @@ func TestTraceHull_ImpactWithFarSideSolid(t *testing.T) {
 	}
 }
 
+// Cover line 164-166: err propagation from the near-side recursion.
+// Build a 3-level hull where the near-side recursion descends two
+// more levels and hits a bad PlaneNum.
+func TestTraceHull_ErrFromNearRecursion(t *testing.T) {
+	h := &Hull{
+		ClipNodes: []bspfile.ClipNode{
+			// node 0: x=0, +x -> node 1, -x -> EMPTY
+			{PlaneNum: 0, Children: [2]int16{1, bspfile.ContentsEmpty}},
+			// node 1: x=5, +x -> node 2 (bad), -x -> EMPTY
+			{PlaneNum: 1, Children: [2]int16{2, bspfile.ContentsEmpty}},
+			// node 2: BAD plane index
+			{PlaneNum: 99, Children: [2]int16{bspfile.ContentsEmpty, bspfile.ContentsEmpty}},
+		},
+		Planes: []bspfile.Plane{
+			{Normal: [3]float32{1, 0, 0}, Dist: 0, Type: bspfile.PlaneX},
+			{Normal: [3]float32{1, 0, 0}, Dist: 5, Type: bspfile.PlaneX},
+		},
+		FirstClipNode: 0,
+		LastClipNode:  2,
+	}
+	tr := DefaultTrace()
+	// Trace from (10,0,0) to (-10,0,0): approaches from +side
+	// (side=0 at node 0), near=children[0]=node 1, recurse, hits
+	// node 2's bad plane via near-side propagation.
+	if _, err := TraceHull(h, 0, [3]float32{10, 0, 0}, [3]float32{-10, 0, 0}, &tr); !errors.Is(err, ErrBadPlaneIndex) {
+		t.Errorf("got %v want ErrBadPlaneIndex (from near recursion)", err)
+	}
+}
+
 // Cover the line-107 guard: nodenum is inside the range
 // FirstClipNode..LastClipNode but past the ClipNodes slice itself.
 func TestTraceHull_NodeIndexPastClipNodes(t *testing.T) {

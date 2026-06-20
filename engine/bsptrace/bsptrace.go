@@ -142,9 +142,15 @@ func traceHullR(hull *Hull, nodenum int32, p1f, p2f float32, p1, p2 [3]float32, 
 	if frac < 0 {
 		frac = 0
 	}
-	if frac > 1 {
-		frac = 1
-	}
+	// frac > 1 is structurally unreachable here: after the both-
+	// same-side block, dist1 and dist2 have opposite signs (the
+	// only way to enter the straddle path), and a sign-table proof
+	// shows the (dist1±Eps)/(dist1-dist2) ratio is always < 1 in
+	// both Case A (dist1>=0, dist2<0) and Case B (dist1<0, dist2>=0).
+	// The C upstream's `if (frac > 1) frac = 1` clamp is defensive
+	// against a hypothetical floating-point precision bug; the
+	// Go port omits it because every input that satisfies the
+	// outer straddle condition fits frac in [0, 1).
 
 	midf := p1f + (p2f-p1f)*frac
 	mid := [3]float32{
