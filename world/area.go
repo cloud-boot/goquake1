@@ -31,10 +31,15 @@ type AreaNode struct {
 // fresh World is empty -- call Clear with the map's worldmodel
 // (mins, maxs) before linking edicts. tyrquake: the static
 // sv_areanodes[] array + sv_numareanodes counter in world.c.
+//
+// The links map replaces the C upstream's intrusive link_t prev/next
+// pair embedded in edict_t: world stores the per-edict link entry
+// keyed by [Key] so progs.Edict stays decoupled from container/list.
 type World struct {
 	nodes [server.AreaNodes]AreaNode
 	used  int // next free slot in nodes[]
 	root  *AreaNode
+	links map[Key]*linkEntry
 }
 
 // New returns an empty World. Use World.Clear to (re)build the area
