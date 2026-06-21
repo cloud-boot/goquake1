@@ -337,11 +337,14 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 			fb.Pixels[i] = 0x10
 		}
 
-		// Camera fixed at (5, 5, +20); yaw spins to animate.
+		// Camera at the in-map anchor; pitch 0 = horizon, yaw spins
+		// 1°/frame to make a panoramic shot of the room walls. The
+		// prior pitch=90 made the camera stare straight at the floor,
+		// which is why early screendumps captured a uniform polygon.
 		yawDeg := float32(frame) * 1.0
 		rd := &render.RefDef{
 			VRect:      render.VRect{Width: fb.Width, Height: fb.Height},
-			ViewAngles: [3]float32{90, yawDeg, 0},
+			ViewAngles: [3]float32{0, yawDeg, 0},
 			ViewOrigin: camOrigin,
 			FovX:       fovX,
 			FovY:       fovX,
