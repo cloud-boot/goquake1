@@ -32,7 +32,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"runtime"
 	"time"
 
 	_ "github.com/go-virtio/validate/board"
@@ -406,12 +405,11 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 			_ = render.FillTexturedPolygon(fb, tex, &cm, 0, verts)
 		}
 
-		// Encourage tamago's small heap to release the per-face lump
-		// decode buffers NewBrushFaceVerts allocates each call. Without
-		// this nudge the 2 GB micro-VM trips OOM after a few frames;
-		// the proper fix (caching the decoded Edges/Surfedges/Vertexes
-		// lumps once) belongs in bspfile and is a separate change.
-		runtime.GC()
+		// Per-frame runtime.GC() is no longer needed: bspfile.File
+		// now caches the decoded Vertexes / Edges / Surfedges /
+		// TexInfos / Textures lumps on first call, so
+		// NewBrushFaceVerts allocates nothing per face on the hot
+		// path. The 2 GB micro-VM stays well below the heap ceiling.
 
 		_ = fb.Expand(rgba, palette)
 		_ = be.PresentFrame(rgba, fb.Width, fb.Height)

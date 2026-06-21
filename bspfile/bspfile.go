@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 )
 
 // On-wire constants.
@@ -47,9 +48,55 @@ type Header struct {
 // File ties a parsed header to the source byte slice for lazy lump
 // decoding. The whole BSP is held in memory because every lump must
 // be available simultaneously to the renderer + collision code.
+//
+// Each typed-lump accessor (Vertexes / Edges / Surfedges / Planes /
+// Models / Nodes / ClipNodes / Leafs / Faces / TexInfos /
+// MarkSurfaces / Textures) caches its decoded slice on first call
+// and returns the same backing array on every subsequent call. This
+// eliminates the per-call re-decode that otherwise dominates the
+// render loop (e.g. NewBrushFaceVerts at ~60 fps × 100 faces re-
+// decodes 5 lumps per face = thousands of throwaway allocations per
+// second). The cache is guarded by a single sync.Mutex, so calls
+// from multiple goroutines are race-free; a decode error from the
+// first call is propagated and the entry is re-decoded on the next
+// call (no error caching — a corrupted file stays corrupted, but we
+// don't want to mask a transient error from a future custom
+// io.ReaderAt either).
+//
+// The returned slices are SHARED with the cache: callers must not
+// mutate them. Mutation would silently corrupt every subsequent
+// reader. The per-frame renderer treats the lumps as read-only
+// reference data, so this matches the natural usage; a defensive
+// per-call copy would defeat the optimization (the whole point is
+// to stop allocating per call).
+//
+// No invalidation is needed: a *File is immutable after Open
+// (the raw byte slice is owned + never rewritten).
 type File struct {
 	raw    []byte
 	Header Header
+
+	// Per-lump memoization. The mutex guards every cache slot;
+	// each slot starts nil and is filled on first successful
+	// decode. Holding the mutex across the decode serialises
+	// concurrent first-callers but is correct, and after warm-up
+	// every reader hits the cache + drops the lock in constant
+	// time. The whole point of this cache is to amortise the
+	// decode away from the render loop, so contention only
+	// matters during one-shot initialisation.
+	mu           sync.Mutex
+	vertices     []Vertex
+	edges        []Edge
+	surfedges    []Surfedge
+	planes       []Plane
+	models       []Model
+	nodes        []Node
+	clipNodes    []ClipNode
+	leafs        []Leaf
+	faces        []Face
+	texInfos     []TexInfo
+	markSurfaces []MarkSurface
+	textures     *MipTexLump
 }
 
 // Vertex is one dvertex_t.
@@ -141,8 +188,24 @@ func (f *File) LumpBytes(k LumpKind) []byte {
 // tyrquake: LUMP_ENTITIES.
 func (f *File) Entities() []byte { return f.LumpBytes(LumpEntities) }
 
-// Vertexes decodes the LUMP_VERTEXES lump into a typed slice.
+// Vertexes returns the decoded LUMP_VERTEXES slice. Cached on first
+// call; the returned slice is shared with the cache (do not mutate).
+// On decode error, the next call retries.
 func (f *File) Vertexes() ([]Vertex, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.vertices != nil {
+		return f.vertices, nil
+	}
+	out, err := f.decodeVertexes()
+	if err != nil {
+		return nil, err
+	}
+	f.vertices = out
+	return out, nil
+}
+
+func (f *File) decodeVertexes() ([]Vertex, error) {
 	raw := f.LumpBytes(LumpVertexes)
 	if len(raw)%vertexSize != 0 {
 		return nil, ErrSectionMisaligned
@@ -158,8 +221,23 @@ func (f *File) Vertexes() ([]Vertex, error) {
 	return out, nil
 }
 
-// Edges decodes LUMP_EDGES using the bsp29 16-bit-vertex-index form.
+// Edges returns the decoded LUMP_EDGES slice (bsp29 16-bit-vertex
+// form). Cached on first call; do not mutate the returned slice.
 func (f *File) Edges() ([]Edge, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.edges != nil {
+		return f.edges, nil
+	}
+	out, err := f.decodeEdges()
+	if err != nil {
+		return nil, err
+	}
+	f.edges = out
+	return out, nil
+}
+
+func (f *File) decodeEdges() ([]Edge, error) {
 	raw := f.LumpBytes(LumpEdges)
 	if len(raw)%edgeSize != 0 {
 		return nil, ErrSectionMisaligned
@@ -174,8 +252,23 @@ func (f *File) Edges() ([]Edge, error) {
 	return out, nil
 }
 
-// Surfedges decodes LUMP_SURFEDGES (one int32 per entry).
+// Surfedges returns the decoded LUMP_SURFEDGES slice (one int32 per
+// entry). Cached on first call; do not mutate the returned slice.
 func (f *File) Surfedges() ([]Surfedge, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.surfedges != nil {
+		return f.surfedges, nil
+	}
+	out, err := f.decodeSurfedges()
+	if err != nil {
+		return nil, err
+	}
+	f.surfedges = out
+	return out, nil
+}
+
+func (f *File) decodeSurfedges() ([]Surfedge, error) {
 	raw := f.LumpBytes(LumpSurfedges)
 	if len(raw)%surfedgeSize != 0 {
 		return nil, ErrSectionMisaligned
@@ -188,8 +281,23 @@ func (f *File) Surfedges() ([]Surfedge, error) {
 	return out, nil
 }
 
-// Planes decodes LUMP_PLANES.
+// Planes returns the decoded LUMP_PLANES slice. Cached on first
+// call; do not mutate the returned slice.
 func (f *File) Planes() ([]Plane, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.planes != nil {
+		return f.planes, nil
+	}
+	out, err := f.decodePlanes()
+	if err != nil {
+		return nil, err
+	}
+	f.planes = out
+	return out, nil
+}
+
+func (f *File) decodePlanes() ([]Plane, error) {
 	raw := f.LumpBytes(LumpPlanes)
 	if len(raw)%planeSize != 0 {
 		return nil, ErrSectionMisaligned
@@ -207,8 +315,23 @@ func (f *File) Planes() ([]Plane, error) {
 	return out, nil
 }
 
-// Models decodes LUMP_MODELS.
+// Models returns the decoded LUMP_MODELS slice. Cached on first
+// call; do not mutate the returned slice.
 func (f *File) Models() ([]Model, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.models != nil {
+		return f.models, nil
+	}
+	out, err := f.decodeModels()
+	if err != nil {
+		return nil, err
+	}
+	f.models = out
+	return out, nil
+}
+
+func (f *File) decodeModels() ([]Model, error) {
 	raw := f.LumpBytes(LumpModels)
 	if len(raw)%modelSize != 0 {
 		return nil, ErrSectionMisaligned

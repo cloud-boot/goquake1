@@ -88,8 +88,23 @@ type TexInfo struct {
 // distinction stays type-safe.
 type MarkSurface uint16
 
-// Nodes decodes LUMP_NODES.
+// Nodes returns the decoded LUMP_NODES slice. Cached on first call;
+// do not mutate the returned slice. See [File] for cache semantics.
 func (f *File) Nodes() ([]Node, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.nodes != nil {
+		return f.nodes, nil
+	}
+	out, err := f.decodeNodes()
+	if err != nil {
+		return nil, err
+	}
+	f.nodes = out
+	return out, nil
+}
+
+func (f *File) decodeNodes() ([]Node, error) {
 	raw := f.LumpBytes(LumpNodes)
 	if len(raw)%nodeSize != 0 {
 		return nil, ErrSectionMisaligned
@@ -113,8 +128,23 @@ func (f *File) Nodes() ([]Node, error) {
 	return out, nil
 }
 
-// ClipNodes decodes LUMP_CLIPNODES.
+// ClipNodes returns the decoded LUMP_CLIPNODES slice. Cached on
+// first call; do not mutate the returned slice.
 func (f *File) ClipNodes() ([]ClipNode, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.clipNodes != nil {
+		return f.clipNodes, nil
+	}
+	out, err := f.decodeClipNodes()
+	if err != nil {
+		return nil, err
+	}
+	f.clipNodes = out
+	return out, nil
+}
+
+func (f *File) decodeClipNodes() ([]ClipNode, error) {
 	raw := f.LumpBytes(LumpClipnodes)
 	if len(raw)%clipnodeSize != 0 {
 		return nil, ErrSectionMisaligned
@@ -130,8 +160,23 @@ func (f *File) ClipNodes() ([]ClipNode, error) {
 	return out, nil
 }
 
-// Leafs decodes LUMP_LEAFS.
+// Leafs returns the decoded LUMP_LEAFS slice. Cached on first call;
+// do not mutate the returned slice.
 func (f *File) Leafs() ([]Leaf, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.leafs != nil {
+		return f.leafs, nil
+	}
+	out, err := f.decodeLeafs()
+	if err != nil {
+		return nil, err
+	}
+	f.leafs = out
+	return out, nil
+}
+
+func (f *File) decodeLeafs() ([]Leaf, error) {
 	raw := f.LumpBytes(LumpLeafs)
 	if len(raw)%leafSize != 0 {
 		return nil, ErrSectionMisaligned
@@ -155,8 +200,23 @@ func (f *File) Leafs() ([]Leaf, error) {
 	return out, nil
 }
 
-// Faces decodes LUMP_FACES.
+// Faces returns the decoded LUMP_FACES slice. Cached on first call;
+// do not mutate the returned slice.
 func (f *File) Faces() ([]Face, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.faces != nil {
+		return f.faces, nil
+	}
+	out, err := f.decodeFaces()
+	if err != nil {
+		return nil, err
+	}
+	f.faces = out
+	return out, nil
+}
+
+func (f *File) decodeFaces() ([]Face, error) {
 	raw := f.LumpBytes(LumpFaces)
 	if len(raw)%faceSize != 0 {
 		return nil, ErrSectionMisaligned
@@ -176,8 +236,23 @@ func (f *File) Faces() ([]Face, error) {
 	return out, nil
 }
 
-// TexInfos decodes LUMP_TEXINFO.
+// TexInfos returns the decoded LUMP_TEXINFO slice. Cached on first
+// call; do not mutate the returned slice.
 func (f *File) TexInfos() ([]TexInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.texInfos != nil {
+		return f.texInfos, nil
+	}
+	out, err := f.decodeTexInfos()
+	if err != nil {
+		return nil, err
+	}
+	f.texInfos = out
+	return out, nil
+}
+
+func (f *File) decodeTexInfos() ([]TexInfo, error) {
 	raw := f.LumpBytes(LumpTexInfo)
 	if len(raw)%texInfoSize != 0 {
 		return nil, ErrSectionMisaligned
@@ -198,9 +273,24 @@ func (f *File) TexInfos() ([]TexInfo, error) {
 	return out, nil
 }
 
-// MarkSurfaces decodes LUMP_MARKSURFACES (a flat array of uint16
-// face indices the leafs slice into).
+// MarkSurfaces returns the decoded LUMP_MARKSURFACES slice (a flat
+// array of uint16 face indices the leafs slice into). Cached on
+// first call; do not mutate the returned slice.
 func (f *File) MarkSurfaces() ([]MarkSurface, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.markSurfaces != nil {
+		return f.markSurfaces, nil
+	}
+	out, err := f.decodeMarkSurfaces()
+	if err != nil {
+		return nil, err
+	}
+	f.markSurfaces = out
+	return out, nil
+}
+
+func (f *File) decodeMarkSurfaces() ([]MarkSurface, error) {
 	raw := f.LumpBytes(LumpMarksurfaces)
 	if len(raw)%marksurfaceSize != 0 {
 		return nil, ErrSectionMisaligned
@@ -237,9 +327,24 @@ type MipTex struct {
 	Offsets [MipLevels]uint32
 }
 
-// Textures decodes LUMP_TEXTURES into its directory table. The
-// per-miptex blocks are accessed via (*MipTexLump).MipTex(i).
+// Textures returns the decoded LUMP_TEXTURES directory. Cached on
+// first call; do not mutate the returned *MipTexLump.
+// The per-miptex blocks are accessed via (*MipTexLump).MipTex(i).
 func (f *File) Textures() (*MipTexLump, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.textures != nil {
+		return f.textures, nil
+	}
+	out, err := f.decodeTextures()
+	if err != nil {
+		return nil, err
+	}
+	f.textures = out
+	return out, nil
+}
+
+func (f *File) decodeTextures() (*MipTexLump, error) {
 	raw := f.LumpBytes(LumpTextures)
 	if len(raw) == 0 {
 		return &MipTexLump{}, nil
