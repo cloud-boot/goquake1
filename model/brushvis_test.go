@@ -450,3 +450,239 @@ func TestBrushModel_PVSForLeaf_VisOfsPastEnd(t *testing.T) {
 		}
 	}
 }
+
+// --- NumNodes / TotalLeaves -----------------------------------------------
+
+func TestBrushModel_NumNodesAndTotalLeaves(t *testing.T) {
+	bm := loadPVSWorld(t, []pvsLeaf{{}, {}, {}, {}, {}})
+	// 4 nodes wiring the 5-leaf tree, plus the outside sentinel = 6 raw leaves.
+	if got := bm.NumNodes(); got != 4 {
+		t.Errorf("NumNodes: got %d want 4", got)
+	}
+	if got := bm.TotalLeaves(); got != 6 {
+		t.Errorf("TotalLeaves: got %d want 6", got)
+	}
+}
+
+func TestBrushModel_NumNodesEmpty(t *testing.T) {
+	bm := &BrushModel{}
+	if got := bm.NumNodes(); got != 0 {
+		t.Errorf("empty NumNodes: got %d want 0", got)
+	}
+	if got := bm.TotalLeaves(); got != 0 {
+		t.Errorf("empty TotalLeaves: got %d want 0", got)
+	}
+}
+
+// --- LeafFaceIndices ------------------------------------------------------
+
+// buildBSPWithMarksurfaces wraps buildBSPWithPVS plus a LumpMarksurfaces
+// blob + per-leaf (FirstMarkSurface, NumMarkSurfaces) spans. marks[i]
+// is the marksurfaces span for the i-th PVS leaf (1-based; the outside
+// sentinel at index 0 always carries an empty span).
+func buildBSPWithMarksurfaces(t *testing.T, pvs []pvsLeaf, marks [][]uint16) ([]byte, int64) {
+	t.Helper()
+	if len(marks) != len(pvs) {
+		t.Fatalf("len(marks)=%d != len(pvs)=%d", len(marks), len(pvs))
+	}
+	// Encode the marksurfaces blob + per-leaf (first, count) spans.
+	// All per-leaf spans live in one shared blob, concatenated in
+	// PVS-leaf order.
+	marksBlob := &bytes.Buffer{}
+	type span struct{ first, count uint16 }
+	spans := make([]span, len(marks))
+	cursor := uint16(0)
+	for i, m := range marks {
+		spans[i] = span{first: cursor, count: uint16(len(m))}
+		for _, v := range m {
+			_ = binary.Write(marksBlob, binary.LittleEndian, v)
+		}
+		cursor += uint16(len(m))
+	}
+
+	planes := []bspfile.Plane{
+		{Normal: [3]float32{1, 0, 0}, Dist: 0, Type: bspfile.PlaneX},
+		{Normal: [3]float32{0, 1, 0}, Dist: 0, Type: bspfile.PlaneY},
+		{Normal: [3]float32{0, 0, 1}, Dist: 0, Type: bspfile.PlaneZ},
+		{Normal: [3]float32{1, 1, 0}, Dist: 0, Type: bspfile.PlaneAnyX},
+	}
+	nodes := []bspfile.Node{
+		{PlaneNum: 0, Children: [2]int16{1, 2}},
+		{PlaneNum: 1, Children: [2]int16{^int16(1), ^int16(2)}},
+		{PlaneNum: 2, Children: [2]int16{^int16(3), 3}},
+		{PlaneNum: 3, Children: [2]int16{^int16(4), ^int16(5)}},
+	}
+	const pvsRowBytes = 1
+	visBlob := make([]byte, pvsRowBytes*len(pvs))
+	for i, p := range pvs {
+		for _, v := range p.visible {
+			bit := v - 1
+			visBlob[i*pvsRowBytes+bit/8] |= 1 << uint(bit%8)
+		}
+	}
+	leafs := []bspfile.Leaf{
+		{Contents: bspfile.ContentsSolid, VisOfs: -1},
+	}
+	for i := range pvs {
+		leafs = append(leafs, bspfile.Leaf{
+			Contents:         bspfile.ContentsEmpty,
+			VisOfs:           int32(i * pvsRowBytes),
+			FirstMarkSurface: spans[i].first,
+			NumMarkSurfaces:  spans[i].count,
+		})
+	}
+	clipnodes := []bspfile.ClipNode{
+		{PlaneNum: 0, Children: [2]int16{bspfile.ContentsEmpty, bspfile.ContentsSolid}},
+	}
+	models := []bspfile.Model{
+		{
+			Mins:     [3]float32{-100, -100, -100},
+			Maxs:     [3]float32{100, 100, 100},
+			Headnode: [bspfile.MaxMapHulls]int32{0, 0, 0, 0},
+		},
+	}
+
+	const headerSize = 4 + 15*8
+	body := &bytes.Buffer{}
+	type lumpInfo struct {
+		kind bspfile.LumpKind
+		data []byte
+	}
+	lumps := []lumpInfo{
+		{kind: bspfile.LumpPlanes, data: encodePlanes(planes)},
+		{kind: bspfile.LumpVisibility, data: visBlob},
+		{kind: bspfile.LumpNodes, data: encodeNodes(nodes)},
+		{kind: bspfile.LumpLeafs, data: encodeLeafs(leafs)},
+		{kind: bspfile.LumpClipnodes, data: encodeClipnodes(clipnodes)},
+		{kind: bspfile.LumpModels, data: encodeModels(models)},
+		{kind: bspfile.LumpMarksurfaces, data: marksBlob.Bytes()},
+	}
+	offsetByKind := map[bspfile.LumpKind]int32{}
+	lenByKind := map[bspfile.LumpKind]int32{}
+	for _, l := range lumps {
+		offsetByKind[l.kind] = int32(headerSize) + int32(body.Len())
+		body.Write(l.data)
+		lenByKind[l.kind] = int32(len(l.data))
+	}
+	hdr := &bytes.Buffer{}
+	_ = binary.Write(hdr, binary.LittleEndian, int32(bspfile.Version29))
+	for k := bspfile.LumpKind(0); int(k) < bspfile.HeaderLumps; k++ {
+		_ = binary.Write(hdr, binary.LittleEndian, offsetByKind[k])
+		_ = binary.Write(hdr, binary.LittleEndian, lenByKind[k])
+	}
+	full := append(hdr.Bytes(), body.Bytes()...)
+	return full, int64(len(full))
+}
+
+func loadMarksurfacesWorld(t *testing.T, pvs []pvsLeaf, marks [][]uint16) *BrushModel {
+	t.Helper()
+	data, size := buildBSPWithMarksurfaces(t, pvs, marks)
+	f, err := bspfile.Open(bytes.NewReader(data), size)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	bm, err := LoadBrush(f, 0)
+	if err != nil {
+		t.Fatalf("LoadBrush: %v", err)
+	}
+	return bm
+}
+
+func TestBrushModel_LeafFaceIndices_HappyPath(t *testing.T) {
+	bm := loadMarksurfacesWorld(t,
+		[]pvsLeaf{{}, {}, {}, {}, {}},
+		[][]uint16{
+			{10, 11, 12}, // leaf 1
+			{},           // leaf 2
+			{20},         // leaf 3
+			{30, 31},     // leaf 4
+			{},           // leaf 5
+		},
+	)
+	got, err := bm.LeafFaceIndices(1)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := []int{10, 11, 12}
+	if len(got) != len(want) {
+		t.Fatalf("leaf 1: got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("leaf 1[%d]: got %d want %d", i, got[i], want[i])
+		}
+	}
+	// Leaf 2 has zero marksurfaces -> empty slice (no decode).
+	if r, _ := bm.LeafFaceIndices(2); len(r) != 0 {
+		t.Errorf("leaf 2: got %v want empty", r)
+	}
+	// Leaf 4 (offset 4 from a span of 6) -> [30, 31].
+	r4, _ := bm.LeafFaceIndices(4)
+	if len(r4) != 2 || r4[0] != 30 || r4[1] != 31 {
+		t.Errorf("leaf 4: got %v want [30 31]", r4)
+	}
+	// Outside sentinel leaf 0 has zero marksurfaces.
+	if r, _ := bm.LeafFaceIndices(0); len(r) != 0 {
+		t.Errorf("leaf 0: got %v want empty", r)
+	}
+}
+
+func TestBrushModel_LeafFaceIndices_OutOfRange(t *testing.T) {
+	bm := loadPVSWorld(t, []pvsLeaf{{}, {}, {}, {}, {}})
+	if r, err := bm.LeafFaceIndices(-1); err != nil || r != nil {
+		t.Errorf("LeafFaceIndices(-1): got (%v, %v) want (nil, nil)", r, err)
+	}
+	if r, err := bm.LeafFaceIndices(999); err != nil || r != nil {
+		t.Errorf("LeafFaceIndices(999): got (%v, %v) want (nil, nil)", r, err)
+	}
+}
+
+// LeafFaceIndices returns an empty slice when the leaf's
+// (FirstMarkSurface, NumMarkSurfaces) span over-runs the lump.
+func TestBrushModel_LeafFaceIndices_SpanOverflow(t *testing.T) {
+	bm := loadMarksurfacesWorld(t,
+		[]pvsLeaf{{}, {}, {}, {}, {}},
+		[][]uint16{{10}, {}, {}, {}, {}},
+	)
+	// Poison leaf 1's span to over-run the 1-entry blob.
+	bm.leaves[1].FirstMarkSurface = 0
+	bm.leaves[1].NumMarkSurfaces = 99
+	r, err := bm.LeafFaceIndices(1)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if r != nil {
+		t.Errorf("over-run span: got %v want nil", r)
+	}
+}
+
+// LeafFaceIndices propagates a MarkSurfaces decode error (malformed
+// lump byte length). Build a BSP whose LumpMarksurfaces blob has an
+// odd byte count so the loader's `len % marksurfaceSize == 0` check
+// trips.
+func TestBrushModel_LeafFaceIndices_DecodeError(t *testing.T) {
+	// Reuse buildBSPWithPVS but overlay an odd-length marksurfaces lump.
+	data, _ := buildBSPWithMarksurfaces(t,
+		[]pvsLeaf{{}, {}, {}, {}, {}},
+		[][]uint16{{10}, {}, {}, {}, {}},
+	)
+	// Patch the marksurfaces lump byte length in the header to a
+	// non-multiple of 2 (the marksurface record size). Lump 11 is
+	// LumpMarksurfaces; header layout: int32 version + per-lump
+	// (int32 offset, int32 length). So the length byte we need to
+	// flip lives at offset 4 + 11*8 + 4 = 96.
+	const marksLumpLenOff = 4 + int(bspfile.LumpMarksurfaces)*8 + 4
+	// Write a 1-byte odd length.
+	binary.LittleEndian.PutUint32(data[marksLumpLenOff:marksLumpLenOff+4], 1)
+	f, err := bspfile.Open(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	bm, err := LoadBrush(f, 0)
+	if err != nil {
+		t.Fatalf("LoadBrush: %v", err)
+	}
+	if r, err := bm.LeafFaceIndices(1); err == nil {
+		t.Errorf("got (%v, nil) want err", r)
+	}
+}

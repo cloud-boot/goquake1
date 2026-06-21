@@ -57,6 +57,18 @@ func (bm *BrushModel) NumLeaves() int {
 	return len(bm.leaves) - 1
 }
 
+// TotalLeaves returns the count of raw leaves including the outside-
+// the-map sentinel at index 0. Used by the BSP-walk wiring to size
+// the unified node+leaf id space (the recurse package addresses nodes
+// at id 0..NumNodes-1 and leaves at id NumNodes..NumNodes+TotalLeaves-1).
+// An empty model returns 0.
+func (bm *BrushModel) TotalLeaves() int { return len(bm.leaves) }
+
+// NumNodes returns the number of interior BSP nodes. The recurse
+// package's [github.com/go-quake1/engine/bsprender.WalkContext.NumNodes]
+// reads this. An empty model returns 0.
+func (bm *BrushModel) NumNodes() int { return len(bm.nodes) }
+
 // Leaf returns a pointer to the leaf at the 0-based index i (so
 // callers can write through to VisFrame). Index 0 is the outside-the-
 // map sentinel; PVS-shaped methods take 1-based indices instead.
@@ -66,6 +78,43 @@ func (bm *BrushModel) Leaf(i int) *Leaf { return &bm.leaves[i] }
 // Node returns a pointer to the node at the 0-based index i. Panics
 // if i is out of [0, len(bm.nodes)).
 func (bm *BrushModel) Node(i int) *Node { return &bm.nodes[i] }
+
+// LeafFaceIndices returns the face indices linked to leaf i via the
+// LumpMarksurfaces span. The returned slice is freshly allocated; the
+// caller owns it.
+//
+// Resolution: the leaf carries (FirstMarkSurface, NumMarkSurfaces) into
+// the MarkSurfaces lump; each entry is a uint16 face index. tyrquake:
+// the marksurfaces[] slice mleaf_t.firstmarksurface points at.
+//
+// Returns:
+//
+//   - empty slice if i is out of range, NumMarkSurfaces == 0, or the
+//     model carries no LumpMarksurfaces (synthetic BSPs in tests).
+//   - the propagated error if MarkSurfaces lump decoding fails.
+func (bm *BrushModel) LeafFaceIndices(i int) ([]int, error) {
+	if i < 0 || i >= len(bm.leaves) {
+		return nil, nil
+	}
+	leaf := &bm.leaves[i]
+	if leaf.NumMarkSurfaces == 0 {
+		return nil, nil
+	}
+	marks, err := bm.File.MarkSurfaces()
+	if err != nil {
+		return nil, err
+	}
+	first := int(leaf.FirstMarkSurface)
+	n := int(leaf.NumMarkSurfaces)
+	if first < 0 || first+n > len(marks) {
+		return nil, nil
+	}
+	out := make([]int, n)
+	for j := 0; j < n; j++ {
+		out[j] = int(marks[first+j])
+	}
+	return out, nil
+}
 
 // PVSForLeaf returns the compressed PVS row for the 1-based leaf
 // index i, as a slice over the BSP file's LumpVisibility blob.

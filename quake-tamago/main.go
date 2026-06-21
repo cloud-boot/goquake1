@@ -27,10 +27,10 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"io/fs"
-	"math"
 	"time"
 
 	_ "github.com/go-virtio/validate/board"
@@ -46,7 +46,11 @@ import (
 	"github.com/go-quake1/engine/assets"
 	"github.com/go-quake1/engine/backend/virtio"
 	"github.com/go-quake1/engine/backend/virtio/realdev"
+	"github.com/go-quake1/engine/bspfile"
+	"github.com/go-quake1/engine/bspfile/synthbsp"
+	"github.com/go-quake1/engine/bsprender"
 	"github.com/go-quake1/engine/client"
+	"github.com/go-quake1/engine/model"
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/runloop"
 	engineserver "github.com/go-quake1/engine/server"
@@ -191,22 +195,47 @@ func run() error {
 	return runDemo3D(runner.FrameBuffer, runner.RGBA, runner.Palette, be)
 }
 
-// runDemo3D renders a textured cube room (6 walls) with the camera
-// rotating around the Y axis at the room centre, then flushes each
-// frame via the virtio-gpu backend. Loops forever (the bare-metal
-// binary has no clean exit path).
+// runDemo3D renders a synthetic BSP via the full engine pipeline:
+// synthbsp.BuildWithFaces -> bspfile.Open -> model.LoadBrush ->
+// bsprender.NewWalkContext + WalkWorld -> bsprender.TransformFace ->
+// render.FillTexturedPolygon -> virtio-gpu Flush. Loops forever (the
+// bare-metal binary has no clean exit path).
 //
-// This is the first interior-3D scene the engine renders on real
-// virtio-gpu hardware. Per face: build 4 world-space corners,
-// transform through the view matrix, perspective-divide to screen
-// XY, populate PerspLitTexturedVertex, fill via the perspective
-// rasterizer.
+// This is the FIRST time the engine's BSP rendering path runs
+// end-to-end on real virtio-gpu hardware. The synthetic BSP carries
+// no LumpMarksurfaces, so a wrapped LeafFaces closure returns every
+// face index for the EMPTY non-sentinel leaf — the demo-only hack
+// that lets WalkWorld emit something while the real PVS+leaf-faces
+// wiring waits on a proper map asset (embedpak).
 func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be *virtio.Backend) error {
-	// Synthetic 16x16 checkerboard with two colour pairs so each
-	// wall is visually distinct after lighting + UV mapping.
-	tex := make4ColorChecker(16)
-	// Identity colormap: every (light, src) -> src. Each wall passes
-	// a different Light value so the colormap-row index varies.
+	// 1. Build the synthetic BSP -> bspfile.File -> *model.BrushModel.
+	bspBytes, size, err := synthbsp.BuildWithFaces()
+	if err != nil {
+		return fmt.Errorf("synthbsp.BuildWithFaces: %w", err)
+	}
+	file, err := bspfile.Open(bytes.NewReader(bspBytes), size)
+	if err != nil {
+		return fmt.Errorf("bspfile.Open: %w", err)
+	}
+	bm, err := model.LoadBrush(file, 0)
+	if err != nil {
+		return fmt.Errorf("model.LoadBrush: %w", err)
+	}
+	faces, err := file.Faces()
+	if err != nil {
+		return fmt.Errorf("file.Faces: %w", err)
+	}
+	fmt.Printf("QUAKE: BSP loaded -- %d nodes, %d leaves (PVS), %d faces\n",
+		bm.NumNodes(), bm.NumLeaves(), len(faces))
+
+	// 2. Synthetic 16x16 checker texture. Real miptex decode (using
+	//    the BSP's TexInfo -> Textures chain) is a follow-up; this
+	//    surface stays visually distinct from the sky-index clear.
+	tex := makeCheckerTex(16)
+
+	// 3. Identity colormap: every (light, src) -> src. Lighting is
+	//    full-bright in this MVP; the colormap reuse keeps the path
+	//    identical to the future per-leaf-lighted version.
 	var cm render.ColorMap
 	for light := 0; light < render.ColorMapRows; light++ {
 		for src := 0; src < render.ColorMapCols; src++ {
@@ -214,80 +243,114 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 		}
 	}
 
-	const (
-		fovX = 90.0
-		half = float32(100) // room half-extent (-100..+100 on every axis)
-	)
-	halfW := float32(fb.Width) / 2
-	halfH := float32(fb.Height) / 2
-	tanHalfX := float32(math.Tan(fovX / 2 * math.Pi / 180))
-	scale := halfW / tanHalfX
+	// 4. WalkContext + per-leaf-all-faces override. The synthetic BSP
+	//    has no marksurfaces lump, so NewWalkContext's LeafFaces
+	//    returns []; we wrap it to emit every face index for the
+	//    EMPTY non-sentinel leaf, which is the leaf the walker
+	//    reaches via node 0's front child.
+	walkCtx := bsprender.NewWalkContext(bm)
+	allFaceIdx := make([]int, len(faces))
+	for i := range allFaceIdx {
+		allFaceIdx[i] = i
+	}
+	walkCtx.LeafFaces = func(id int) []int {
+		// id 0..NumNodes-1 = node; otherwise leaf. Map every drawable
+		// leaf (kind != Empty) to the all-faces list.
+		if walkCtx.NodeKind(id) == bsprender.NodeKindLeaf {
+			return allFaceIdx
+		}
+		return nil
+	}
+	// NewWalkContext's NodeKind classifies a leaf with no marksurfaces
+	// as Empty (via the empty-LeafFaces / SOLID-contents test). The
+	// LeafFaces override above is moot unless NodeKind also reports
+	// the EMPTY-contents leaves as NodeKindLeaf. Re-wrap NodeKind to
+	// promote every EMPTY-contents leaf — the synthbsp uses leaf 0 as
+	// a drawable leaf (no outside-sentinel convention), so we ignore
+	// the leafIdx==0 distinction.
+	walkCtx.NodeKind = func(id int) bsprender.NodeKind {
+		if id < walkCtx.NumNodes {
+			return bsprender.NodeKindInterior
+		}
+		leafIdx := id - walkCtx.NumNodes
+		if leafIdx < 0 || leafIdx >= bm.TotalLeaves() {
+			return bsprender.NodeKindEmpty
+		}
+		if bm.Leaf(leafIdx).Contents == bspfile.ContentsSolid {
+			return bsprender.NodeKindEmpty
+		}
+		return bsprender.NodeKindLeaf
+	}
+	// The synthbsp ships zero-size node bboxes (Mins == Maxs == 0),
+	// which BoxInFrustum rejects against any frustum whose planes
+	// have a positive Dist (i.e. a non-origin camera). Override
+	// NodeBBox with a "huge box" so the walker's frustum test always
+	// passes for the demo; real maps carry valid culling bboxes and
+	// won't need this override.
+	const bigF = float32(1e6)
+	walkCtx.NodeBBox = func(id int) (mins, maxs [3]float32) {
+		return [3]float32{-bigF, -bigF, -bigF}, [3]float32{bigF, bigF, bigF}
+	}
 
-	// Six cube faces, each a quad in world space (CCW from inside).
-	// faceVerts[face] = 4 corners; faceLight[face] = 0..40 light idx.
-	type face struct {
-		verts [4][3]float32
-		light int
-	}
-	faces := [6]face{
-		// Front wall (+Z, faces toward -Z)
-		{[4][3]float32{{-half, -half, +half}, {+half, -half, +half}, {+half, +half, +half}, {-half, +half, +half}}, 0},
-		// Back wall (-Z, faces toward +Z)
-		{[4][3]float32{{+half, -half, -half}, {-half, -half, -half}, {-half, +half, -half}, {+half, +half, -half}}, 8},
-		// Right wall (+X)
-		{[4][3]float32{{+half, -half, +half}, {+half, -half, -half}, {+half, +half, -half}, {+half, +half, +half}}, 16},
-		// Left wall (-X)
-		{[4][3]float32{{-half, -half, -half}, {-half, -half, +half}, {-half, +half, +half}, {-half, +half, -half}}, 24},
-		// Floor (-Y)
-		{[4][3]float32{{-half, -half, -half}, {+half, -half, -half}, {+half, -half, +half}, {-half, -half, +half}}, 32},
-		// Ceiling (+Y)
-		{[4][3]float32{{-half, +half, +half}, {+half, +half, +half}, {+half, +half, -half}, {-half, +half, -half}}, 4},
-	}
-	uvs := [4][2]float32{{0, 0}, {15, 0}, {15, 15}, {0, 15}}
+	// 5. Camera setup. The synthbsp face verts live at (0,0,0),
+	//    (10,0,0), (0,10,0) on the Z=0 plane. A camera at
+	//    (5, 5, +60) pitched 90 degrees down keeps the triangle
+	//    dead-ahead of the forward axis (forward = (0, 0, -1) at
+	//    pitch=90) at depth 60 — comfortable margin past
+	//    ParticleNearClip = 16. Yaw spins the view around the camera's
+	//    forward axis so the triangle rotates on-screen.
+	const (
+		fovX     = 90.0
+		camDepth = float32(20) // triangle spans X/Y in [0,10]; camDepth ≥ 16 (ParticleNearClip)
+	)
+	var surfaces bsprender.SurfaceList
 
 	for frame := 0; ; frame++ {
-		// Sky-index background (palette idx 0x10).
+		// Clear to sky background (palette idx 0x10).
 		for i := range fb.Pixels {
 			fb.Pixels[i] = 0x10
 		}
 
-		// Camera at room centre, rotating around the Y axis.
+		// Camera fixed at (5, 5, +60); yaw spins to animate.
 		yawDeg := float32(frame) * 1.0
 		rd := &render.RefDef{
 			VRect:      render.VRect{Width: fb.Width, Height: fb.Height},
-			ViewAngles: [3]float32{0, yawDeg, 0},
-			ViewOrigin: [3]float32{0, 0, 0},
+			ViewAngles: [3]float32{90, yawDeg, 0},
+			ViewOrigin: [3]float32{5, 5, camDepth},
 			FovX:       fovX,
 			FovY:       fovX,
 		}
 		view := rd.SetupView()
+		frustum := rd.BuildFrustum()
 
-		for _, f := range faces {
-			// Transform every corner into view space.
-			var vp [4][3]float32
-			anyBehind := false
-			for i := 0; i < 4; i++ {
-				vp[i] = render.TransformAffine(view, f.verts[i])
-				if vp[i][2] < 1 {
-					anyBehind = true
-				}
+		// Stamp every node + leaf at this frame so WalkWorld doesn't
+		// PVS-cull anything. Proper R_MarkLeaves seeding from the
+		// viewer's leaf waits on map-asset PVS data.
+		stampFrame := int32(frame + 1)
+		for n := 0; n < bm.NumNodes(); n++ {
+			bm.SetNodeVisFrame(n, stampFrame)
+		}
+		for l := 0; l < bm.TotalLeaves(); l++ {
+			bm.Leaf(l).VisFrame = stampFrame
+		}
+
+		surfaces.Reset()
+		if err := bsprender.WalkWorld(walkCtx, 0, rd.ViewOrigin, frustum, stampFrame, &surfaces); err != nil {
+			return fmt.Errorf("WalkWorld: %w", err)
+		}
+
+		// Rasterize each visible face via TransformFace + FillTexturedPolygon.
+		for i := 0; i < surfaces.Len(); i++ {
+			ref := surfaces.Refs[i]
+			fv, err := bsprender.NewBrushFaceVerts(bm, ref.FaceIdx)
+			if err != nil {
+				continue
 			}
-			if anyBehind {
-				continue // skip faces partially/fully behind camera (no clipper yet)
+			verts, err := bsprender.TransformFace(view, fb, fovX, fv)
+			if err != nil {
+				continue
 			}
-			var verts [4]render.PerspLitTexturedVertex
-			for i := 0; i < 4; i++ {
-				invZ := 1 / vp[i][2]
-				verts[i] = render.PerspLitTexturedVertex{
-					X:     halfW + vp[i][0]*scale*invZ,
-					Y:     halfH - vp[i][1]*scale*invZ,
-					Z:     vp[i][2],
-					U:     uvs[i][0],
-					V:     uvs[i][1],
-					Light: float32(f.light),
-				}
-			}
-			_ = render.FillPerspectiveLitTexturedPolygon(fb, tex, &cm, verts[:])
+			_ = render.FillTexturedPolygon(fb, tex, &cm, 0, verts)
 		}
 
 		_ = fb.Expand(rgba, palette)
@@ -295,9 +358,12 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 	}
 }
 
-// make4ColorChecker returns an NxN texture with a 4-colour checker
+// makeCheckerTex returns an NxN texture with a 4-colour checker
 // pattern (palette indices cycling through 0, 15, 31, 47 by tile).
-func make4ColorChecker(n int) *render.Pic {
+// Used as the stand-in surface texture for every BSP face until the
+// proper miptex chain (TexInfo -> Textures lump -> miptex pixels) is
+// wired in.
+func makeCheckerTex(n int) *render.Pic {
 	pixels := make([]byte, n*n)
 	colors := [4]byte{0, 15, 31, 47}
 	tile := n / 4
