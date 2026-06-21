@@ -28,8 +28,9 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
-	"testing/fstest"
+	"time"
 
 	_ "github.com/go-virtio/validate/board"
 	"github.com/go-virtio/validate/transport"
@@ -207,12 +208,59 @@ func run() error {
 //     finds non-background pixels everywhere, so
 //     the printed console lines show up.
 func syntheticAssets() fs.FS {
-	return fstest.MapFS{
-		"gfx/palette.lmp":  &fstest.MapFile{Data: makePaletteLump()},
-		"gfx/colormap.lmp": &fstest.MapFile{Data: makeColorMapLump()},
-		"gfx/conchars.lmp": &fstest.MapFile{Data: makeConcharsLump()},
+	return memFS{
+		"gfx/palette.lmp":  makePaletteLump(),
+		"gfx/colormap.lmp": makeColorMapLump(),
+		"gfx/conchars.lmp": makeConcharsLump(),
 	}
 }
+
+// memFS is a minimal in-memory fs.FS used in place of testing/fstest.MapFS.
+// The testing package's init() pulls in signal handling + runtime metrics
+// that don't link cleanly on bare-metal tamago; this hand-rolled
+// equivalent stays runtime-free.
+type memFS map[string][]byte
+
+func (m memFS) Open(name string) (fs.File, error) {
+	data, ok := m[name]
+	if !ok {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	}
+	return &memFile{name: name, data: data}, nil
+}
+
+type memFile struct {
+	name string
+	data []byte
+	pos  int
+}
+
+func (f *memFile) Read(p []byte) (int, error) {
+	if f.pos >= len(f.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.data[f.pos:])
+	f.pos += n
+	return n, nil
+}
+
+func (f *memFile) Stat() (fs.FileInfo, error) {
+	return &memFileInfo{name: f.name, size: int64(len(f.data))}, nil
+}
+
+func (f *memFile) Close() error { return nil }
+
+type memFileInfo struct {
+	name string
+	size int64
+}
+
+func (i *memFileInfo) Name() string       { return i.name }
+func (i *memFileInfo) Size() int64        { return i.size }
+func (i *memFileInfo) Mode() fs.FileMode  { return 0o444 }
+func (i *memFileInfo) ModTime() time.Time { return time.Time{} }
+func (i *memFileInfo) IsDir() bool        { return false }
+func (i *memFileInfo) Sys() any           { return nil }
 
 // makePaletteLump returns a 768-byte synthetic palette. The pattern
 // mirrors the assets test fixture so the engine's downstream code

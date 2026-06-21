@@ -21,7 +21,7 @@ vars:
   SERIAL: '/tmp/quake-serial.log'
   MON: '/tmp/quake-mon.sock'
   CPU: '{{default "max" .CPU}}'
-  MEM: '{{default "512M" .MEM}}'
+  MEM: '{{default "2G" .MEM}}'  # tamago boot fails silently with < 1G; 2G mirrors validate/run.sh
 
 tasks:
   build:
