@@ -54,26 +54,38 @@ func makeSyntheticPak(name, payload string) []byte {
 	return out
 }
 
+// placeholderBytes returns the canonical 12-byte empty PAK header
+// used as the build-time stub. Tests use it via withEmbedded to
+// exercise the empty-placeholder code paths regardless of what
+// real pak0.pak the operator may have dropped into empty.pak.
+func placeholderBytes() []byte {
+	return []byte{'P', 'A', 'C', 'K', 12, 0, 0, 0, 0, 0, 0, 0}
+}
+
 func TestBytes_PlaceholderIsTwelveBytes(t *testing.T) {
-	got := Bytes()
-	if len(got) != emptyPakSize {
-		t.Fatalf("Bytes() len: got %d, want %d", len(got), emptyPakSize)
-	}
-	if string(got[0:4]) != "PACK" {
-		t.Errorf("Bytes() magic: got %q, want %q", got[0:4], "PACK")
-	}
-	// Mutating the returned copy must not affect subsequent calls.
-	got[0] = 0
-	again := Bytes()
-	if string(again[0:4]) != "PACK" {
-		t.Errorf("Bytes() returned shared buffer; mutation leaked")
-	}
+	withEmbedded(t, placeholderBytes(), func() {
+		got := Bytes()
+		if len(got) != emptyPakSize {
+			t.Fatalf("Bytes() len: got %d, want %d", len(got), emptyPakSize)
+		}
+		if string(got[0:4]) != "PACK" {
+			t.Errorf("Bytes() magic: got %q, want %q", got[0:4], "PACK")
+		}
+		// Mutating the returned copy must not affect subsequent calls.
+		got[0] = 0
+		again := Bytes()
+		if string(again[0:4]) != "PACK" {
+			t.Errorf("Bytes() returned shared buffer; mutation leaked")
+		}
+	})
 }
 
 func TestIsEmpty_Placeholder(t *testing.T) {
-	if !IsEmpty() {
-		t.Errorf("IsEmpty() with placeholder: got false, want true")
-	}
+	withEmbedded(t, placeholderBytes(), func() {
+		if !IsEmpty() {
+			t.Errorf("IsEmpty() with placeholder: got false, want true")
+		}
+	})
 }
 
 func TestIsEmpty_NonPlaceholder(t *testing.T) {
@@ -85,13 +97,15 @@ func TestIsEmpty_NonPlaceholder(t *testing.T) {
 }
 
 func TestOpenAsFS_PlaceholderReturnsErrEmbedPakEmpty(t *testing.T) {
-	f, err := OpenAsFS()
-	if !errors.Is(err, ErrEmbedPakEmpty) {
-		t.Errorf("OpenAsFS() err: got %v, want ErrEmbedPakEmpty", err)
-	}
-	if f != nil {
-		t.Errorf("OpenAsFS() f: got %v, want nil", f)
-	}
+	withEmbedded(t, placeholderBytes(), func() {
+		f, err := OpenAsFS()
+		if !errors.Is(err, ErrEmbedPakEmpty) {
+			t.Errorf("OpenAsFS() err: got %v, want ErrEmbedPakEmpty", err)
+		}
+		if f != nil {
+			t.Errorf("OpenAsFS() f: got %v, want nil", f)
+		}
+	})
 }
 
 func TestOpenAsFS_NonEmptyReadsEntry(t *testing.T) {
@@ -120,14 +134,16 @@ func TestOpenAsFS_NonEmptyReadsEntry(t *testing.T) {
 }
 
 func TestAddToVFS_PlaceholderReturnsErrEmbedPakEmpty(t *testing.T) {
-	sp := vfs.New()
-	err := AddToVFS(sp)
-	if !errors.Is(err, ErrEmbedPakEmpty) {
-		t.Errorf("AddToVFS() err: got %v, want ErrEmbedPakEmpty", err)
-	}
-	if sp.Len() != 0 {
-		t.Errorf("AddToVFS() sp.Len(): got %d, want 0", sp.Len())
-	}
+	withEmbedded(t, placeholderBytes(), func() {
+		sp := vfs.New()
+		err := AddToVFS(sp)
+		if !errors.Is(err, ErrEmbedPakEmpty) {
+			t.Errorf("AddToVFS() err: got %v, want ErrEmbedPakEmpty", err)
+		}
+		if sp.Len() != 0 {
+			t.Errorf("AddToVFS() sp.Len(): got %d, want 0", sp.Len())
+		}
+	})
 }
 
 func TestAddToVFS_NonEmptyAddsSource(t *testing.T) {
