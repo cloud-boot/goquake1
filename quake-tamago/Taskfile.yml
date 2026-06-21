@@ -36,18 +36,34 @@ tasks:
           -o "{{.ELF}}" .
 
   qemu-visible:
-    desc: Run Quake in QEMU with a real GTK window (interactive; close window to exit).
+    desc: Run Quake in QEMU with a native window (cocoa on darwin, gtk on linux).
     deps: [build]
+    vars:
+      DISPLAY_BACKEND:
+        sh: 'case "$(uname -s)" in Darwin) echo cocoa ;; *) echo gtk ;; esac'
     cmds:
       - |
         qemu-system-x86_64 -M q35 -accel tcg -cpu {{.CPU}} -m {{.MEM}} \
-          -display gtk,grab-on-hover=on \
+          -display {{.DISPLAY_BACKEND}} \
           -no-reboot -vga none \
           -device virtio-gpu-pci,id=vgpu \
           -device virtio-keyboard-pci,id=vkbd \
           -device virtio-mouse-pci,id=vmouse \
-          -device virtio-snd-pci,id=vsnd,audiodev=audio0 \
-          -audiodev coreaudio,id=audio0 \
+          -serial stdio \
+          -kernel "{{.ELF}}"
+
+  qemu-vnc:
+    desc: Run Quake in QEMU with a VNC server on :5900 (connect via any VNC viewer).
+    deps: [build]
+    cmds:
+      - echo "VNC listening on localhost:5900 (display :0)"
+      - |
+        qemu-system-x86_64 -M q35 -accel tcg -cpu {{.CPU}} -m {{.MEM}} \
+          -display vnc=:0 \
+          -no-reboot -vga none \
+          -device virtio-gpu-pci,id=vgpu \
+          -device virtio-keyboard-pci,id=vkbd \
+          -device virtio-mouse-pci,id=vmouse \
           -serial stdio \
           -kernel "{{.ELF}}"
 
