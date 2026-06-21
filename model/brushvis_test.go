@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/go-quake1/engine/bspfile"
+	"github.com/go-quake1/engine/bspfile/synthbsp"
 )
 
 // --- Synthetic BSP with PVS data + a 4-node / 5-leaf tree -----------------
@@ -684,5 +685,229 @@ func TestBrushModel_LeafFaceIndices_DecodeError(t *testing.T) {
 	}
 	if r, err := bm.LeafFaceIndices(1); err == nil {
 		t.Errorf("got (%v, nil) want err", r)
+	}
+}
+
+// --- PointInLeaf ----------------------------------------------------------
+//
+// The two synthbsp fixtures span the interesting cases:
+//
+//   - BuildFiveLeafPVS: 4 interior nodes splitting on X / Y / Z / X+Y, so
+//     the descent visits every code path (front + back at multiple
+//     depths, on-plane fallback to back-child).
+//   - BuildWithFaces: a single-node BSP where the descent terminates on
+//     the very first interior step. Doubles as the smallest viable
+//     fixture.
+
+// loadSynthFiveLeafPVS opens the canonical 5-leaf BSP from
+// bspfile/synthbsp and returns a fully-loaded BrushModel for it.
+func loadSynthFiveLeafPVS(t *testing.T) *BrushModel {
+	t.Helper()
+	data, size, err := synthbsp.BuildFiveLeafPVS()
+	if err != nil {
+		t.Fatalf("synthbsp.BuildFiveLeafPVS: %v", err)
+	}
+	f, err := bspfile.Open(bytes.NewReader(data), size)
+	if err != nil {
+		t.Fatalf("bspfile.Open: %v", err)
+	}
+	bm, err := LoadBrush(f, 0)
+	if err != nil {
+		t.Fatalf("LoadBrush: %v", err)
+	}
+	return bm
+}
+
+// loadSynthWithFaces opens the BuildWithFaces single-node BSP.
+func loadSynthWithFaces(t *testing.T) *BrushModel {
+	t.Helper()
+	data, size, err := synthbsp.BuildWithFaces()
+	if err != nil {
+		t.Fatalf("synthbsp.BuildWithFaces: %v", err)
+	}
+	f, err := bspfile.Open(bytes.NewReader(data), size)
+	if err != nil {
+		t.Fatalf("bspfile.Open: %v", err)
+	}
+	bm, err := LoadBrush(f, 0)
+	if err != nil {
+		t.Fatalf("LoadBrush: %v", err)
+	}
+	return bm
+}
+
+// TestBrushModel_PointInLeaf_FiveLeafPVS walks every leaf of the
+// 5-leaf tree by handing PointInLeaf a point known to fall into that
+// leaf, and asserts the returned index matches.
+//
+// Tree (from synthbsp.BuildFiveLeafPVS):
+//
+//	node 0: plane (1,0,0) dist 0   -- splits by X
+//	node 1: plane (0,1,0) dist 0   -- splits by Y
+//	node 2: plane (0,0,1) dist 0   -- splits by Z
+//	node 3: plane (1,1,0) dist 0   -- splits by x+y
+//
+// Children: node 0 -> [n1, n2]; node 1 -> [^1, ^2]; node 2 -> [^3, n3];
+// node 3 -> [^4, ^5]. Descent uses `dot - dist > 0` for the front
+// (Children[0]) branch.
+func TestBrushModel_PointInLeaf_FiveLeafPVS(t *testing.T) {
+	bm := loadSynthFiveLeafPVS(t)
+
+	cases := []struct {
+		name  string
+		point [3]float32
+		want  int
+	}{
+		{"x>0, y>0 -> leaf 1", [3]float32{5, 5, 0}, 1},
+		{"x>0, y<0 -> leaf 2", [3]float32{5, -5, 0}, 2},
+		{"x<0, z>0 -> leaf 3", [3]float32{-5, 0, 5}, 3},
+		{"x<0, z<0, x+y>0 -> leaf 4", [3]float32{-1, 5, -5}, 4},
+		{"x<0, z<0, x+y<0 -> leaf 5", [3]float32{-5, -5, -5}, 5},
+		// On-plane case at the root: x=0 falls to back child (node 2),
+		// then z>0 -> leaf 3. Verifies the `dist > 0` strict-positive
+		// gating matches tyrquake.
+		{"x=0 (on plane) z>0 -> leaf 3", [3]float32{0, 0, 5}, 3},
+	}
+	for _, tc := range cases {
+		got := bm.PointInLeaf(tc.point)
+		if got != tc.want {
+			t.Errorf("%s: PointInLeaf(%v) = %d, want %d", tc.name, tc.point, got, tc.want)
+		}
+	}
+}
+
+// TestBrushModel_PointInLeaf_FiveLeafPVSConsistency picks a cluster of
+// points within the same half-space partition and asserts they all
+// agree on the destination leaf -- a property a buggy descent (e.g.
+// flipped child polarity) would not preserve.
+func TestBrushModel_PointInLeaf_FiveLeafPVSConsistency(t *testing.T) {
+	bm := loadSynthFiveLeafPVS(t)
+
+	// All four points satisfy x > 0 and y > 0, so they must all land
+	// in leaf 1 -- the front-front descent of nodes 0 and 1.
+	leaf1Cluster := [][3]float32{
+		{1, 1, 0},
+		{10, 0.5, -100},
+		{1e-3, 1e-3, 1e6},
+		{42, 42, 42},
+	}
+	want := bm.PointInLeaf(leaf1Cluster[0])
+	if want != 1 {
+		t.Fatalf("cluster anchor: got %d want 1", want)
+	}
+	for _, p := range leaf1Cluster[1:] {
+		got := bm.PointInLeaf(p)
+		if got != want {
+			t.Errorf("cluster inconsistency: PointInLeaf(%v) = %d, want %d (anchor result)", p, got, want)
+		}
+	}
+
+	// And the symmetric back-back-back cluster (x<0, z<0, x+y<0) all
+	// lands in leaf 5.
+	leaf5Cluster := [][3]float32{
+		{-1, -1, -1},
+		{-10, -10, -10},
+		{-100, -100, -50},
+	}
+	for _, p := range leaf5Cluster {
+		if got := bm.PointInLeaf(p); got != 5 {
+			t.Errorf("leaf 5 cluster: PointInLeaf(%v) = %d, want 5", p, got)
+		}
+	}
+}
+
+// TestBrushModel_PointInLeaf_WithFaces validates the single-interior-
+// node BSP from synthbsp.BuildWithFaces: front-child is leaf 0 (EMPTY,
+// no outside sentinel in this fixture), back-child is leaf 1 (SOLID).
+func TestBrushModel_PointInLeaf_WithFaces(t *testing.T) {
+	bm := loadSynthWithFaces(t)
+
+	if got := bm.PointInLeaf([3]float32{5, 0, 0}); got != 0 {
+		t.Errorf("front-of-plane: got %d want 0", got)
+	}
+	if got := bm.PointInLeaf([3]float32{-5, 0, 0}); got != 1 {
+		t.Errorf("back-of-plane: got %d want 1", got)
+	}
+}
+
+// TestBrushModel_PointInLeaf_EmptyModel exercises the early "no nodes"
+// guard: a hand-built empty BrushModel returns -1 regardless of input.
+func TestBrushModel_PointInLeaf_EmptyModel(t *testing.T) {
+	bm := &BrushModel{}
+	if got := bm.PointInLeaf([3]float32{0, 0, 0}); got != -1 {
+		t.Errorf("empty model: got %d want -1", got)
+	}
+}
+
+// TestBrushModel_PointInLeaf_BadPlaneNum poisons a node's PlaneNum so
+// the descent's planes-bounds check fires; PointInLeaf must surface -1
+// rather than panic.
+func TestBrushModel_PointInLeaf_BadPlaneNum(t *testing.T) {
+	bm := loadSynthFiveLeafPVS(t)
+	bm.nodes[0].PlaneNum = 9999
+	if got := bm.PointInLeaf([3]float32{0, 0, 0}); got != -1 {
+		t.Errorf("bad plane num: got %d want -1", got)
+	}
+	// And the negative side of the same guard.
+	bm.nodes[0].PlaneNum = -1
+	if got := bm.PointInLeaf([3]float32{0, 0, 0}); got != -1 {
+		t.Errorf("negative plane num: got %d want -1", got)
+	}
+}
+
+// TestBrushModel_PointInLeaf_OutOfRangeNodeChild poisons a node's
+// Children to reference an out-of-range node, exercising the in-loop
+// bounds check at the next iteration.
+func TestBrushModel_PointInLeaf_OutOfRangeNodeChild(t *testing.T) {
+	bm := loadSynthFiveLeafPVS(t)
+	// Force the front-child to a node id past the slice.
+	bm.nodes[0].Children[0] = 99
+	if got := bm.PointInLeaf([3]float32{5, 0, 0}); got != -1 {
+		t.Errorf("out-of-range node child: got %d want -1", got)
+	}
+}
+
+// TestBrushModel_PointInLeaf_OutOfRangeLeafChild poisons a node's
+// Children to encode a leaf index past the leaves slice, exercising
+// the post-descend bounds check.
+func TestBrushModel_PointInLeaf_OutOfRangeLeafChild(t *testing.T) {
+	bm := loadSynthFiveLeafPVS(t)
+	// Override node 1's front child (^1 = leaf 1) with an oversized
+	// leaf encoding so a point heading into leaf 1 lands in the guard.
+	bm.nodes[1].Children[0] = ^int16(99)
+	if got := bm.PointInLeaf([3]float32{5, 5, 0}); got != -1 {
+		t.Errorf("out-of-range leaf child: got %d want -1", got)
+	}
+}
+
+// TestBrushModel_PointInLeaf_PlanesDecodeError corrupts the underlying
+// LumpPlanes byte length so File.Planes() returns an error, and
+// PointInLeaf must surface -1.
+func TestBrushModel_PointInLeaf_PlanesDecodeError(t *testing.T) {
+	data, size, err := synthbsp.BuildFiveLeafPVS()
+	if err != nil {
+		t.Fatalf("synthbsp.BuildFiveLeafPVS: %v", err)
+	}
+	// Patch the planes lump length in the header to a non-multiple of
+	// the on-disk plane record size so the decoder errors. Header
+	// layout: int32 version + per-lump (int32 offset, int32 length).
+	// LumpPlanes is lump 1; the length field starts at 4 + 1*8 + 4 = 16.
+	const planesLumpLenOff = 4 + int(bspfile.LumpPlanes)*8 + 4
+	binary.LittleEndian.PutUint32(data[planesLumpLenOff:planesLumpLenOff+4], 1)
+	f, err := bspfile.Open(bytes.NewReader(data), size)
+	if err != nil {
+		t.Fatalf("bspfile.Open: %v", err)
+	}
+	// LoadBrush also reads planes -- it will error out. Reach into the
+	// BrushModel state directly: build a minimal shell with the bad
+	// File and a one-node skeleton so PointInLeaf's planes-decode path
+	// is the one that trips.
+	bm := &BrushModel{
+		File:   f,
+		nodes:  []Node{{Node: bspfile.Node{PlaneNum: 0, Children: [2]int16{^int16(0), ^int16(1)}}, ParentNode: -1}},
+		leaves: []Leaf{{ParentNode: -1}, {ParentNode: -1}},
+	}
+	if got := bm.PointInLeaf([3]float32{0, 0, 0}); got != -1 {
+		t.Errorf("planes decode error: got %d want -1", got)
 	}
 }

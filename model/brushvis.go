@@ -192,6 +192,71 @@ func (bm *BrushModel) NodeParent(i int) int {
 	return bm.nodes[i].ParentNode
 }
 
+// PointInLeaf descends the BSP from the root (node 0), using the
+// splitting plane at each interior node to pick the front (Children[0])
+// or back (Children[1]) child, until it reaches a leaf reference.
+// Returns the 1-based leaf index (matching the
+// [github.com/go-quake1/engine/bsprender.VisLeafIdx] convention --
+// leaf 0 is the outside-the-map sentinel a valid in-map point never
+// lands on).
+//
+// The per-node side test is `dot(point, plane.Normal) - plane.Dist`:
+// strictly positive -> front child; otherwise back child. This matches
+// tyrquake's Mod_PointInLeaf, which uses the same `> 0` short-circuit
+// (the on-plane case falls through to the back child). Inlining the
+// arithmetic here keeps this package import-cycle-free; the engine's
+// render package owns the equivalent [render.PlaneSide] helper for
+// other consumers.
+//
+// Returns -1 (defensive) if the descent escapes the BSP, i.e.:
+//
+//   - the model has no nodes (empty BSP)
+//   - an interior node's PlaneNum is out of range vs the planes lump
+//   - the planes lump fails to decode (shouldn't happen for a
+//     [BrushModel] produced by [LoadBrush], which already decoded the
+//     planes once, but the check keeps the method panic-free under
+//     exotic input)
+//   - a child reference decodes to a leaf index outside the leaves
+//     slice
+//
+// tyrquake: Mod_PointInLeaf.
+func (bm *BrushModel) PointInLeaf(point [3]float32) int {
+	if len(bm.nodes) == 0 {
+		return -1
+	}
+	planes, err := bm.File.Planes()
+	if err != nil {
+		return -1
+	}
+	nodeIdx := 0
+	for {
+		if nodeIdx < 0 || nodeIdx >= len(bm.nodes) {
+			return -1
+		}
+		n := &bm.nodes[nodeIdx]
+		pn := int(n.PlaneNum)
+		if pn < 0 || pn >= len(planes) {
+			return -1
+		}
+		p := &planes[pn]
+		d := p.Normal[0]*point[0] + p.Normal[1]*point[1] + p.Normal[2]*point[2] - p.Dist
+		var raw int16
+		if d > 0 {
+			raw = n.Children[0]
+		} else {
+			raw = n.Children[1]
+		}
+		if raw < 0 {
+			leafIdx := int(^raw)
+			if leafIdx < 0 || leafIdx >= len(bm.leaves) {
+				return -1
+			}
+			return leafIdx
+		}
+		nodeIdx = int(raw)
+	}
+}
+
 // setParent walks the BSP tree rooted at node index nodeIdx,
 // recursively populating each node + leaf's ParentNode field with
 // parentIdx (the immediate parent index, or -1 for the root). Called

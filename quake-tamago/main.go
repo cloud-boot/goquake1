@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"runtime"
 	"time"
 
 	_ "github.com/go-virtio/validate/board"
@@ -215,12 +216,24 @@ func run() error {
 //     that lets the rasterizer path stay exercised without any real
 //     id-Software assets.
 //
-// The synthetic BSP carries no LumpMarksurfaces, so a wrapped
-// LeafFaces closure returns every face index for the EMPTY non-
-// sentinel leaf — the demo-only hack that lets WalkWorld emit
-// something against the synthbsp. Real maps from pak0.pak carry valid
-// marksurfaces + PVS data and don't need the override (but it stays
-// harmless: the wrapper only fires for leaves with no marksurfaces).
+// Per-frame culling strategy:
+//
+//   - Real BSP (LumpMarksurfaces non-empty): use the canonical PVS
+//     walk. PointInLeaf finds the viewer's leaf, MarkVisibleLeaves
+//     stamps just the leaves in that leaf's PVS row (+ their parent
+//     chains), and WalkWorld emits only those leaves' marksurfaces.
+//     start.bsp has ~1865 leaves / 6187 faces; PVS culling typically
+//     drops per-frame face emission to ~50-200 (vs 6187 with the
+//     "stamp everything" hack, which trips a tamago OOM during the
+//     SurfaceList growslice).
+//
+//   - Synthetic BSP (BuildWithFaces, no marksurfaces lump): keep the
+//     "stamp every leaf + emit all faces from the one drawable leaf"
+//     demo path. PointInLeaf would return the EMPTY leaf at index 0
+//     (no outside sentinel in that fixture), which the spec-PVS path
+//     would treat as "outside the map" and skip rendering -- not what
+//     the synthbsp demo wants. The synth detection (zero-length
+//     marksurfaces lump) routes around this.
 func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be *virtio.Backend) error {
 	// 1. Source the BSP bytes: real pak0.pak first, synthbsp fallback.
 	bspBytes, size, err := loadBSP()
@@ -239,8 +252,10 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 	if err != nil {
 		return fmt.Errorf("file.Faces: %w", err)
 	}
-	fmt.Printf("QUAKE: BSP loaded -- %d nodes, %d leaves (PVS), %d faces\n",
-		bm.NumNodes(), bm.NumLeaves(), len(faces))
+	marks, _ := file.MarkSurfaces()
+	isSynth := len(marks) == 0
+	fmt.Printf("QUAKE: BSP loaded -- %d nodes, %d leaves (PVS), %d faces, %d marksurfaces (synth=%v)\n",
+		bm.NumNodes(), bm.NumLeaves(), len(faces), len(marks), isSynth)
 
 	// 2. Synthetic 16x16 checker texture. Real miptex decode (using
 	//    the BSP's TexInfo -> Textures chain) is a follow-up; this
@@ -257,66 +272,64 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 		}
 	}
 
-	// 4. WalkContext + per-leaf-all-faces override. The synthetic BSP
-	//    has no marksurfaces lump, so NewWalkContext's LeafFaces
-	//    returns []; we wrap it to emit every face index for the
-	//    EMPTY non-sentinel leaf, which is the leaf the walker
-	//    reaches via node 0's front child.
+	// 4. WalkContext. Real BSPs use NewWalkContext's defaults verbatim
+	//    -- the marksurfaces lump drives LeafFaces, the file's bboxes
+	//    drive culling. The synthbsp fixture ships none of that, so we
+	//    overlay the same demo-only wrappers that worked before.
 	walkCtx := bsprender.NewWalkContext(bm)
-	allFaceIdx := make([]int, len(faces))
-	for i := range allFaceIdx {
-		allFaceIdx[i] = i
-	}
-	walkCtx.LeafFaces = func(id int) []int {
-		// id 0..NumNodes-1 = node; otherwise leaf. Map every drawable
-		// leaf (kind != Empty) to the all-faces list.
-		if walkCtx.NodeKind(id) == bsprender.NodeKindLeaf {
-			return allFaceIdx
+	if isSynth {
+		allFaceIdx := make([]int, len(faces))
+		for i := range allFaceIdx {
+			allFaceIdx[i] = i
 		}
-		return nil
-	}
-	// NewWalkContext's NodeKind classifies a leaf with no marksurfaces
-	// as Empty (via the empty-LeafFaces / SOLID-contents test). The
-	// LeafFaces override above is moot unless NodeKind also reports
-	// the EMPTY-contents leaves as NodeKindLeaf. Re-wrap NodeKind to
-	// promote every EMPTY-contents leaf — the synthbsp uses leaf 0 as
-	// a drawable leaf (no outside-sentinel convention), so we ignore
-	// the leafIdx==0 distinction.
-	walkCtx.NodeKind = func(id int) bsprender.NodeKind {
-		if id < walkCtx.NumNodes {
-			return bsprender.NodeKindInterior
+		walkCtx.LeafFaces = func(id int) []int {
+			if walkCtx.NodeKind(id) == bsprender.NodeKindLeaf {
+				return allFaceIdx
+			}
+			return nil
 		}
-		leafIdx := id - walkCtx.NumNodes
-		if leafIdx < 0 || leafIdx >= bm.TotalLeaves() {
-			return bsprender.NodeKindEmpty
+		// Promote every EMPTY-contents leaf to NodeKindLeaf -- the
+		// synthbsp uses leaf 0 as a drawable leaf (no outside sentinel).
+		walkCtx.NodeKind = func(id int) bsprender.NodeKind {
+			if id < walkCtx.NumNodes {
+				return bsprender.NodeKindInterior
+			}
+			leafIdx := id - walkCtx.NumNodes
+			if leafIdx < 0 || leafIdx >= bm.TotalLeaves() {
+				return bsprender.NodeKindEmpty
+			}
+			if bm.Leaf(leafIdx).Contents == bspfile.ContentsSolid {
+				return bsprender.NodeKindEmpty
+			}
+			return bsprender.NodeKindLeaf
 		}
-		if bm.Leaf(leafIdx).Contents == bspfile.ContentsSolid {
-			return bsprender.NodeKindEmpty
+		// The synthbsp ships zero-size node bboxes; widen them so the
+		// walker's frustum test always passes for the demo.
+		const bigF = float32(1e6)
+		walkCtx.NodeBBox = func(id int) (mins, maxs [3]float32) {
+			return [3]float32{-bigF, -bigF, -bigF}, [3]float32{bigF, bigF, bigF}
 		}
-		return bsprender.NodeKindLeaf
-	}
-	// The synthbsp ships zero-size node bboxes (Mins == Maxs == 0),
-	// which BoxInFrustum rejects against any frustum whose planes
-	// have a positive Dist (i.e. a non-origin camera). Override
-	// NodeBBox with a "huge box" so the walker's frustum test always
-	// passes for the demo; real maps carry valid culling bboxes and
-	// won't need this override.
-	const bigF = float32(1e6)
-	walkCtx.NodeBBox = func(id int) (mins, maxs [3]float32) {
-		return [3]float32{-bigF, -bigF, -bigF}, [3]float32{bigF, bigF, bigF}
 	}
 
-	// 5. Camera setup. The synthbsp face verts live at (0,0,0),
-	//    (10,0,0), (0,10,0) on the Z=0 plane. A camera at
-	//    (5, 5, +60) pitched 90 degrees down keeps the triangle
-	//    dead-ahead of the forward axis (forward = (0, 0, -1) at
-	//    pitch=90) at depth 60 — comfortable margin past
-	//    ParticleNearClip = 16. Yaw spins the view around the camera's
-	//    forward axis so the triangle rotates on-screen.
-	const (
-		fovX     = 90.0
-		camDepth = float32(20) // triangle spans X/Y in [0,10]; camDepth ≥ 16 (ParticleNearClip)
-	)
+	// 5. Camera setup. For the synthbsp the face verts live at
+	//    (0,0,0), (10,0,0), (0,10,0) on the Z=0 plane -- camera at
+	//    (5, 5, +20) pitched 90 degrees down keeps the triangle
+	//    dead-ahead at depth 20 (>= ParticleNearClip = 16). Yaw spins
+	//    the view to animate.
+	//
+	//    For a real BSP the (5, 5, 20) point is almost certainly
+	//    outside any leaf -- PointInLeaf returns leaf 0 (outside
+	//    sentinel) and rendering is skipped. To land the camera inside
+	//    the map we walk a small spiral of candidate points around the
+	//    world model's bbox centre until PointInLeaf returns a non-zero
+	//    leaf; that point becomes the viewpoint.
+	const fovX = 90.0
+	camOrigin := [3]float32{5, 5, 20}
+	if !isSynth {
+		camOrigin = pickInMapCamera(bm, file)
+		fmt.Printf("QUAKE: camera origin %v\n", camOrigin)
+	}
+	markCtx := bsprender.NewMarkContext(bm)
 	var surfaces bsprender.SurfaceList
 
 	for frame := 0; ; frame++ {
@@ -325,32 +338,58 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 			fb.Pixels[i] = 0x10
 		}
 
-		// Camera fixed at (5, 5, +60); yaw spins to animate.
+		// Camera fixed at (5, 5, +20); yaw spins to animate.
 		yawDeg := float32(frame) * 1.0
 		rd := &render.RefDef{
 			VRect:      render.VRect{Width: fb.Width, Height: fb.Height},
 			ViewAngles: [3]float32{90, yawDeg, 0},
-			ViewOrigin: [3]float32{5, 5, camDepth},
+			ViewOrigin: camOrigin,
 			FovX:       fovX,
 			FovY:       fovX,
 		}
 		view := rd.SetupView()
 		frustum := rd.BuildFrustum()
-
-		// Stamp every node + leaf at this frame so WalkWorld doesn't
-		// PVS-cull anything. Proper R_MarkLeaves seeding from the
-		// viewer's leaf waits on map-asset PVS data.
 		stampFrame := int32(frame + 1)
-		for n := 0; n < bm.NumNodes(); n++ {
-			bm.SetNodeVisFrame(n, stampFrame)
-		}
-		for l := 0; l < bm.TotalLeaves(); l++ {
-			bm.Leaf(l).VisFrame = stampFrame
+
+		if isSynth {
+			// Synth: no PVS, mark everything so WalkWorld visits the
+			// single drawable leaf + emits the all-faces list.
+			for n := 0; n < bm.NumNodes(); n++ {
+				bm.SetNodeVisFrame(n, stampFrame)
+			}
+			for l := 0; l < bm.TotalLeaves(); l++ {
+				bm.Leaf(l).VisFrame = stampFrame
+			}
+		} else {
+			// Real BSP: locate the viewer's leaf, then stamp only the
+			// PVS-visible leaves + their parent chains. Out-of-map
+			// viewer (PointInLeaf returns <= 0) -> nothing to draw;
+			// present the cleared background and move on.
+			viewerLeaf := bm.PointInLeaf(rd.ViewOrigin)
+			if viewerLeaf > 0 {
+				if err := bsprender.MarkVisibleLeaves(markCtx,
+					bsprender.VisLeafIdx(viewerLeaf),
+					bsprender.FrameMarkSequence(stampFrame),
+				); err != nil {
+					return fmt.Errorf("MarkVisibleLeaves: %w", err)
+				}
+			} else {
+				_ = fb.Expand(rgba, palette)
+				_ = be.PresentFrame(rgba, fb.Width, fb.Height)
+				continue
+			}
 		}
 
 		surfaces.Reset()
 		if err := bsprender.WalkWorld(walkCtx, 0, rd.ViewOrigin, frustum, stampFrame, &surfaces); err != nil {
 			return fmt.Errorf("WalkWorld: %w", err)
+		}
+
+		// Per-frame face count log (sparse, every 60 frames) so the
+		// serial log surfaces PVS culling effectiveness without
+		// drowning the channel.
+		if frame%60 == 0 {
+			fmt.Printf("QUAKE: frame %d -- %d surfaces emitted\n", frame, surfaces.Len())
 		}
 
 		// Rasterize each visible face via TransformFace + FillTexturedPolygon.
@@ -367,9 +406,60 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 			_ = render.FillTexturedPolygon(fb, tex, &cm, 0, verts)
 		}
 
+		// Encourage tamago's small heap to release the per-face lump
+		// decode buffers NewBrushFaceVerts allocates each call. Without
+		// this nudge the 2 GB micro-VM trips OOM after a few frames;
+		// the proper fix (caching the decoded Edges/Surfedges/Vertexes
+		// lumps once) belongs in bspfile and is a separate change.
+		runtime.GC()
+
 		_ = fb.Expand(rgba, palette)
 		_ = be.PresentFrame(rgba, fb.Width, fb.Height)
 	}
+}
+
+// pickInMapCamera returns a viewpoint that lands inside a valid leaf
+// of bm. It starts from the world model's bbox centre (the most
+// natural "centre of the map" the BSP carries on disk) and, if that
+// point is in the outside-leaf sentinel, walks a 9x9x9 lattice of
+// jittered candidates within the bbox until PointInLeaf returns a
+// non-zero leaf index. Falls back to the bbox centre verbatim if every
+// candidate is solid -- the per-frame PointInLeaf check then skips
+// rendering rather than crashing.
+//
+// The lattice is coarse on purpose: with start.bsp's ~3000-unit bbox
+// and a 9-step lattice we sample every ~375 units, which is well
+// inside any playable Quake corridor.
+func pickInMapCamera(bm *model.BrushModel, file *bspfile.File) [3]float32 {
+	models, err := file.Models()
+	if err != nil || len(models) == 0 {
+		return [3]float32{0, 0, 0}
+	}
+	m := &models[0]
+	centre := [3]float32{
+		(m.Mins[0] + m.Maxs[0]) * 0.5,
+		(m.Mins[1] + m.Maxs[1]) * 0.5,
+		(m.Mins[2] + m.Maxs[2]) * 0.5,
+	}
+	if leaf := bm.PointInLeaf(centre); leaf > 0 {
+		return centre
+	}
+	const steps = 9
+	for ix := 0; ix < steps; ix++ {
+		for iy := 0; iy < steps; iy++ {
+			for iz := 0; iz < steps; iz++ {
+				p := [3]float32{
+					m.Mins[0] + (m.Maxs[0]-m.Mins[0])*float32(ix+1)/float32(steps+1),
+					m.Mins[1] + (m.Maxs[1]-m.Mins[1])*float32(iy+1)/float32(steps+1),
+					m.Mins[2] + (m.Maxs[2]-m.Mins[2])*float32(iz+1)/float32(steps+1),
+				}
+				if leaf := bm.PointInLeaf(p); leaf > 0 {
+					return p
+				}
+			}
+		}
+	}
+	return centre
 }
 
 // loadBSP returns the BSP bytes + size to render. It walks the
