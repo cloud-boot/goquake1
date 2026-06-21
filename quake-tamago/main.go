@@ -5,17 +5,30 @@
 // quake-tamago is the bare-metal Quake-on-TamaGo entry point. It boots
 // in QEMU as a `-kernel` ELF, probes the virtio PCI bus for gpu / input /
 // sound devices, wires them through backend/virtio/realdev into the
-// engine's backend.Backend contract, and drives runloop.Runner.RunUntilQuit.
+// engine's backend.Backend contract, and drives a per-frame demo loop
+// alongside the real id-Software game-server tick (host.Host.Frame).
 //
 // First-bring-up scope:
 //
 //   - Synthetic asset VFS (palette + colormap + conchars built in code).
-//     The validation target is "a non-blank frame reaches the host
-//     scanout", not "Quake plays". A follow-up batch embeds pak0.pak.
+//     The renderer-side asset pipeline keeps the synthetic lumps until
+//     the WAD/miptex bridge lands; the BSP and progs.dat are loaded
+//     out of the embedded pak0.pak via embedpak.OpenAsFS.
 //
-//   - stubHost satisfies runloop.HostFramer with a no-op per tic. The
-//     real id-Software game-server tick (sv_main) wires in a follow-up
-//     batch; for now the run loop just renders frames + processes input.
+//   - The real host.Host is constructed when embedpak.OpenAsFS yields a
+//     non-placeholder pak: progs.Load + progs.NewVM + model.NewCache +
+//     a pak-backed FileResolver + host.NewHost(..., 1 client). The
+//     host's SpawnServer loads "maps/start.bsp", parses entities,
+//     populates the edict pool. Per-frame the demo loop calls
+//     host.Frame(dt) -- this drives SV_Physics + SendClientFrames over
+//     a 20Hz tic. The runloop.Runner is built with stubHost{} because
+//     runDemo3D bypasses RunFrame; calling host.Frame inline keeps the
+//     server tick on the rendering thread for now.
+//
+//   - On the placeholder-pak path (no real pak0 present) the engine
+//     falls back to the stubHost no-op + synthbsp rendering, matching
+//     the previous bring-up behaviour. This keeps the binary boot-safe
+//     in CI environments where the shareware archive is absent.
 //
 //   - Input + sound are best-effort. If virtio-input or virtio-snd are
 //     absent from the QEMU command line the engine falls back to a
@@ -28,7 +41,6 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -52,7 +64,10 @@ import (
 	"github.com/go-quake1/engine/bsprender"
 	"github.com/go-quake1/engine/client"
 	"github.com/go-quake1/engine/embedpak"
+	enginehost "github.com/go-quake1/engine/host"
 	"github.com/go-quake1/engine/model"
+	"github.com/go-quake1/engine/progs"
+	"github.com/go-quake1/engine/protocol"
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/runloop"
 	engineserver "github.com/go-quake1/engine/server"
@@ -153,18 +168,52 @@ func run() error {
 	}
 
 	// 5. Build a synthetic VFS with the minimum assets LoadStandard
-	//    needs (palette + colormap + conchars). Real pak0.pak lives in
-	//    a follow-up batch (embedpak/).
+	//    needs (palette + colormap + conchars). The real pak0 carries
+	//    these lumps too but the WAD/miptex bridge that would consume
+	//    them is a follow-up; for first bring-up the synthetic copies
+	//    keep the asset side deterministic.
 	v := vfs.New()
 	v.Add(syntheticAssets())
 
-	// 6. Build a loopback NetConn pair. The single-player path serves
+	// 6. Open the embedded pak once. Shared between loadBSP (renderer)
+	//    and the host's FileResolver (server-side worldmodel + miptex
+	//    bytes-by-name). nil means the placeholder is still installed;
+	//    the renderer falls back to synthbsp + the host stays stubbed.
+	pakFS, pakErr := embedpak.OpenAsFS()
+	if pakErr != nil {
+		fmt.Printf("QUAKE: embedpak.OpenAsFS failed (%v); host stays stubbed\n", pakErr)
+	}
+
+	// 7. Build the real Host when a real pak is available. Failures
+	//    here log + fall back to stubHost so the binary still boots +
+	//    renders something even if progs.dat is malformed / missing /
+	//    the BSP can't be located inside the pak.
+	var realHost *enginehost.Host
+	if pakFS != nil {
+		h, herr := buildHost(pakFS, "start")
+		if herr != nil {
+			fmt.Printf("QUAKE: buildHost failed (%v); host stays stubbed\n", herr)
+		} else {
+			realHost = h
+			fmt.Printf("QUAKE: real host live -- sv.active=%v numEdicts=%d maxEdicts=%d\n",
+				h.Server.Active, h.Server.NumEdicts, h.Server.MaxEdicts)
+		}
+	}
+
+	// 8. Build a loopback NetConn pair. The single-player path serves
 	//    both client + server in this process; the engine's runloop
 	//    only holds the client-side handle (the server-side handle is
-	//    plumbed into the host package when it lands).
+	//    plumbed through the host's ConnectLoopback in a follow-up
+	//    batch that wires the client tick).
 	cli, _ := engineserver.NewLoopbackConn()
 
-	// 7. Construct the Runner via NewRunnerFromVFS.
+	// 9. Construct the Runner via NewRunnerFromVFS. NOTE: runDemo3D is
+	//    still the render driver (RunUntilQuit waits on the client
+	//    tick); the runner is built so Console / Screen / Palette are
+	//    ready when the client tick lands. The runner's Host field is
+	//    only read by RunFrame, which runDemo3D bypasses -- so passing
+	//    stubHost there is safe even when realHost is non-nil. The
+	//    real host's Frame is driven inline by runDemo3D below.
 	runner, err := runloop.NewRunnerFromVFS(runloop.SetupOpts{
 		VFS:            v,
 		Host:           stubHost{},
@@ -179,22 +228,83 @@ func run() error {
 		return fmt.Errorf("NewRunnerFromVFS: %w", err)
 	}
 
-	// 8. Print something visible into the console so the rendered
-	//    frame is not blank. Drop the console fully open so the lines
-	//    are visible from frame 0 (otherwise ConCurrent=0 keeps the
-	//    drop-down closed and the synthetic conchars sheet has nothing
-	//    to draw against).
+	// 10. Print something visible into the console so the rendered
+	//     frame is not blank. Drop the console fully open so the lines
+	//     are visible from frame 0 (otherwise ConCurrent=0 keeps the
+	//     drop-down closed and the synthetic conchars sheet has nothing
+	//     to draw against).
 	runner.Console.Print("PURE-GO QUAKE 1 -- TamaGo + go-virtio bring-up\n")
 	runner.Console.Print("framebuffer wired; per-tick Compose2D + Flush\n")
 	runner.Screen.ConCurrent = runner.Screen.ConLines
 
-	// 9. Drive a 3D demo loop instead of the (still-empty) RunUntilQuit
-	//    path. Renders a rotating textured quad via the perspective
-	//    rasterizer + presents each frame through the virtio-gpu
-	//    Framebuffer.Flush. Proves the 3D path works end-to-end on
-	//    real virtio-gpu hardware.
-	fmt.Printf("QUAKE: entering demo3D loop\n")
-	return runDemo3D(runner.FrameBuffer, runner.RGBA, runner.Palette, be)
+	// 11. Drive a 3D demo loop instead of the (still-empty) RunUntilQuit
+	//     path. Renders a rotating BSP camera + presents each frame
+	//     through the virtio-gpu Framebuffer.Flush. When realHost is
+	//     non-nil it ALSO advances the server simulation each frame
+	//     (host.Frame); when nil the per-frame loop is renderer-only.
+	fmt.Printf("QUAKE: entering demo3D loop (realHost=%v)\n", realHost != nil)
+	return runDemo3D(runner.FrameBuffer, runner.RGBA, runner.Palette, be, realHost, pakFS)
+}
+
+// buildHost wires the embedded pak0 into a fully constructed
+// host.Host: progs.Load -> progs.NewVM -> model.NewCache -> pak-backed
+// FileResolver -> host.NewHost(maxClients=1) -> host.SpawnServer(map).
+//
+// Returns the SpawnServer'd host on success; any failure (missing
+// progs.dat, malformed BSP, entity-parse error) is propagated to the
+// caller, which falls back to the stubHost.
+//
+// mapSlug is the bare map name ("start", "e1m1") -- SpawnServer
+// expands it to "maps/<slug>.bsp" internally via MapBSPPath.
+func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
+	// 1. progs.dat -> VM. Quake's bytecode lives at the top of the pak
+	//    under "progs.dat"; failures here mean the pak is malformed
+	//    (id Software's shareware ships it; community paks may not).
+	progsBytes, ok := tryReadPakFile(pakFS, "progs.dat")
+	if !ok {
+		return nil, fmt.Errorf("buildHost: progs.dat missing from pak")
+	}
+	p, err := progs.Load(bytes.NewReader(progsBytes), int64(len(progsBytes)))
+	if err != nil {
+		return nil, fmt.Errorf("buildHost: progs.Load: %w", err)
+	}
+	vm := progs.NewVM(p)
+	fmt.Printf("QUAKE: progs.dat loaded -- %d bytes, %d functions, %d global defs\n",
+		len(progsBytes), len(p.Functions), len(p.GlobalDefs))
+
+	// 2. Model cache + pak-backed FileResolver. The resolver fetches
+	//    bytes by name out of the embedded pak so SpawnServer's
+	//    LoadModelByName worldmodel-load sees the real BSP. Submodels
+	//    are reused from the same File without re-resolving.
+	cache := model.NewCache()
+	resolver := func(name string) (int64, io.ReaderAt, error) {
+		data, ok := tryReadPakFile(pakFS, name)
+		if !ok {
+			return 0, nil, fmt.Errorf("pak: %s missing", name)
+		}
+		return int64(len(data)), bytes.NewReader(data), nil
+	}
+
+	// 3. Host. maxClients=1 = the local-player loop. NewHost
+	//    pre-allocates the Server + Static + World pools; SetProgs
+	//    binds the bytecode the per-tic dispatcher consults for
+	//    named-global hand-off.
+	h, err := enginehost.NewHost(vm, cache, resolver, 1)
+	if err != nil {
+		return nil, fmt.Errorf("buildHost: NewHost: %w", err)
+	}
+	h.SetProgs(p)
+
+	// 4. SpawnServer. Loads the BSP, builds the area tree, parses the
+	//    entities lump, populates the edict pool. The default
+	//    no-op interner stores every string field as offset 0 (the
+	//    empty-string sentinel) -- field structure is preserved; only
+	//    the human-readable string payload is dropped. Good enough to
+	//    drive SV_Physics + measure tic advance.
+	if err := h.SpawnServer(mapSlug, protocol.VersionNQ); err != nil {
+		return nil, fmt.Errorf("buildHost: SpawnServer(%q): %w", mapSlug, err)
+	}
+	return h, nil
 }
 
 // runDemo3D renders a BSP via the full engine pipeline:
@@ -233,9 +343,9 @@ func run() error {
 //     would treat as "outside the map" and skip rendering -- not what
 //     the synthbsp demo wants. The synth detection (zero-length
 //     marksurfaces lump) routes around this.
-func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be *virtio.Backend) error {
+func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be *virtio.Backend, host *enginehost.Host, pakFS fs.FS) error {
 	// 1. Source the BSP bytes: real pak0.pak first, synthbsp fallback.
-	bspBytes, size, err := loadBSP()
+	bspBytes, size, err := loadBSP(pakFS)
 	if err != nil {
 		return fmt.Errorf("loadBSP: %w", err)
 	}
@@ -332,6 +442,23 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 	var surfaces bsprender.SurfaceList
 
 	for frame := 0; ; frame++ {
+		// Server-side tick: run one SV_Physics + SendClientFrames pass
+		// per rendered frame. dt = DefaultFrameTime (0.05s, 20Hz) --
+		// the same delta NewHost initialises with, so the bytecode
+		// interpreter's RunThink deadlines line up with the C upstream
+		// at the canonical sys_ticrate. Errors short-circuit the loop
+		// (returning surfaces the failure on the serial log + halts
+		// the binary via main's halt()).
+		if host != nil {
+			if herr := host.Frame(enginehost.DefaultFrameTime); herr != nil {
+				return fmt.Errorf("host.Frame frame=%d: %w", frame, herr)
+			}
+			if frame%60 == 0 {
+				fmt.Printf("QUAKE: tic %d -- sv.time=%.3f numEdicts=%d\n",
+					frame, host.Server.Time, host.Server.NumEdicts)
+			}
+		}
+
 		// Clear to sky background (palette idx 0x10).
 		for i := range fb.Pixels {
 			fb.Pixels[i] = 0x10
@@ -463,21 +590,18 @@ func pickInMapCamera(bm *model.BrushModel, file *bspfile.File) [3]float32 {
 	return centre
 }
 
-// loadBSP returns the BSP bytes + size to render. It walks the
-// preferred sources in order:
+// loadBSP returns the BSP bytes + size to render. Sources, in order:
 //
-//  1. embedpak.OpenAsFS() — when a real pak0.pak has been dropped
-//     into embedpak/empty.pak, try "maps/start.bsp" (canonical entry
-//     map) then "maps/e1m1.bsp" (episode 1 first map).
-//  2. synthbsp.BuildWithFaces() — the always-available synthetic
-//     fallback. Used when the embedded pak is still the placeholder
+//  1. The shared embedpak fs.FS opened by run() -- try "maps/start.bsp"
+//     (canonical entry map) then "maps/e1m1.bsp" (episode 1 first map).
+//  2. synthbsp.BuildWithFaces() -- the always-available synthetic
+//     fallback. Used when pakFS is nil (placeholder pak installed)
 //     OR when neither canonical map is present in the supplied pak.
 //
 // The chosen path is logged on the serial console so the QEMU log
 // makes the source unambiguous.
-func loadBSP() ([]byte, int64, error) {
-	pakFS, err := embedpak.OpenAsFS()
-	if err == nil {
+func loadBSP(pakFS fs.FS) ([]byte, int64, error) {
+	if pakFS != nil {
 		for _, mapName := range []string{"maps/start.bsp", "maps/e1m1.bsp"} {
 			data, ok := tryReadPakFile(pakFS, mapName)
 			if ok {
@@ -487,10 +611,8 @@ func loadBSP() ([]byte, int64, error) {
 			}
 		}
 		fmt.Printf("QUAKE: embedded pak0.pak lacks maps/start.bsp and maps/e1m1.bsp; using synthbsp fallback\n")
-	} else if errors.Is(err, embedpak.ErrEmbedPakEmpty) {
-		fmt.Printf("QUAKE: using synthbsp fallback (drop real pak0.pak into embedpak/empty.pak)\n")
 	} else {
-		fmt.Printf("QUAKE: embedpak.OpenAsFS failed (%v); using synthbsp fallback\n", err)
+		fmt.Printf("QUAKE: using synthbsp fallback (no pak FS available)\n")
 	}
 	return synthbsp.BuildWithFaces()
 }
