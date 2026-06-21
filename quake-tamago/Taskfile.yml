@@ -1,0 +1,89 @@
+# Quake-on-TamaGo build + launch tasks.
+#
+# `task build` produces a bare-metal tamago/amd64 ELF that the QEMU
+# launcher boots as -kernel. `task qemu` runs it headless + captures
+# a screendump via the QEMU monitor. `task qemu-visible` runs with
+# a real GTK window so a human can see Quake actually running.
+#
+# Requires:
+#   - $TAMAGO pointing at tannevaled/tamago-go/bin/go (or any tamago
+#     toolchain). Defaults to ~/Documents/VCS/GIT/github.com/tannevaled/tamago-go/bin/go.
+#   - qemu-system-x86_64 in PATH.
+#   - python3 in PATH (only for headless screendump task).
+
+version: "3"
+
+vars:
+  TAMAGO:
+    sh: echo "${TAMAGO:-$HOME/Documents/VCS/GIT/github.com/tannevaled/tamago-go/bin/go}"
+  ELF: '{{.TASKFILE_DIR}}/build/quake.elf'
+  PPM: '/tmp/quake-frame.ppm'
+  SERIAL: '/tmp/quake-serial.log'
+  MON: '/tmp/quake-mon.sock'
+  CPU: '{{default "max" .CPU}}'
+  MEM: '{{default "512M" .MEM}}'
+
+tasks:
+  build:
+    desc: Build the tamago/amd64 Quake-on-bare-metal ELF.
+    cmds:
+      - mkdir -p {{.TASKFILE_DIR}}/build
+      - |
+        GOWORK=off GOOS=tamago GOARCH=amd64 \
+          GOOSPKG=github.com/usbarmory/tamago \
+          "{{.TAMAGO}}" build \
+          -ldflags "-T 0x10010000 -R 0x1000" \
+          -o "{{.ELF}}" .
+
+  qemu-visible:
+    desc: Run Quake in QEMU with a real GTK window (interactive; close window to exit).
+    deps: [build]
+    cmds:
+      - |
+        qemu-system-x86_64 -M q35 -accel tcg -cpu {{.CPU}} -m {{.MEM}} \
+          -display gtk,grab-on-hover=on \
+          -no-reboot -vga none \
+          -device virtio-gpu-pci,id=vgpu \
+          -device virtio-keyboard-pci,id=vkbd \
+          -device virtio-mouse-pci,id=vmouse \
+          -device virtio-snd-pci,id=vsnd,audiodev=audio0 \
+          -audiodev coreaudio,id=audio0 \
+          -serial stdio \
+          -kernel "{{.ELF}}"
+
+  qemu-headless:
+    desc: Boot in QEMU headless + capture one screendump after 5 seconds.
+    deps: [build]
+    cmds:
+      - rm -f "{{.PPM}}" "{{.SERIAL}}" "{{.MON}}"
+      - |
+        qemu-system-x86_64 -M q35 -accel tcg -cpu {{.CPU}} -m {{.MEM}} \
+          -display none -no-reboot -vga none \
+          -device virtio-gpu-pci,id=vgpu \
+          -device virtio-keyboard-pci,id=vkbd \
+          -device virtio-mouse-pci,id=vmouse \
+          -serial "file:{{.SERIAL}}" \
+          -monitor "unix:{{.MON}},server,nowait" \
+          -kernel "{{.ELF}}" &
+        QPID=$!
+        sleep 5
+        # Capture screendump via QEMU monitor (python3 talks to the unix socket).
+        python3 -c "
+        import socket, time
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect('{{.MON}}')
+        time.sleep(0.3)
+        s.recv(65536)
+        s.sendall(b'screendump {{.PPM}} vgpu 0\n')
+        time.sleep(0.6)
+        print(s.recv(65536).decode(errors='replace').strip())
+        "
+        kill $QPID 2>/dev/null || true
+        wait $QPID 2>/dev/null || true
+      - test -s "{{.PPM}}" && echo "wrote {{.PPM}} ($(wc -c < {{.PPM}}) bytes)"
+
+  clean:
+    desc: Remove build artifacts + any captured PPM/log files.
+    cmds:
+      - rm -rf {{.TASKFILE_DIR}}/build
+      - rm -f {{.PPM}} {{.SERIAL}} {{.MON}}
