@@ -49,6 +49,8 @@ tasks:
           -device virtio-gpu-pci,id=vgpu \
           -device virtio-keyboard-pci,id=vkbd \
           -device virtio-mouse-pci,id=vmouse \
+          -device virtio-sound-pci,id=vsnd,audiodev=audio0 \
+          -audiodev none,id=audio0 \
           -serial stdio \
           -kernel "{{.ELF}}"
 
