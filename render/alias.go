@@ -97,6 +97,16 @@ func DrawAlias(fb *FrameBuffer, rd *RefDef, cm *ColorMap, lightLevel int,
 	}
 
 	verts := framePose(model.Frames[ent.FrameIdx])
+	return drawAliasFromPose(fb, rd, cm, lightLevel, model, skin, ent, verts)
+}
+
+// drawAliasFromPose runs the per-vertex transform + per-triangle
+// rasterization workflow over a CALLER-SUPPLIED vertex slice. Shared
+// by DrawAlias (single frame) and DrawAliasInterp (lerped pose).
+// Caller must have already validated fb/rd/model/skin and the frame
+// index(es); this helper just renders the supplied pose.
+func drawAliasFromPose(fb *FrameBuffer, rd *RefDef, cm *ColorMap, lightLevel int,
+	model *mdl.Model, skin *Pic, ent AliasEntity, verts []mdl.TriVertx) error {
 
 	const deg2rad = math.Pi / 180
 	tanHalfX := float32(math.Tan(float64(rd.FovX/2) * deg2rad))
