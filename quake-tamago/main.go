@@ -35,10 +35,15 @@
 //     absent from the QEMU command line the engine falls back to a
 //     no-input / silent backend rather than panicking.
 //
-//   - Camera position stays anchored at pickInMapCamera's lattice probe
-//     for first bring-up: full player-follow needs the server-edict
-//     -> client.State.ViewOrigin wiring (separate batch). Camera angles
-//     ARE driven by virtio-input via client.Tick (the WASD + mouse +
+//   - Camera position follows the player edict at server slot 1 when
+//     the real host is wired: each tic the Pre2DDraw closure calls
+//     host.EdictOrigin(1), and uses the returned origin (plus the
+//     client's ViewHeightOffset eye-height nudge) as the ViewOrigin.
+//     When that origin is the zero vector -- the bytecode default
+//     before QC SpawnFn populates an info_player_start spawn point --
+//     the camera falls back to pickInMapCamera's lattice probe, which
+//     is guaranteed to land inside a valid leaf. Camera angles are
+//     driven by virtio-input via client.Tick (the WASD + mouse +
 //     jump bindings already in UpdateButtonsFromSnapshot).
 //
 // Rationale (project-driver quote): "on a fait les pilote virtio pour
@@ -252,8 +257,11 @@ func run() error {
 	// 12. Build the Pre2DDraw hook (BSP load, mark/walk contexts,
 	//     synthetic texture, identity colormap) + anchor the camera
 	//     origin at pickInMapCamera. The closure is wired onto the
-	//     runner; RunUntilQuit then drives the full pipeline.
-	if err := setupRenderer(runner, pakFS); err != nil {
+	//     runner; RunUntilQuit then drives the full pipeline. When a
+	//     real host exists we pass it in so the per-frame camera can
+	//     follow the player edict at slot 1; nil falls back to the
+	//     static pickInMapCamera anchor.
+	if err := setupRenderer(runner, pakFS, realHost); err != nil {
 		return fmt.Errorf("setupRenderer: %w", err)
 	}
 
@@ -272,13 +280,14 @@ func run() error {
 // host.Frame + client.Tick + Compose2D + PresentFrame are all wired
 // into the same per-tic schedule.
 //
-// SIMPLIFICATION: the camera ViewOrigin is set ONCE at startup
-// (lattice-probed in-map point + ViewHeightOffset offset; the offset
-// is read on each tic from the client state). The viewer does NOT
-// follow the player edict yet -- that needs the server-edict ->
-// client.State.ViewOrigin wiring (separate batch). Camera angles ARE
-// driven per-tic via client.Tick -> r.ViewAngles (mouse + WASD).
-func setupRenderer(runner *runloop.Runner, pakFS fs.FS) error {
+// CAMERA: when realHost is non-nil the per-frame Pre2DDraw closure
+// asks realHost.EdictOrigin(1) (the player slot) and uses the
+// returned origin + a ViewHeightOffset eye-height nudge as the
+// ViewOrigin. A zero origin (the bytecode default until SpawnFn is
+// wired) or an error falls back to camOrigin -- the static
+// pickInMapCamera anchor. Camera angles come from client.Tick
+// (mouse + WASD) regardless of the position source.
+func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host) error {
 	// 1. Source the BSP bytes: real pak0.pak first, synthbsp fallback.
 	bspBytes, size, err := loadBSP(pakFS)
 	if err != nil {
@@ -387,10 +396,25 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS) error {
 			fb.Pixels[i] = 0x10
 		}
 
-		// Bias the anchor by the client's view-height offset (the
-		// vertical bob/crouch nudge). Full player-follow is a
-		// follow-up wiring batch.
+		// Pick the camera anchor for this frame. When the real host
+		// is wired we ask it for slot 1 (the local player edict).
+		// Until SpawnFn is wired the player edict's origin field
+		// stays at the bytecode default (zero vector); in that case
+		// (or on any error) we fall back to camOrigin -- the static
+		// pickInMapCamera anchor that always lands inside a leaf.
 		origin := viewOrigin
+		fromEdict := false
+		if realHost != nil {
+			if eo, err := realHost.EdictOrigin(1); err == nil && (eo[0] != 0 || eo[1] != 0 || eo[2] != 0) {
+				origin = eo
+				fromEdict = true
+			}
+		}
+
+		// Bias the anchor by the client's view-height offset (the
+		// vertical bob/crouch nudge). When the origin comes from the
+		// player edict the offset is the eye-height delta above the
+		// edict's base origin.
 		origin[2] += runner.Client.ViewHeightOffset
 
 		rd := &render.RefDef{
@@ -436,11 +460,12 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS) error {
 		}
 
 		// Per-frame face count log (sparse, every 60 frames) so the
-		// serial log surfaces PVS culling effectiveness without
-		// drowning the channel.
+		// serial log surfaces PVS culling effectiveness + the chosen
+		// camera origin (player-edict-follow vs pickInMapCamera
+		// fallback) without drowning the channel.
 		if frame%60 == 0 {
-			fmt.Printf("QUAKE: tic %d -- sv.time-driven; %d surfaces emitted\n",
-				frame, surfaces.Len())
+			fmt.Printf("QUAKE: tic %d -- sv.time-driven; viewOrigin=%v fromEdict=%v; %d surfaces emitted\n",
+				frame, origin, fromEdict, surfaces.Len())
 		}
 
 		// Rasterize each visible face via TransformFace + FillTexturedPolygon.

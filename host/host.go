@@ -375,3 +375,47 @@ func (h *Host) findProgs() *progs.Progs {
 func (h *Host) SetProgs(p *progs.Progs) {
 	h.progsRef = p
 }
+
+// ErrNoEdict fires when [Host.EdictOrigin] is asked for a slot that
+// has no live edict -- either SpawnServer has not run (the pool is
+// empty) or the requested slot is past the end of the allocated pool.
+var ErrNoEdict = errors.New("host: edict slot out of range")
+
+// ErrNoProgs fires when [Host.EdictOrigin] is called without a Progs
+// bound -- the field-name -> offset lookup needs the FieldDefs table,
+// which only the embedder-supplied Progs carries.
+var ErrNoProgs = errors.New("host: EdictOrigin needs a bound Progs")
+
+// EdictOrigin returns the value of the per-edict QC "origin" vector
+// at slot in the active server's edict pool. tyrquake: ent->v.origin
+// for ent = sv.edicts[slot] (the world entity is slot 0; clients
+// occupy slots 1..MaxClients).
+//
+// Bring-up use case: per-frame camera-follow reads slot 1 (the local
+// player) and uses the returned origin as the [render.RefDef]
+// ViewOrigin. Until the QC SpawnFn hook is wired the player edict's
+// origin field stays at the bytecode default (typically {0,0,0});
+// callers detect that case and fall back to a fixed anchor.
+//
+// Returns ErrNoEdict when slot is out of range, ErrNoProgs when no
+// Progs is bound, and ErrFieldNotFound / ErrFieldTypeMismatch from
+// the underlying [progs.EntVars] read.
+//
+// NewEntVars's nil-arg guard is unreachable here -- the slot + progs
+// guards above ensure both inputs are non-nil -- so its error is
+// dropped (bsptrace-style) rather than threaded through.
+func (h *Host) EdictOrigin(slot int) ([3]float32, error) {
+	if slot < 0 || slot >= len(h.Server.Edicts) {
+		return [3]float32{}, ErrNoEdict
+	}
+	ent := h.Server.Edicts[slot]
+	if ent == nil {
+		return [3]float32{}, ErrNoEdict
+	}
+	p := h.findProgs()
+	if p == nil {
+		return [3]float32{}, ErrNoProgs
+	}
+	v, _ := progs.NewEntVars(p, ent)
+	return v.ReadVec3("origin")
+}

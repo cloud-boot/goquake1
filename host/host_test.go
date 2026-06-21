@@ -670,6 +670,101 @@ func TestHostKeyAt(t *testing.T) {
 	}
 }
 
+// --- EdictOrigin ----------------------------------------------------------
+
+// Happy path: write origin into the world edict via EntVars, read it
+// back through EdictOrigin.
+func TestEdictOrigin_HappyPath(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, p := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	v, err := progs.NewEntVars(p, h.Server.Edicts[1])
+	if err != nil {
+		t.Fatalf("NewEntVars: %v", err)
+	}
+	want := [3]float32{12, 34, 56}
+	if err := v.WriteVec3("origin", want); err != nil {
+		t.Fatalf("WriteVec3: %v", err)
+	}
+	got, err := h.EdictOrigin(1)
+	if err != nil {
+		t.Fatalf("EdictOrigin: %v", err)
+	}
+	if got != want {
+		t.Errorf("EdictOrigin got %v want %v", got, want)
+	}
+}
+
+// Out-of-range slot indices fail with ErrNoEdict.
+func TestEdictOrigin_OutOfRange(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if _, err := h.EdictOrigin(-1); !errors.Is(err, ErrNoEdict) {
+		t.Errorf("EdictOrigin(-1) got %v want ErrNoEdict", err)
+	}
+	if _, err := h.EdictOrigin(1 << 30); !errors.Is(err, ErrNoEdict) {
+		t.Errorf("EdictOrigin(huge) got %v want ErrNoEdict", err)
+	}
+}
+
+// nil edict in an in-range slot also surfaces ErrNoEdict.
+func TestEdictOrigin_NilEdict(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	h.Server.Edicts[0] = nil
+	if _, err := h.EdictOrigin(0); !errors.Is(err, ErrNoEdict) {
+		t.Errorf("EdictOrigin(nil) got %v want ErrNoEdict", err)
+	}
+}
+
+// EdictOrigin pre-SpawnServer: the edict pool is empty -> ErrNoEdict.
+func TestEdictOrigin_BeforeSpawn(t *testing.T) {
+	h, _ := makeHost(t, nil, 1)
+	if _, err := h.EdictOrigin(0); !errors.Is(err, ErrNoEdict) {
+		t.Errorf("EdictOrigin pre-spawn got %v want ErrNoEdict", err)
+	}
+}
+
+// Without a bound Progs the helper can't resolve the field name; the
+// guard returns ErrNoProgs.
+func TestEdictOrigin_NoProgs(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	h.SetProgs(nil)
+	if _, err := h.EdictOrigin(0); !errors.Is(err, ErrNoProgs) {
+		t.Errorf("EdictOrigin no-progs got %v want ErrNoProgs", err)
+	}
+}
+
+// EntVars-layer errors propagate verbatim: a Progs that omits the
+// "origin" field def surfaces ErrFieldNotFound.
+func TestEdictOrigin_FieldNotFound(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	stripped := &progs.Progs{
+		Header:  progs.Header{EntityFields: 8},
+		Strings: []byte{0},
+	}
+	h.SetProgs(stripped)
+	if _, err := h.EdictOrigin(0); !errors.Is(err, progs.ErrFieldNotFound) {
+		t.Errorf("EdictOrigin missing-field got %v want ErrFieldNotFound", err)
+	}
+}
+
 // SetInterner replaces the bound interner.
 func TestSetInterner(t *testing.T) {
 	h, _ := makeHost(t, nil, 1)
