@@ -1,0 +1,452 @@
+// Copyright (c) 2026 the go-quake1/engine authors.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+package model
+
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+
+	"github.com/go-quake1/engine/bspfile"
+)
+
+// --- Synthetic BSP with PVS data + a 4-node / 5-leaf tree -----------------
+//
+// We need a richer tree than buildMinimalBSPForBrushModel to exercise
+// setParent + the PVS / parent-walk accessors. The tree:
+//
+//	            node 0  (root, parent = -1)
+//	           /        \
+//	       node 1      node 2
+//	       /   \        /   \
+//	    leaf1 leaf2  leaf3  node 3
+//	                        /   \
+//	                     leaf4  leaf5
+//
+// Stored 0-based: leafs = [outside, leaf1, leaf2, leaf3, leaf4, leaf5]
+// so the 1-based VisLeafIdx the renderer uses maps to slice index
+// directly. Leaf 0 (outside) is a SOLID placeholder, the other five
+// carry an EMPTY contents tag + an explicit VisOfs into our PVS blob.
+
+// pvsLeaf is one (1-based) leaf entry with the bits visible from it.
+type pvsLeaf struct {
+	visible []int // 1-based leaf indices visible from this leaf
+}
+
+// buildBSPWithPVS encodes the 5-leaf tree above plus a LumpVisibility
+// blob whose row layout is: leaf i's PVS row starts at visdata offset
+// pvsOffsets[i]. Each row uses the raw "no-RLE" form (a contiguous
+// byte array sized for NumLeaves bits = 5 bits = 1 byte). Since the
+// rows happen to be non-zero, DecompressVis copies them verbatim.
+func buildBSPWithPVS(t *testing.T, pvs []pvsLeaf) ([]byte, int64) {
+	t.Helper()
+
+	planes := []bspfile.Plane{
+		{Normal: [3]float32{1, 0, 0}, Dist: 0, Type: bspfile.PlaneX},
+		{Normal: [3]float32{0, 1, 0}, Dist: 0, Type: bspfile.PlaneY},
+		{Normal: [3]float32{0, 0, 1}, Dist: 0, Type: bspfile.PlaneZ},
+		{Normal: [3]float32{1, 1, 0}, Dist: 0, Type: bspfile.PlaneAnyX},
+	}
+	// 4 nodes wiring the tree shown above.
+	//   node 0 children: node 1 (=1), node 2 (=2)
+	//   node 1 children: leaf 1 (=^1), leaf 2 (=^2)
+	//   node 2 children: leaf 3 (=^3), node 3 (=3)
+	//   node 3 children: leaf 4 (=^4), leaf 5 (=^5)
+	nodes := []bspfile.Node{
+		{PlaneNum: 0, Children: [2]int16{1, 2}},
+		{PlaneNum: 1, Children: [2]int16{^int16(1), ^int16(2)}},
+		{PlaneNum: 2, Children: [2]int16{^int16(3), 3}},
+		{PlaneNum: 3, Children: [2]int16{^int16(4), ^int16(5)}},
+	}
+	// Build the LumpVisibility blob. One row per PVS-trackable leaf
+	// (5 rows for 5 leaves), 1 byte each.
+	const pvsRowBytes = 1
+	visBlob := make([]byte, pvsRowBytes*len(pvs))
+	for i, p := range pvs {
+		for _, v := range p.visible {
+			bit := v - 1
+			visBlob[i*pvsRowBytes+bit/8] |= 1 << uint(bit%8)
+		}
+	}
+
+	// 6 leaves total: [outside, leaf1..leaf5]. Outside is SOLID and
+	// VisOfs = -1; the five PVS leaves get VisOfs = (i-1) * pvsRowBytes.
+	leafs := []bspfile.Leaf{
+		{Contents: bspfile.ContentsSolid, VisOfs: -1},
+	}
+	for i := range pvs {
+		leafs = append(leafs, bspfile.Leaf{
+			Contents: bspfile.ContentsEmpty,
+			VisOfs:   int32(i * pvsRowBytes),
+		})
+	}
+
+	clipnodes := []bspfile.ClipNode{
+		{PlaneNum: 0, Children: [2]int16{bspfile.ContentsEmpty, bspfile.ContentsSolid}},
+	}
+	models := []bspfile.Model{
+		{
+			Mins:     [3]float32{-100, -100, -100},
+			Maxs:     [3]float32{100, 100, 100},
+			Headnode: [bspfile.MaxMapHulls]int32{0, 0, 0, 0},
+		},
+	}
+
+	// Encode lumps to bytes.
+	pb := encodePlanes(planes)
+	nb := encodeNodes(nodes)
+	lb := encodeLeafs(leafs)
+	cnb := encodeClipnodes(clipnodes)
+	mb := encodeModels(models)
+
+	const headerSize = 4 + 15*8
+	body := &bytes.Buffer{}
+
+	type lumpInfo struct {
+		kind bspfile.LumpKind
+		data []byte
+	}
+	lumps := []lumpInfo{
+		{kind: bspfile.LumpPlanes, data: pb},
+		{kind: bspfile.LumpVisibility, data: visBlob},
+		{kind: bspfile.LumpNodes, data: nb},
+		{kind: bspfile.LumpLeafs, data: lb},
+		{kind: bspfile.LumpClipnodes, data: cnb},
+		{kind: bspfile.LumpModels, data: mb},
+	}
+	offsetByKind := map[bspfile.LumpKind]int32{}
+	lenByKind := map[bspfile.LumpKind]int32{}
+	for _, l := range lumps {
+		offsetByKind[l.kind] = int32(headerSize) + int32(body.Len())
+		body.Write(l.data)
+		lenByKind[l.kind] = int32(len(l.data))
+	}
+
+	hdr := &bytes.Buffer{}
+	_ = binary.Write(hdr, binary.LittleEndian, int32(bspfile.Version29))
+	for k := bspfile.LumpKind(0); int(k) < bspfile.HeaderLumps; k++ {
+		_ = binary.Write(hdr, binary.LittleEndian, offsetByKind[k])
+		_ = binary.Write(hdr, binary.LittleEndian, lenByKind[k])
+	}
+	full := append(hdr.Bytes(), body.Bytes()...)
+	return full, int64(len(full))
+}
+
+func encodePlanes(planes []bspfile.Plane) []byte {
+	b := &bytes.Buffer{}
+	for _, p := range planes {
+		_ = binary.Write(b, binary.LittleEndian, p.Normal[0])
+		_ = binary.Write(b, binary.LittleEndian, p.Normal[1])
+		_ = binary.Write(b, binary.LittleEndian, p.Normal[2])
+		_ = binary.Write(b, binary.LittleEndian, p.Dist)
+		_ = binary.Write(b, binary.LittleEndian, p.Type)
+	}
+	return b.Bytes()
+}
+
+func encodeNodes(nodes []bspfile.Node) []byte {
+	b := &bytes.Buffer{}
+	for _, n := range nodes {
+		_ = binary.Write(b, binary.LittleEndian, n.PlaneNum)
+		_ = binary.Write(b, binary.LittleEndian, n.Children[0])
+		_ = binary.Write(b, binary.LittleEndian, n.Children[1])
+		for j := 0; j < 3; j++ {
+			_ = binary.Write(b, binary.LittleEndian, n.Mins[j])
+		}
+		for j := 0; j < 3; j++ {
+			_ = binary.Write(b, binary.LittleEndian, n.Maxs[j])
+		}
+		_ = binary.Write(b, binary.LittleEndian, n.FirstFace)
+		_ = binary.Write(b, binary.LittleEndian, n.NumFaces)
+	}
+	return b.Bytes()
+}
+
+func encodeLeafs(leafs []bspfile.Leaf) []byte {
+	b := &bytes.Buffer{}
+	for _, l := range leafs {
+		_ = binary.Write(b, binary.LittleEndian, l.Contents)
+		_ = binary.Write(b, binary.LittleEndian, l.VisOfs)
+		for j := 0; j < 3; j++ {
+			_ = binary.Write(b, binary.LittleEndian, l.Mins[j])
+		}
+		for j := 0; j < 3; j++ {
+			_ = binary.Write(b, binary.LittleEndian, l.Maxs[j])
+		}
+		_ = binary.Write(b, binary.LittleEndian, l.FirstMarkSurface)
+		_ = binary.Write(b, binary.LittleEndian, l.NumMarkSurfaces)
+		b.Write(l.AmbientLevel[:])
+	}
+	return b.Bytes()
+}
+
+func encodeClipnodes(cs []bspfile.ClipNode) []byte {
+	b := &bytes.Buffer{}
+	for _, c := range cs {
+		_ = binary.Write(b, binary.LittleEndian, c.PlaneNum)
+		_ = binary.Write(b, binary.LittleEndian, c.Children[0])
+		_ = binary.Write(b, binary.LittleEndian, c.Children[1])
+	}
+	return b.Bytes()
+}
+
+func encodeModels(ms []bspfile.Model) []byte {
+	b := &bytes.Buffer{}
+	for _, m := range ms {
+		for j := 0; j < 3; j++ {
+			_ = binary.Write(b, binary.LittleEndian, m.Mins[j])
+		}
+		for j := 0; j < 3; j++ {
+			_ = binary.Write(b, binary.LittleEndian, m.Maxs[j])
+		}
+		for j := 0; j < 3; j++ {
+			_ = binary.Write(b, binary.LittleEndian, m.Origin[j])
+		}
+		for j := 0; j < bspfile.MaxMapHulls; j++ {
+			_ = binary.Write(b, binary.LittleEndian, m.Headnode[j])
+		}
+		_ = binary.Write(b, binary.LittleEndian, m.VisLeafs)
+		_ = binary.Write(b, binary.LittleEndian, m.FirstFace)
+		_ = binary.Write(b, binary.LittleEndian, m.NumFaces)
+	}
+	return b.Bytes()
+}
+
+// loadPVSWorld builds the 5-leaf tree with the per-leaf PVS rows and
+// returns the resulting *BrushModel.
+func loadPVSWorld(t *testing.T, pvs []pvsLeaf) *BrushModel {
+	t.Helper()
+	data, size := buildBSPWithPVS(t, pvs)
+	f, err := bspfile.Open(bytes.NewReader(data), size)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	bm, err := LoadBrush(f, 0)
+	if err != nil {
+		t.Fatalf("LoadBrush: %v", err)
+	}
+	return bm
+}
+
+// --- NumLeaves / Leaf / Node accessors -----------------------------------
+
+func TestBrushModel_NumLeavesAndAccessors(t *testing.T) {
+	bm := loadPVSWorld(t, []pvsLeaf{
+		{visible: []int{1}},
+		{visible: []int{2}},
+		{visible: []int{3}},
+		{visible: []int{4}},
+		{visible: []int{5}},
+	})
+
+	// 6 raw leaves -> 5 PVS-trackable.
+	if got := bm.NumLeaves(); got != 5 {
+		t.Errorf("NumLeaves: got %d want 5", got)
+	}
+	// Leaf 0 is the outside sentinel (SOLID).
+	if bm.Leaf(0).Contents != bspfile.ContentsSolid {
+		t.Errorf("Leaf(0).Contents: got %d want SOLID", bm.Leaf(0).Contents)
+	}
+	if bm.Leaf(0).ParentNode != -1 {
+		t.Errorf("Leaf(0).ParentNode: got %d want -1 (sentinel unreachable from tree)", bm.Leaf(0).ParentNode)
+	}
+	// Leaf 1..5 are EMPTY.
+	for i := 1; i <= 5; i++ {
+		if bm.Leaf(i).Contents != bspfile.ContentsEmpty {
+			t.Errorf("Leaf(%d).Contents: got %d want EMPTY", i, bm.Leaf(i).Contents)
+		}
+	}
+	// 4 nodes.
+	if bm.Node(0).PlaneNum != 0 {
+		t.Errorf("Node(0).PlaneNum: got %d want 0", bm.Node(0).PlaneNum)
+	}
+	if bm.Node(3).PlaneNum != 3 {
+		t.Errorf("Node(3).PlaneNum: got %d want 3", bm.Node(3).PlaneNum)
+	}
+}
+
+// Empty / 1-leaf models report NumLeaves = 0 (no PVS work).
+func TestBrushModel_NumLeavesEmptyAndSingleton(t *testing.T) {
+	bm := &BrushModel{}
+	if got := bm.NumLeaves(); got != 0 {
+		t.Errorf("empty NumLeaves: got %d want 0", got)
+	}
+	bm.leaves = []Leaf{{}}
+	if got := bm.NumLeaves(); got != 0 {
+		t.Errorf("singleton NumLeaves: got %d want 0", got)
+	}
+}
+
+// --- VisFrame round-trip --------------------------------------------------
+
+func TestBrushModel_VisFrameRoundTrip(t *testing.T) {
+	bm := loadPVSWorld(t, []pvsLeaf{
+		{}, {}, {}, {}, {},
+	})
+
+	bm.SetLeafVisFrame(2, 17)
+	if got := bm.Leaf(2).VisFrame; got != 17 {
+		t.Errorf("SetLeafVisFrame round-trip: leaf 2 VisFrame=%d want 17", got)
+	}
+
+	bm.SetNodeVisFrame(1, 99)
+	if got := bm.GetNodeVisFrame(1); got != 99 {
+		t.Errorf("SetNodeVisFrame/GetNodeVisFrame round-trip: got %d want 99", got)
+	}
+	// Untouched node still 0.
+	if got := bm.GetNodeVisFrame(0); got != 0 {
+		t.Errorf("untouched node 0 VisFrame: got %d want 0", got)
+	}
+}
+
+// --- Parent walk (setParent invoked from LoadBrush) ----------------------
+
+func TestBrushModel_SetParentTreeWalk(t *testing.T) {
+	bm := loadPVSWorld(t, []pvsLeaf{
+		{}, {}, {}, {}, {},
+	})
+
+	// Root is node 0, parent must be -1.
+	if got := bm.NodeParent(0); got != -1 {
+		t.Errorf("root NodeParent: got %d want -1", got)
+	}
+	// Both children of root are nodes 1 and 2; their parent is 0.
+	if got := bm.NodeParent(1); got != 0 {
+		t.Errorf("node 1 parent: got %d want 0", got)
+	}
+	if got := bm.NodeParent(2); got != 0 {
+		t.Errorf("node 2 parent: got %d want 0", got)
+	}
+	// Node 3 hangs off node 2.
+	if got := bm.NodeParent(3); got != 2 {
+		t.Errorf("node 3 parent: got %d want 2", got)
+	}
+	// Leaf parents.
+	if got := bm.LeafParentNode(1); got != 1 {
+		t.Errorf("leaf 1 parent: got %d want 1", got)
+	}
+	if got := bm.LeafParentNode(2); got != 1 {
+		t.Errorf("leaf 2 parent: got %d want 1", got)
+	}
+	if got := bm.LeafParentNode(3); got != 2 {
+		t.Errorf("leaf 3 parent: got %d want 2", got)
+	}
+	if got := bm.LeafParentNode(4); got != 3 {
+		t.Errorf("leaf 4 parent: got %d want 3", got)
+	}
+	if got := bm.LeafParentNode(5); got != 3 {
+		t.Errorf("leaf 5 parent: got %d want 3", got)
+	}
+}
+
+// setParent bails on out-of-range node indices (used by submodel
+// headnodes that reach into the same nodes array with a different
+// root). Construct the case directly so the guard branch is exercised.
+func TestBrushModel_SetParentOutOfRange(t *testing.T) {
+	bm := &BrushModel{
+		nodes:  []Node{{ParentNode: -1}},
+		leaves: []Leaf{{ParentNode: -1}},
+	}
+	// Negative index -- no-op.
+	bm.setParent(-1, 99)
+	if bm.nodes[0].ParentNode != -1 {
+		t.Errorf("nodes[0] mutated by negative setParent: got %d", bm.nodes[0].ParentNode)
+	}
+	// Past-end index -- no-op.
+	bm.setParent(99, 0)
+	if bm.nodes[0].ParentNode != -1 {
+		t.Errorf("nodes[0] mutated by out-of-range setParent: got %d", bm.nodes[0].ParentNode)
+	}
+}
+
+// setParent silently skips child leaf indices outside the leaves
+// slice. Build a node whose ^child decodes to a leaf index past the
+// slice and verify the walk doesn't panic + the in-range leaf is
+// still tagged.
+func TestBrushModel_SetParentSkipsOutOfRangeLeafChild(t *testing.T) {
+	bm := &BrushModel{
+		// One node, child 0 -> leaf 0 (valid), child 1 -> leaf 99 (invalid).
+		nodes:  []Node{{Node: bspfile.Node{Children: [2]int16{^int16(0), ^int16(99)}}, ParentNode: -1}},
+		leaves: []Leaf{{ParentNode: -1}},
+	}
+	bm.setParent(0, -1)
+	if bm.leaves[0].ParentNode != 0 {
+		t.Errorf("leaf 0 parent: got %d want 0", bm.leaves[0].ParentNode)
+	}
+	// No panic == success.
+}
+
+// --- PVSForLeaf -----------------------------------------------------------
+
+func TestBrushModel_PVSForLeaf_HasVisData(t *testing.T) {
+	// Leaf 1's row: leaves 2 and 4 visible (bits 1 and 3 set -> 0x0A).
+	// Leaf 2's row: leaf 5 visible (bit 4 set -> 0x10).
+	bm := loadPVSWorld(t, []pvsLeaf{
+		{visible: []int{2, 4}},
+		{visible: []int{5}},
+		{},
+		{},
+		{},
+	})
+
+	row1 := bm.PVSForLeaf(1)
+	if len(row1) < 1 || row1[0] != 0x0A {
+		t.Errorf("PVSForLeaf(1)[0]: got %#x want 0x0A", row1[0])
+	}
+	row2 := bm.PVSForLeaf(2)
+	if len(row2) < 1 || row2[0] != 0x10 {
+		t.Errorf("PVSForLeaf(2)[0]: got %#x want 0x10", row2[0])
+	}
+}
+
+func TestBrushModel_PVSForLeaf_NoVisInfoReturnsAllVisible(t *testing.T) {
+	// Reach the "all 0xFF" branch: rebuild the model and poison the
+	// leaf 1 VisOfs to -1 directly (after LoadBrush has already
+	// decoded it).
+	bm := loadPVSWorld(t, []pvsLeaf{
+		{visible: []int{1}}, {}, {}, {}, {},
+	})
+	bm.leaves[1].VisOfs = -1
+
+	row := bm.PVSForLeaf(1)
+	wantLen := (bm.NumLeaves() + 7) / 8
+	if len(row) != wantLen {
+		t.Fatalf("PVSForLeaf no-vis row len: got %d want %d", len(row), wantLen)
+	}
+	for i, b := range row {
+		if b != 0xFF {
+			t.Errorf("PVSForLeaf no-vis byte %d: got %#x want 0xFF", i, b)
+		}
+	}
+}
+
+func TestBrushModel_PVSForLeaf_OutOfRange(t *testing.T) {
+	bm := loadPVSWorld(t, []pvsLeaf{
+		{visible: []int{1}}, {}, {}, {}, {},
+	})
+	if bm.PVSForLeaf(0) != nil {
+		t.Error("PVSForLeaf(0): want nil")
+	}
+	if bm.PVSForLeaf(99) != nil {
+		t.Error("PVSForLeaf(99): want nil")
+	}
+}
+
+// Also exercise the "VisOfs >= len(visdata)" branch (treated as
+// "missing vis" -> all visible).
+func TestBrushModel_PVSForLeaf_VisOfsPastEnd(t *testing.T) {
+	bm := loadPVSWorld(t, []pvsLeaf{
+		{visible: []int{1}}, {}, {}, {}, {},
+	})
+	bm.leaves[1].VisOfs = int32(len(bm.File.Visibility()) + 100)
+	row := bm.PVSForLeaf(1)
+	if len(row) == 0 {
+		t.Fatal("expected an all-visible row, got empty")
+	}
+	for _, b := range row {
+		if b != 0xFF {
+			t.Errorf("expected 0xFF byte, got %#x", b)
+		}
+	}
+}

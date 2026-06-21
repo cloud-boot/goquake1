@@ -39,9 +39,19 @@ var BrushHullSizes = [bspfile.MaxMapHulls]HullSize{
 // BrushModel is a loaded BSP brushmodel: the source [bspfile.File]
 // plus the 4 [bsptrace.Hull] values the collision walker traces
 // against. tyrquake: brushmodel_t.
+//
+// Beyond the raw [bspfile] data, BrushModel keeps decoded wrappers
+// around the leaf + node arrays ([Leaf], [Node]) that add the two
+// runtime fields the renderer's per-frame PVS walk needs (VisFrame +
+// ParentNode). Access them via the [BrushModel.Leaf], [BrushModel.Node],
+// and matching VisFrame / ParentNode accessors; the
+// [github.com/go-quake1/engine/bsprender] package consumes those via
+// the MarkContext closures returned by its NewMarkContext helper.
 type BrushModel struct {
-	File  *bspfile.File
-	Hulls [bspfile.MaxMapHulls]bsptrace.Hull
+	File   *bspfile.File
+	Hulls  [bspfile.MaxMapHulls]bsptrace.Hull
+	leaves []Leaf // index 0 is the outside-the-map sentinel
+	nodes  []Node
 }
 
 // LoadBrush builds a BrushModel for the given submodel index of
@@ -89,6 +99,23 @@ func LoadBrush(file *bspfile.File, submodelIdx int) (*BrushModel, error) {
 	headnode := &models[submodelIdx].Headnode
 
 	bm := &BrushModel{File: file}
+	// Build the leaf + node wrappers the renderer's PVS walk writes
+	// through. Initialise ParentNode = -1 everywhere; setParent below
+	// overwrites the real values for nodes reachable from the root.
+	// Leaves unreachable from the root (the outside-the-map sentinel
+	// in particular) keep ParentNode = -1.
+	bm.leaves = make([]Leaf, len(leafs))
+	for i := range leafs {
+		bm.leaves[i] = Leaf{Leaf: leafs[i], ParentNode: -1}
+	}
+	bm.nodes = make([]Node, len(nodes))
+	for i := range nodes {
+		bm.nodes[i] = Node{Node: nodes[i], ParentNode: -1}
+	}
+	if len(bm.nodes) > 0 {
+		bm.setParent(0, -1)
+	}
+
 	bm.Hulls[0] = bsptrace.Hull{
 		ClipNodes:     hull0Clipnodes,
 		Planes:        planes,
