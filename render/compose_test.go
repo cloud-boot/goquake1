@@ -204,3 +204,28 @@ func TestExpandFrame_DstTooSmall(t *testing.T) {
 		t.Fatalf("err = %v want ErrFBDstTooSmall", err)
 	}
 }
+
+// TestCompose2D_SkipBackgroundFill verifies the SkipBackgroundFill
+// flag suppresses Compose2D's DrawFill so pre-existing pixels (the
+// 3D scene a Pre2DDraw hook just rasterized) survive into the
+// composed frame.
+func TestCompose2D_SkipBackgroundFill(t *testing.T) {
+	fb, ctx := newComposeCtx(t)
+	// Pre-fill the framebuffer with a sentinel value (0x42) that
+	// is NOT the BackgroundIdx (0x99). With SkipBackgroundFill the
+	// sentinel must survive the Compose2D call.
+	for i := range fb.Pixels {
+		fb.Pixels[i] = 0x42
+	}
+	ctx.SkipBackgroundFill = true
+	if err := Compose2D(fb, ctx); err != nil {
+		t.Fatalf("Compose2D: %v", err)
+	}
+	// Console is closed + notify is empty -> every pixel should
+	// still be the pre-filled sentinel (no background fill ran).
+	for i, p := range fb.Pixels {
+		if p != 0x42 {
+			t.Fatalf("pixel[%d] = %#x want sentinel 0x42 (SkipBackgroundFill should suppress DrawFill)", i, p)
+		}
+	}
+}

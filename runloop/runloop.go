@@ -61,6 +61,14 @@ type Runner struct {
 	Speeds     client.InputSpeeds
 	ViewAngles [3]float32
 
+	// ViewOrigin is the camera position the Pre2DDraw hook reads
+	// when rasterizing the 3D scene. The runner does NOT update
+	// this itself (full server-edict-to-client-state wiring is a
+	// follow-up); callers set it once at startup (e.g. from a
+	// pickInMapCamera() lattice probe) and may adjust it per-tic
+	// if they wire up player-follow logic out-of-band.
+	ViewOrigin [3]float32
+
 	// Working buffers (long-lived; reused per frame).
 	RGBA      []byte               // size = fb.Width * fb.Height * 4
 	MixBuffer []sound.StereoSample // size = sound.MixBufferStereoFrames
@@ -69,6 +77,25 @@ type Runner struct {
 	BackgroundIdx  byte    // palette fill for Compose2D
 	NotifyLifetime float32 // seconds a notify row stays visible
 	MaxNotifyRows  int     // upper bound on the notify overlay row count
+
+	// Pre2DDraw is an optional hook the runner invokes between the
+	// client tick and the 2D Compose. The closure owns the 3D
+	// rasterization (BSP walk, surface emission, FillTexturedPolygon
+	// per face); on return fb holds the rendered scene, which
+	// Compose2D then overlays its 2D layers on top of.
+	//
+	// Signature: (fb, viewOrigin, viewAngles) -> error. viewOrigin
+	// is the (x, y, z) world-space camera position; viewAngles is
+	// (pitch, yaw, roll) in DEGREES, matching render.RefDef.
+	//
+	// When non-nil the runner also asks Compose2D to skip its
+	// background clear (FrameContext.SkipBackgroundFill = true) so
+	// the pre-drawn scene isn't overwritten. When nil the previous
+	// 2D-only behaviour is preserved verbatim.
+	//
+	// Errors propagate from RunFrame verbatim (the present /
+	// audio steps are skipped for that tic).
+	Pre2DDraw func(fb *render.FrameBuffer, viewOrigin [3]float32, viewAngles [3]float32) error
 }
 
 // Sentinel errors returned by [Runner.RunFrame] before any work runs.
@@ -90,11 +117,14 @@ var (
 //  3. host.Frame(dt)                    (server-side tick)
 //  4. client.Tick(...)                  (client-side: drain inbound,
 //     send clc_move; updates r.ViewAngles)
-//  5. render.Compose2D(fb, ...)         (2D frame -- console + notify)
-//  6. fb.Expand(r.RGBA, palette)        (palette -> RGBA)
-//  7. Backend.PresentFrame(r.RGBA, ...) (display)
-//  8. sound.Paint(pool, r.MixBuffer, n) (mix audio)
-//  9. Backend.QueueAudio(r.MixBuffer[:n])
+//  5. r.Pre2DDraw(fb, viewOrigin,       (optional 3D pass; skipped
+//     viewAngles)                        when nil)
+//  6. render.Compose2D(fb, ...)         (2D frame -- console + notify;
+//     SkipBackgroundFill when Pre2DDraw is set so the 3D pixels survive)
+//  7. fb.Expand(r.RGBA, palette)        (palette -> RGBA)
+//  8. Backend.PresentFrame(r.RGBA, ...) (display)
+//  9. sound.Paint(pool, r.MixBuffer, n) (mix audio)
+//  10. Backend.QueueAudio(r.MixBuffer[:n])
 //
 // dt is the frame delta in seconds (from Backend.Now() differences;
 // caller passes the result). nowSec is the wall-clock-like time the
@@ -167,16 +197,33 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		r.ViewAngles = out.ViewAngles
 	}
 
-	// 5+6) Render the 2D frame + expand to RGBA in one call.
+	// 5) Optional 3D pass. The closure owns the BSP walk +
+	//    rasterization; on return r.FrameBuffer holds the rendered
+	//    scene that Compose2D overlays its 2D layers on top of.
+	//    When nil the previous 2D-only behaviour is preserved.
+	//
+	//    ViewOrigin is the camera position the BSP path needs;
+	//    ViewAngles is the (pitch, yaw, roll) the client tick
+	//    has just refreshed from mouse + arrow-key input.
+	if r.Pre2DDraw != nil {
+		if err := r.Pre2DDraw(r.FrameBuffer, r.ViewOrigin, r.ViewAngles); err != nil {
+			return err
+		}
+	}
+
+	// 6+7) Render the 2D frame + expand to RGBA in one call. When
+	//      Pre2DDraw is set we skip Compose2D's background clear so
+	//      the 3D pixels under the console/notify overlay survive.
 	ctx := render.FrameContext{
-		Screen:         r.Screen,
-		Console:        r.Console,
-		Chars:          r.Chars,
-		Palette:        r.Palette,
-		Now:            nowSec,
-		NotifyLifetime: r.NotifyLifetime,
-		MaxNotifyRows:  r.MaxNotifyRows,
-		BackgroundIdx:  r.BackgroundIdx,
+		Screen:             r.Screen,
+		Console:            r.Console,
+		Chars:              r.Chars,
+		Palette:            r.Palette,
+		Now:                nowSec,
+		NotifyLifetime:     r.NotifyLifetime,
+		MaxNotifyRows:      r.MaxNotifyRows,
+		BackgroundIdx:      r.BackgroundIdx,
+		SkipBackgroundFill: r.Pre2DDraw != nil,
 	}
 	if err := render.ExpandFrame(r.FrameBuffer, r.RGBA, ctx); err != nil {
 		return err

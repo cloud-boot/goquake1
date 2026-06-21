@@ -5,8 +5,10 @@
 // quake-tamago is the bare-metal Quake-on-TamaGo entry point. It boots
 // in QEMU as a `-kernel` ELF, probes the virtio PCI bus for gpu / input /
 // sound devices, wires them through backend/virtio/realdev into the
-// engine's backend.Backend contract, and drives a per-frame demo loop
-// alongside the real id-Software game-server tick (host.Host.Frame).
+// engine's backend.Backend contract, and drives the runloop end-to-end:
+// virtio-input -> client.Tick (clc_move) -> host.Frame (SV_Physics) ->
+// Pre2DDraw (BSP walk + rasterize) -> Compose2D (console + notify) ->
+// virtio-gpu PresentFrame, all from a single runloop.Runner.RunUntilQuit.
 //
 // First-bring-up scope:
 //
@@ -19,11 +21,10 @@
 //     non-placeholder pak: progs.Load + progs.NewVM + model.NewCache +
 //     a pak-backed FileResolver + host.NewHost(..., 1 client). The
 //     host's SpawnServer loads "maps/start.bsp", parses entities,
-//     populates the edict pool. Per-frame the demo loop calls
+//     populates the edict pool. Per-tic the runloop calls
 //     host.Frame(dt) -- this drives SV_Physics + SendClientFrames over
-//     a 20Hz tic. The runloop.Runner is built with stubHost{} because
-//     runDemo3D bypasses RunFrame; calling host.Frame inline keeps the
-//     server tick on the rendering thread for now.
+//     a 20Hz tic. The runner's Host field is wired to the real host
+//     (no more stub bypass); RunUntilQuit drives the full pipeline.
 //
 //   - On the placeholder-pak path (no real pak0 present) the engine
 //     falls back to the stubHost no-op + synthbsp rendering, matching
@@ -33,6 +34,12 @@
 //   - Input + sound are best-effort. If virtio-input or virtio-snd are
 //     absent from the QEMU command line the engine falls back to a
 //     no-input / silent backend rather than panicking.
+//
+//   - Camera position stays anchored at pickInMapCamera's lattice probe
+//     for first bring-up: full player-follow needs the server-edict
+//     -> client.State.ViewOrigin wiring (separate batch). Camera angles
+//     ARE driven by virtio-input via client.Tick (the WASD + mouse +
+//     jump bindings already in UpdateButtonsFromSnapshot).
 //
 // Rationale (project-driver quote): "on a fait les pilote virtio pour
 // eprouver tamago" — the go-virtio drivers exist so this binary can
@@ -207,16 +214,21 @@ func run() error {
 	//    batch that wires the client tick).
 	cli, _ := engineserver.NewLoopbackConn()
 
-	// 9. Construct the Runner via NewRunnerFromVFS. NOTE: runDemo3D is
-	//    still the render driver (RunUntilQuit waits on the client
-	//    tick); the runner is built so Console / Screen / Palette are
-	//    ready when the client tick lands. The runner's Host field is
-	//    only read by RunFrame, which runDemo3D bypasses -- so passing
-	//    stubHost there is safe even when realHost is non-nil. The
-	//    real host's Frame is driven inline by runDemo3D below.
+	// 9. Pick the HostFramer the runner drives per-tic. When the real
+	//    host built successfully it goes straight in; otherwise the
+	//    stub keeps RunFrame's host.Frame call infallible.
+	var hostFramer runloop.HostFramer = stubHost{}
+	if realHost != nil {
+		hostFramer = realHost
+	}
+
+	// 10. Construct the Runner via NewRunnerFromVFS. The runner now
+	//     drives the FULL per-tic sequence (PollInput -> client.Tick
+	//     -> host.Frame -> Pre2DDraw -> Compose2D -> PresentFrame);
+	//     the renderer setup below wires its Pre2DDraw hook.
 	runner, err := runloop.NewRunnerFromVFS(runloop.SetupOpts{
 		VFS:            v,
-		Host:           stubHost{},
+		Host:           hostFramer,
 		Client:         client.NewState(),
 		Conn:           cli,
 		Backend:        be,
@@ -228,122 +240,45 @@ func run() error {
 		return fmt.Errorf("NewRunnerFromVFS: %w", err)
 	}
 
-	// 10. Print something visible into the console so the rendered
+	// 11. Print something visible into the console so the rendered
 	//     frame is not blank. Drop the console fully open so the lines
 	//     are visible from frame 0 (otherwise ConCurrent=0 keeps the
 	//     drop-down closed and the synthetic conchars sheet has nothing
 	//     to draw against).
 	runner.Console.Print("PURE-GO QUAKE 1 -- TamaGo + go-virtio bring-up\n")
-	runner.Console.Print("framebuffer wired; per-tick Compose2D + Flush\n")
+	runner.Console.Print("runloop wired: input -> client.Tick -> host.Frame -> Pre2DDraw\n")
 	runner.Screen.ConCurrent = runner.Screen.ConLines
 
-	// 11. Drive a 3D demo loop instead of the (still-empty) RunUntilQuit
-	//     path. Renders a rotating BSP camera + presents each frame
-	//     through the virtio-gpu Framebuffer.Flush. When realHost is
-	//     non-nil it ALSO advances the server simulation each frame
-	//     (host.Frame); when nil the per-frame loop is renderer-only.
-	fmt.Printf("QUAKE: entering demo3D loop (realHost=%v)\n", realHost != nil)
-	return runDemo3D(runner.FrameBuffer, runner.RGBA, runner.Palette, be, realHost, pakFS)
+	// 12. Build the Pre2DDraw hook (BSP load, mark/walk contexts,
+	//     synthetic texture, identity colormap) + anchor the camera
+	//     origin at pickInMapCamera. The closure is wired onto the
+	//     runner; RunUntilQuit then drives the full pipeline.
+	if err := setupRenderer(runner, pakFS); err != nil {
+		return fmt.Errorf("setupRenderer: %w", err)
+	}
+
+	fmt.Printf("QUAKE: entering RunUntilQuit (realHost=%v)\n", realHost != nil)
+	return runner.RunUntilQuit()
 }
 
-// buildHost wires the embedded pak0 into a fully constructed
-// host.Host: progs.Load -> progs.NewVM -> model.NewCache -> pak-backed
-// FileResolver -> host.NewHost(maxClients=1) -> host.SpawnServer(map).
+// setupRenderer loads the BSP, builds the mark/walk contexts +
+// synthetic texture + identity colormap, anchors the camera origin,
+// and installs runner.Pre2DDraw as a closure that rasterizes one
+// frame of the visible BSP for each call.
 //
-// Returns the SpawnServer'd host on success; any failure (missing
-// progs.dat, malformed BSP, entity-parse error) is propagated to the
-// caller, which falls back to the stubHost.
+// Per-frame culling (real vs synth BSP) and the camera anchor logic
+// mirror the legacy runDemo3D this replaces; the difference is that
+// the runner drives the call instead of an inline forever-loop, so
+// host.Frame + client.Tick + Compose2D + PresentFrame are all wired
+// into the same per-tic schedule.
 //
-// mapSlug is the bare map name ("start", "e1m1") -- SpawnServer
-// expands it to "maps/<slug>.bsp" internally via MapBSPPath.
-func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
-	// 1. progs.dat -> VM. Quake's bytecode lives at the top of the pak
-	//    under "progs.dat"; failures here mean the pak is malformed
-	//    (id Software's shareware ships it; community paks may not).
-	progsBytes, ok := tryReadPakFile(pakFS, "progs.dat")
-	if !ok {
-		return nil, fmt.Errorf("buildHost: progs.dat missing from pak")
-	}
-	p, err := progs.Load(bytes.NewReader(progsBytes), int64(len(progsBytes)))
-	if err != nil {
-		return nil, fmt.Errorf("buildHost: progs.Load: %w", err)
-	}
-	vm := progs.NewVM(p)
-	fmt.Printf("QUAKE: progs.dat loaded -- %d bytes, %d functions, %d global defs\n",
-		len(progsBytes), len(p.Functions), len(p.GlobalDefs))
-
-	// 2. Model cache + pak-backed FileResolver. The resolver fetches
-	//    bytes by name out of the embedded pak so SpawnServer's
-	//    LoadModelByName worldmodel-load sees the real BSP. Submodels
-	//    are reused from the same File without re-resolving.
-	cache := model.NewCache()
-	resolver := func(name string) (int64, io.ReaderAt, error) {
-		data, ok := tryReadPakFile(pakFS, name)
-		if !ok {
-			return 0, nil, fmt.Errorf("pak: %s missing", name)
-		}
-		return int64(len(data)), bytes.NewReader(data), nil
-	}
-
-	// 3. Host. maxClients=1 = the local-player loop. NewHost
-	//    pre-allocates the Server + Static + World pools; SetProgs
-	//    binds the bytecode the per-tic dispatcher consults for
-	//    named-global hand-off.
-	h, err := enginehost.NewHost(vm, cache, resolver, 1)
-	if err != nil {
-		return nil, fmt.Errorf("buildHost: NewHost: %w", err)
-	}
-	h.SetProgs(p)
-
-	// 4. SpawnServer. Loads the BSP, builds the area tree, parses the
-	//    entities lump, populates the edict pool. The default
-	//    no-op interner stores every string field as offset 0 (the
-	//    empty-string sentinel) -- field structure is preserved; only
-	//    the human-readable string payload is dropped. Good enough to
-	//    drive SV_Physics + measure tic advance.
-	if err := h.SpawnServer(mapSlug, protocol.VersionNQ); err != nil {
-		return nil, fmt.Errorf("buildHost: SpawnServer(%q): %w", mapSlug, err)
-	}
-	return h, nil
-}
-
-// runDemo3D renders a BSP via the full engine pipeline:
-// (embedpak | synthbsp) -> bspfile.Open -> model.LoadBrush ->
-// bsprender.NewWalkContext + WalkWorld -> bsprender.TransformFace ->
-// render.FillTexturedPolygon -> virtio-gpu Flush. Loops forever (the
-// bare-metal binary has no clean exit path).
-//
-// BSP source selection (one-time, at startup):
-//
-//   - Try embedpak.OpenAsFS(). When the operator has dropped a real
-//     pak0.pak into embedpak/empty.pak, the shareware archive is
-//     available and we open "maps/start.bsp" (or "maps/e1m1.bsp" as a
-//     fallback) out of it.
-//   - When the placeholder is still in place (ErrEmbedPakEmpty) OR
-//     neither canonical map is present, fall back to
-//     synthbsp.BuildWithFaces(): the always-available synthetic BSP
-//     that lets the rasterizer path stay exercised without any real
-//     id-Software assets.
-//
-// Per-frame culling strategy:
-//
-//   - Real BSP (LumpMarksurfaces non-empty): use the canonical PVS
-//     walk. PointInLeaf finds the viewer's leaf, MarkVisibleLeaves
-//     stamps just the leaves in that leaf's PVS row (+ their parent
-//     chains), and WalkWorld emits only those leaves' marksurfaces.
-//     start.bsp has ~1865 leaves / 6187 faces; PVS culling typically
-//     drops per-frame face emission to ~50-200 (vs 6187 with the
-//     "stamp everything" hack, which trips a tamago OOM during the
-//     SurfaceList growslice).
-//
-//   - Synthetic BSP (BuildWithFaces, no marksurfaces lump): keep the
-//     "stamp every leaf + emit all faces from the one drawable leaf"
-//     demo path. PointInLeaf would return the EMPTY leaf at index 0
-//     (no outside sentinel in that fixture), which the spec-PVS path
-//     would treat as "outside the map" and skip rendering -- not what
-//     the synthbsp demo wants. The synth detection (zero-length
-//     marksurfaces lump) routes around this.
-func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be *virtio.Backend, host *enginehost.Host, pakFS fs.FS) error {
+// SIMPLIFICATION: the camera ViewOrigin is set ONCE at startup
+// (lattice-probed in-map point + ViewHeightOffset offset; the offset
+// is read on each tic from the client state). The viewer does NOT
+// follow the player edict yet -- that needs the server-edict ->
+// client.State.ViewOrigin wiring (separate batch). Camera angles ARE
+// driven per-tic via client.Tick -> r.ViewAngles (mouse + WASD).
+func setupRenderer(runner *runloop.Runner, pakFS fs.FS) error {
 	// 1. Source the BSP bytes: real pak0.pak first, synthbsp fallback.
 	bspBytes, size, err := loadBSP(pakFS)
 	if err != nil {
@@ -420,59 +355,48 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 		}
 	}
 
-	// 5. Camera setup. For the synthbsp the face verts live at
-	//    (0,0,0), (10,0,0), (0,10,0) on the Z=0 plane -- camera at
-	//    (5, 5, +20) pitched 90 degrees down keeps the triangle
-	//    dead-ahead at depth 20 (>= ParticleNearClip = 16). Yaw spins
-	//    the view to animate.
-	//
-	//    For a real BSP the (5, 5, 20) point is almost certainly
-	//    outside any leaf -- PointInLeaf returns leaf 0 (outside
-	//    sentinel) and rendering is skipped. To land the camera inside
-	//    the map we walk a small spiral of candidate points around the
-	//    world model's bbox centre until PointInLeaf returns a non-zero
-	//    leaf; that point becomes the viewpoint.
+	// 5. Camera anchor. Synthbsp wants (5,5,20) so the triangle on
+	//    Z=0 stays in front of the camera; real BSP wants an in-map
+	//    point so PointInLeaf returns a non-zero leaf.
 	const fovX = 90.0
 	camOrigin := [3]float32{5, 5, 20}
 	if !isSynth {
 		camOrigin = pickInMapCamera(bm, file)
 		fmt.Printf("QUAKE: camera origin %v\n", camOrigin)
 	}
+	runner.ViewOrigin = camOrigin
+
 	markCtx := bsprender.NewMarkContext(bm)
 	var surfaces bsprender.SurfaceList
+	frameCount := 0
 
-	for frame := 0; ; frame++ {
-		// Server-side tick: run one SV_Physics + SendClientFrames pass
-		// per rendered frame. dt = DefaultFrameTime (0.05s, 20Hz) --
-		// the same delta NewHost initialises with, so the bytecode
-		// interpreter's RunThink deadlines line up with the C upstream
-		// at the canonical sys_ticrate. Errors short-circuit the loop
-		// (returning surfaces the failure on the serial log + halts
-		// the binary via main's halt()).
-		if host != nil {
-			if herr := host.Frame(enginehost.DefaultFrameTime); herr != nil {
-				return fmt.Errorf("host.Frame frame=%d: %w", frame, herr)
-			}
-			if frame%60 == 0 {
-				fmt.Printf("QUAKE: tic %d -- sv.time=%.3f numEdicts=%d\n",
-					frame, host.Server.Time, host.Server.NumEdicts)
-			}
-		}
+	// 6. Pre2DDraw closure. Runs per-tic from RunFrame BEFORE the 2D
+	//    Compose; viewAngles is the (pitch, yaw, roll) the client tick
+	//    has just refreshed from mouse + arrow keys. viewOrigin is the
+	//    runner's anchor; we offset it by client.State.ViewHeightOffset
+	//    so jumping/crouching still nudges the camera.
+	runner.Pre2DDraw = func(fb *render.FrameBuffer, viewOrigin, viewAngles [3]float32) error {
+		frame := frameCount
+		frameCount++
 
-		// Clear to sky background (palette idx 0x10).
+		// Clear to sky background (palette idx 0x10). Compose2D is
+		// told to SkipBackgroundFill (via the Runner.Pre2DDraw != nil
+		// branch in RunFrame), so the 3D pixels we write here survive
+		// past the 2D overlay.
 		for i := range fb.Pixels {
 			fb.Pixels[i] = 0x10
 		}
 
-		// Camera at the in-map anchor; pitch 0 = horizon, yaw spins
-		// 1°/frame to make a panoramic shot of the room walls. The
-		// prior pitch=90 made the camera stare straight at the floor,
-		// which is why early screendumps captured a uniform polygon.
-		yawDeg := float32(frame) * 1.0
+		// Bias the anchor by the client's view-height offset (the
+		// vertical bob/crouch nudge). Full player-follow is a
+		// follow-up wiring batch.
+		origin := viewOrigin
+		origin[2] += runner.Client.ViewHeightOffset
+
 		rd := &render.RefDef{
 			VRect:      render.VRect{Width: fb.Width, Height: fb.Height},
-			ViewAngles: [3]float32{0, yawDeg, 0},
-			ViewOrigin: camOrigin,
+			ViewAngles: viewAngles,
+			ViewOrigin: origin,
 			FovX:       fovX,
 			FovY:       fovX,
 		}
@@ -492,8 +416,7 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 		} else {
 			// Real BSP: locate the viewer's leaf, then stamp only the
 			// PVS-visible leaves + their parent chains. Out-of-map
-			// viewer (PointInLeaf returns <= 0) -> nothing to draw;
-			// present the cleared background and move on.
+			// viewer (PointInLeaf returns <= 0) -> nothing to draw.
 			viewerLeaf := bm.PointInLeaf(rd.ViewOrigin)
 			if viewerLeaf > 0 {
 				if err := bsprender.MarkVisibleLeaves(markCtx,
@@ -503,9 +426,7 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 					return fmt.Errorf("MarkVisibleLeaves: %w", err)
 				}
 			} else {
-				_ = fb.Expand(rgba, palette)
-				_ = be.PresentFrame(rgba, fb.Width, fb.Height)
-				continue
+				return nil
 			}
 		}
 
@@ -518,7 +439,8 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 		// serial log surfaces PVS culling effectiveness without
 		// drowning the channel.
 		if frame%60 == 0 {
-			fmt.Printf("QUAKE: frame %d -- %d surfaces emitted\n", frame, surfaces.Len())
+			fmt.Printf("QUAKE: tic %d -- sv.time-driven; %d surfaces emitted\n",
+				frame, surfaces.Len())
 		}
 
 		// Rasterize each visible face via TransformFace + FillTexturedPolygon.
@@ -534,16 +456,70 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 			}
 			_ = render.FillTexturedPolygon(fb, tex, &cm, 0, verts)
 		}
-
-		// Per-frame runtime.GC() is no longer needed: bspfile.File
-		// now caches the decoded Vertexes / Edges / Surfedges /
-		// TexInfos / Textures lumps on first call, so
-		// NewBrushFaceVerts allocates nothing per face on the hot
-		// path. The 2 GB micro-VM stays well below the heap ceiling.
-
-		_ = fb.Expand(rgba, palette)
-		_ = be.PresentFrame(rgba, fb.Width, fb.Height)
+		return nil
 	}
+	return nil
+}
+
+// buildHost wires the embedded pak0 into a fully constructed
+// host.Host: progs.Load -> progs.NewVM -> model.NewCache -> pak-backed
+// FileResolver -> host.NewHost(maxClients=1) -> host.SpawnServer(map).
+//
+// Returns the SpawnServer'd host on success; any failure (missing
+// progs.dat, malformed BSP, entity-parse error) is propagated to the
+// caller, which falls back to the stubHost.
+//
+// mapSlug is the bare map name ("start", "e1m1") -- SpawnServer
+// expands it to "maps/<slug>.bsp" internally via MapBSPPath.
+func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
+	// 1. progs.dat -> VM. Quake's bytecode lives at the top of the pak
+	//    under "progs.dat"; failures here mean the pak is malformed
+	//    (id Software's shareware ships it; community paks may not).
+	progsBytes, ok := tryReadPakFile(pakFS, "progs.dat")
+	if !ok {
+		return nil, fmt.Errorf("buildHost: progs.dat missing from pak")
+	}
+	p, err := progs.Load(bytes.NewReader(progsBytes), int64(len(progsBytes)))
+	if err != nil {
+		return nil, fmt.Errorf("buildHost: progs.Load: %w", err)
+	}
+	vm := progs.NewVM(p)
+	fmt.Printf("QUAKE: progs.dat loaded -- %d bytes, %d functions, %d global defs\n",
+		len(progsBytes), len(p.Functions), len(p.GlobalDefs))
+
+	// 2. Model cache + pak-backed FileResolver. The resolver fetches
+	//    bytes by name out of the embedded pak so SpawnServer's
+	//    LoadModelByName worldmodel-load sees the real BSP. Submodels
+	//    are reused from the same File without re-resolving.
+	cache := model.NewCache()
+	resolver := func(name string) (int64, io.ReaderAt, error) {
+		data, ok := tryReadPakFile(pakFS, name)
+		if !ok {
+			return 0, nil, fmt.Errorf("pak: %s missing", name)
+		}
+		return int64(len(data)), bytes.NewReader(data), nil
+	}
+
+	// 3. Host. maxClients=1 = the local-player loop. NewHost
+	//    pre-allocates the Server + Static + World pools; SetProgs
+	//    binds the bytecode the per-tic dispatcher consults for
+	//    named-global hand-off.
+	h, err := enginehost.NewHost(vm, cache, resolver, 1)
+	if err != nil {
+		return nil, fmt.Errorf("buildHost: NewHost: %w", err)
+	}
+	h.SetProgs(p)
+
+	// 4. SpawnServer. Loads the BSP, builds the area tree, parses the
+	//    entities lump, populates the edict pool. The default
+	//    no-op interner stores every string field as offset 0 (the
+	//    empty-string sentinel) -- field structure is preserved; only
+	//    the human-readable string payload is dropped. Good enough to
+	//    drive SV_Physics + measure tic advance.
+	if err := h.SpawnServer(mapSlug, protocol.VersionNQ); err != nil {
+		return nil, fmt.Errorf("buildHost: SpawnServer(%q): %w", mapSlug, err)
+	}
+	return h, nil
 }
 
 // pickInMapCamera returns a viewpoint that lands inside a valid leaf

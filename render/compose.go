@@ -21,16 +21,24 @@ import "errors"
 // background fill + Con_DrawConsole + Con_DrawNotify calls, minus
 // the 3D world view + Sbar_Draw + menu/HUD layers.
 type FrameContext struct {
-	Screen   *Screen
-	Console  *Console
-	Chars    *Pic
-	Palette  *Palette
+	Screen  *Screen
+	Console *Console
+	Chars   *Pic
+	Palette *Palette
 
 	Now            float32 // wall-clock-like time for the notify overlay
 	NotifyLifetime float32 // seconds a notify row stays visible
 	MaxNotifyRows  int     // upper bound on the overlay row count
 
 	BackgroundIdx byte // palette index for the framebuffer fill
+
+	// SkipBackgroundFill suppresses the per-frame DrawFill that
+	// clears the framebuffer to BackgroundIdx. Set when the caller
+	// has already rasterized a 3D scene into fb (via a Runner
+	// Pre2DDraw hook or equivalent) and Compose2D's job is to
+	// overlay the 2D layers (console + notify) on top WITHOUT
+	// wiping the 3D pixels first.
+	SkipBackgroundFill bool
 }
 
 var (
@@ -42,7 +50,8 @@ var (
 
 // Compose2D paints one full 2D frame into fb:
 //
-//  1. DrawFill the whole framebuffer to ctx.BackgroundIdx.
+//  1. DrawFill the whole framebuffer to ctx.BackgroundIdx (skipped
+//     when ctx.SkipBackgroundFill is true).
 //  2. If the console is open (Screen.ConCurrent > 0): DrawConsole.
 //  3. DrawNotify the recent-rows overlay.
 //
@@ -73,8 +82,11 @@ func Compose2D(fb *FrameBuffer, ctx FrameContext) error {
 	}
 
 	// DrawFill's only error path is nil-fb, already caught above;
-	// the call is infallible here.
-	_ = DrawFill(fb, 0, 0, fb.Width, fb.Height, ctx.BackgroundIdx)
+	// the call is infallible here. Skipped when the caller has
+	// pre-drawn a 3D scene into fb.
+	if !ctx.SkipBackgroundFill {
+		_ = DrawFill(fb, 0, 0, fb.Width, fb.Height, ctx.BackgroundIdx)
+	}
 
 	if ctx.Screen.ConCurrent > 0 {
 		if err := ctx.Screen.DrawConsole(fb, ctx.Console, ctx.Chars); err != nil {

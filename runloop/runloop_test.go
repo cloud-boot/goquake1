@@ -518,6 +518,75 @@ func TestUpdateButtonsFromSnapshot_UpReleasesAllMappedKeys(t *testing.T) {
 	}
 }
 
+// ----- Pre2DDraw hook -----------------------------------------------
+
+// TestRunFrame_Pre2DDrawInvoked verifies the optional Pre2DDraw hook
+// is invoked between client.Tick and Compose2D, receives the
+// runner's ViewOrigin + ViewAngles, and the pre-drawn pixels survive
+// the 2D Compose (SkipBackgroundFill is wired through). Also asserts
+// the runner's frame still presents successfully.
+func TestRunFrame_Pre2DDrawInvoked(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	r, _ := newRunner(t, rec)
+	r.ViewOrigin = [3]float32{1, 2, 3}
+	r.ViewAngles = [3]float32{10, 20, 30}
+
+	var gotFB *render.FrameBuffer
+	var gotOrigin, gotAngles [3]float32
+	called := 0
+	r.Pre2DDraw = func(fb *render.FrameBuffer, origin [3]float32, angles [3]float32) error {
+		called++
+		gotFB = fb
+		gotOrigin = origin
+		gotAngles = angles
+		// Stamp a sentinel pixel that Compose2D must NOT overwrite
+		// (SkipBackgroundFill should be true when the hook is set).
+		fb.Pixels[0] = 0x7F
+		return nil
+	}
+
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("Pre2DDraw calls = %d want 1", called)
+	}
+	if gotFB != r.FrameBuffer {
+		t.Fatalf("Pre2DDraw fb = %p want %p", gotFB, r.FrameBuffer)
+	}
+	if gotOrigin != r.ViewOrigin {
+		t.Fatalf("Pre2DDraw origin = %v want %v", gotOrigin, r.ViewOrigin)
+	}
+	if gotAngles != r.ViewAngles {
+		t.Fatalf("Pre2DDraw angles = %v want %v", gotAngles, r.ViewAngles)
+	}
+	// The sentinel pixel must survive Compose2D (SkipBackgroundFill).
+	if r.FrameBuffer.Pixels[0] != 0x7F {
+		t.Fatalf("Pre2DDraw sentinel pixel = %#x want 0x7F (Compose2D should skip background fill)",
+			r.FrameBuffer.Pixels[0])
+	}
+	if len(rec.Frames) != 1 {
+		t.Fatalf("rec.Frames len = %d want 1", len(rec.Frames))
+	}
+}
+
+// TestRunFrame_Pre2DDrawErrorPropagates verifies an error from the
+// 3D hook short-circuits the frame (no PresentFrame, no audio).
+func TestRunFrame_Pre2DDrawErrorPropagates(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	r, _ := newRunner(t, rec)
+	wantErr := errors.New("pre2d boom")
+	r.Pre2DDraw = func(_ *render.FrameBuffer, _, _ [3]float32) error {
+		return wantErr
+	}
+	if err := r.RunFrame(0.05, 1); !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v want %v", err, wantErr)
+	}
+	if len(rec.Frames) != 0 {
+		t.Fatalf("rec.Frames len = %d want 0 on Pre2DDraw error", len(rec.Frames))
+	}
+}
+
 // TestUpdateButtonsFromSnapshot_UnmappedKeysIgnored covers the
 // fall-through path in buttonSlot (the keys with no movement mapping
 // like KeyEnter / KeyMouse1 are silently dropped, NOT crashed on).
