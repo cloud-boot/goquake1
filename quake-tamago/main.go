@@ -83,6 +83,7 @@ import (
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/runloop"
 	engineserver "github.com/go-quake1/engine/server"
+	enginesound "github.com/go-quake1/engine/sound"
 	"github.com/go-quake1/engine/vfs"
 )
 
@@ -247,6 +248,7 @@ func run() error {
 		BackgroundIdx:  0x20, // pleasant grey background from the synthetic palette
 		NotifyLifetime: 3,
 		MaxNotifyRows:  4,
+		SoundChannels:  8, // ambient slots for the runloop's Paint/QueueAudio path
 	})
 	if err != nil {
 		return fmt.Errorf("NewRunnerFromVFS: %w", err)
@@ -260,6 +262,26 @@ func run() error {
 	runner.Console.Print("PURE-GO QUAKE 1 -- TamaGo + go-virtio bring-up\n")
 	runner.Console.Print("runloop wired: input -> client.Tick -> host.Frame -> Pre2DDraw\n")
 	runner.Screen.ConCurrent = runner.Screen.ConLines
+
+	// 11b. Seed the sound pool with a few WAV samples from the pak so
+	//     the runloop's existing Paint + QueueAudio path has something
+	//     to mix every tic. Stock id1 ambient/weapon/items WAVs are
+	//     16-bit mono PCM, which sound.Paint currently rejects (the
+	//     16-bit mix path is the next sound batch -- see mix.go's
+	//     ErrMixBadFormat docstring). For this batch we use the only
+	//     8-bit samples present in the shareware archive
+	//     (sound/nav_editor/*.wav, 11025 Hz / 8-bit mono one-shots)
+	//     so the mixer accepts them + the QueueAudio path actually
+	//     reaches the virtio-sound device with non-empty PCM. The
+	//     16-bit ambient track gets wired once sound/mix.go gains
+	//     SND_PaintChannelFrom16.
+	if pakFS != nil && runner.SoundPool != nil {
+		seeded := seedSoundPool(runner.SoundPool, pakFS, []string{
+			"sound/nav_editor/changed_edict.wav",
+			"sound/nav_editor/edit_edict.wav",
+		})
+		fmt.Printf("QUAKE: sound pool seeded -- %d sample(s) playing on reserved-static slots\n", seeded)
+	}
 
 	// 12. Build the Pre2DDraw hook (BSP load, mark/walk contexts,
 	//     synthetic texture, identity colormap) + anchor the camera
@@ -483,10 +505,18 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 		// Per-frame face count log (sparse, every 60 frames) so the
 		// serial log surfaces PVS culling effectiveness + the chosen
 		// camera origin (player-edict-follow vs pickInMapCamera
-		// fallback) without drowning the channel.
+		// fallback) without drowning the channel. Audio activity is
+		// piggy-backed onto the same cadence: the runloop's Paint +
+		// QueueAudio path runs immediately AFTER Pre2DDraw, so the
+		// channel count we read here is what the next mix call will
+		// process, and the mix size is constant (MixBufferStereoFrames).
 		if frame%60 == 0 {
-			fmt.Printf("QUAKE: tic %d -- sv.time-driven; viewOrigin=%v fromEdict=%v; %d surfaces emitted\n",
-				frame, origin, fromEdict, surfaces.Len())
+			active := 0
+			if runner.SoundPool != nil {
+				active = runner.SoundPool.ActiveCount()
+			}
+			fmt.Printf("QUAKE: tic %d -- sv.time-driven; viewOrigin=%v fromEdict=%v; %d surfaces emitted; audio: %d active channels, %d samples mixed\n",
+				frame, origin, fromEdict, surfaces.Len(), active, enginesound.MixBufferStereoFrames)
 		}
 
 		// Rasterize each visible face via TransformFace + FillTexturedPolygon.
@@ -976,6 +1006,58 @@ func makeConcharsLump() []byte {
 		buf[i] = byte(i & 0xFF)
 	}
 	return buf
+}
+
+// seedSoundPool loads each candidate WAV name out of pakFS, parses it
+// via sound.LoadWav, and parks it on one of the pool's reserved-static
+// channel slots (slots 0..ReservedStatic-1, the bank the upstream
+// engine carved out for level-ambient loops). Each seeded channel
+// plays at full volume (LeftVol/RightVol = 200) from Position 0 to
+// EndPos = sample.NumSamples, then retires when sound.Paint advances
+// past EndPos.
+//
+// The per-sample header info (rate, bits, channels, size) is logged to
+// the serial console so the QEMU run-log makes the loaded asset set
+// unambiguous. Missing assets + parse errors are logged but otherwise
+// skipped -- the engine stays boot-safe when the shareware archive's
+// nav-editor subset is absent.
+//
+// Returns the count of seeded channels (<= len(names) and <=
+// pool.ReservedStatic).
+//
+// Channels are NOT looped here: LoopStart == -1 in the candidate WAVs,
+// and the runloop's Paint path will Stop() them when their data is
+// consumed. This is enough to prove the audio pipeline reaches
+// virtio-sound (the goal of this batch); a follow-up wires the looped
+// 16-bit ambient track once sound.Paint gains the 16-bit mix path.
+func seedSoundPool(pool *enginesound.Pool, pakFS fs.FS, names []string) int {
+	seeded := 0
+	for _, name := range names {
+		if seeded >= pool.ReservedStatic {
+			break
+		}
+		blob, ok := tryReadPakFile(pakFS, name)
+		if !ok {
+			fmt.Printf("QUAKE: sound asset missing: %s\n", name)
+			continue
+		}
+		s, err := enginesound.LoadWav(name, blob)
+		if err != nil {
+			fmt.Printf("QUAKE: sound asset load failed: %s -- %v\n", name, err)
+			continue
+		}
+		fmt.Printf("QUAKE: loaded WAV %s -- rate=%dHz bits=%d numSamples=%d loopStart=%d dataLen=%d\n",
+			name, s.SampleRate, s.BitsPerSam, s.NumSamples, s.LoopStart, len(s.Data))
+		ch := &pool.Channels[seeded]
+		ch.Sfx = s
+		ch.Position = 0
+		ch.EndPos = s.NumSamples
+		ch.LeftVol = 200
+		ch.RightVol = 200
+		ch.Master = true
+		seeded++
+	}
+	return seeded
 }
 
 // halt is the tamago "spin forever after a fatal error" primitive.

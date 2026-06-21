@@ -7,7 +7,9 @@ package realdev
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 
+	"github.com/go-quake1/engine/backend"
 	"github.com/go-quake1/engine/backend/virtio"
 	"github.com/go-quake1/engine/sound"
 	"github.com/go-virtio/gpu"
@@ -15,17 +17,24 @@ import (
 	gvsound "github.com/go-virtio/sound"
 )
 
-// ErrSoundStreamNotReady is the placeholder error WritePCM returns when
-// the underlying virtio-sound stream has not yet been negotiated
-// (PCMSetParams → PCMPrepare → PCMStart). The wrapper itself does NOT
-// drive that handshake — the caller is responsible — and the sentinel
-// exists so the engine's QueueAudio can errors.Is-check it and stay
-// silent when audio output is optional. Today the wrapper forwards
-// every WritePCM straight to the device, which returns
-// gvsound.ErrDeviceStatus if the stream is not RUNNING; this sentinel
-// is reserved for future use by callers that want to enforce stream
-// state guest-side instead of round-tripping through the device.
-var ErrSoundStreamNotReady = errors.New("realdev: sound stream has not been negotiated")
+// ErrSoundStreamNotReady is returned by WritePCM when the underlying
+// virtio-sound stream has not yet been negotiated (PCMSetParams →
+// PCMPrepare → PCMStart). The wrapper itself does NOT drive that
+// handshake — the caller is responsible — and this sentinel exists so
+// the engine's [backend.Backend.QueueAudio] can errors.Is-check it and
+// stay silent when audio output is optional.
+//
+// The sentinel wraps [backend.ErrUnsupported] so existing QueueAudio
+// implementations (which already swallow ErrUnsupported on the
+// "backend doesn't support audio yet" path) also swallow this guest-
+// side guard without further changes.
+//
+// Detection: SampleRate() returns 0 until the first successful
+// PCMSetParams populates the device-side StreamParams cache, so the
+// wrapper short-circuits any WritePCM call made before negotiation
+// rather than round-tripping a payload the device will reject (or
+// worse, time out polling for).
+var ErrSoundStreamNotReady = fmt.Errorf("realdev: sound stream has not been negotiated: %w", backend.ErrUnsupported)
 
 // ----- framebuffer ----------------------------------------------------
 
@@ -207,9 +216,19 @@ func WrapAudio(snd *gvsound.VirtioSound, streamID uint32) virtio.AudioDevice {
 
 // WritePCM forwards `samples` to the underlying device. Returns nil on
 // a zero-length input (nothing to push) without touching the device.
+// Returns [ErrSoundStreamNotReady] (which wraps [backend.ErrUnsupported])
+// when SampleRate() reports 0, the sentinel value virtio-sound uses
+// when no PCMSetParams has been issued for the wrapper's streamID:
+// pushing a payload at that state would either time out at the device
+// (no queue descriptor produced) or be rejected with ErrDeviceStatus.
+// The guard keeps the engine's audio path optional without requiring
+// callers to drive the full handshake just to stay quiet.
 func (a *audioAdapter) WritePCM(samples []sound.StereoSample) error {
 	if len(samples) == 0 {
 		return nil
+	}
+	if a.SampleRate() == 0 {
+		return ErrSoundStreamNotReady
 	}
 	buf := serializeStereo(samples)
 	_, err := a.write(a.streamID, buf)

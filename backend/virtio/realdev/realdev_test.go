@@ -9,6 +9,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/go-quake1/engine/backend"
 	"github.com/go-quake1/engine/backend/virtio"
 	"github.com/go-quake1/engine/sound"
 	"github.com/go-virtio/gpu"
@@ -317,6 +318,7 @@ func TestAudioAdapter_WritePCM_SerializesLEInt16(t *testing.T) {
 			capturedBuf = append(capturedBuf, frames...)
 			return len(frames), nil
 		},
+		rateLookup: stubRateLookup(gvsound.PCMRate44100, true),
 	}
 	samples := []sound.StereoSample{
 		{L: 0x0102, R: 0x0304},
@@ -361,10 +363,40 @@ func TestAudioAdapter_WritePCM_EmptyIsNoop(t *testing.T) {
 // Write must surface to the caller verbatim.
 func TestAudioAdapter_WritePCM_ForwardsError(t *testing.T) {
 	want := errors.New("xfer boom")
-	a := &audioAdapter{write: func(uint32, []byte) (int, error) { return 0, want }}
+	a := &audioAdapter{
+		write:      func(uint32, []byte) (int, error) { return 0, want },
+		rateLookup: stubRateLookup(gvsound.PCMRate44100, true),
+	}
 	err := a.WritePCM([]sound.StereoSample{{L: 1, R: 2}})
 	if !errors.Is(err, want) {
 		t.Fatalf("WritePCM err = %v want %v", err, want)
+	}
+}
+
+// TestAudioAdapter_WritePCM_StreamNotReady covers the guard that
+// short-circuits the device round-trip when the stream has not been
+// negotiated (SampleRate == 0). The wrapper returns
+// ErrSoundStreamNotReady without touching the underlying write fn so
+// the engine's QueueAudio swallows it via the backend.ErrUnsupported
+// branch.
+func TestAudioAdapter_WritePCM_StreamNotReady(t *testing.T) {
+	calls := 0
+	a := &audioAdapter{
+		write: func(uint32, []byte) (int, error) {
+			calls++
+			return 0, nil
+		},
+		rateLookup: stubRateLookup(0, false),
+	}
+	err := a.WritePCM([]sound.StereoSample{{L: 1, R: 2}})
+	if !errors.Is(err, ErrSoundStreamNotReady) {
+		t.Fatalf("WritePCM err = %v want ErrSoundStreamNotReady", err)
+	}
+	if !errors.Is(err, backend.ErrUnsupported) {
+		t.Fatalf("WritePCM err = %v want wrapping backend.ErrUnsupported", err)
+	}
+	if calls != 0 {
+		t.Fatalf("device write called %d times when stream not ready, want 0", calls)
 	}
 }
 
@@ -435,13 +467,28 @@ func TestSerializeStereo_Empty(t *testing.T) {
 }
 
 // TestErrSoundStreamNotReady_IsExported guards the sentinel's
-// stability — engine code is allowed to errors.Is-check it.
+// stability — engine code is allowed to errors.Is-check it. The
+// sentinel must also wrap backend.ErrUnsupported so the existing
+// backend.QueueAudio "swallow when unsupported" branch fires without
+// any change to the engine.
 func TestErrSoundStreamNotReady_IsExported(t *testing.T) {
 	if ErrSoundStreamNotReady == nil {
 		t.Fatal("ErrSoundStreamNotReady must be non-nil")
 	}
 	if ErrSoundStreamNotReady.Error() == "" {
 		t.Fatal("ErrSoundStreamNotReady must have a non-empty message")
+	}
+	if !errors.Is(ErrSoundStreamNotReady, backend.ErrUnsupported) {
+		t.Fatalf("ErrSoundStreamNotReady (%v) must wrap backend.ErrUnsupported", ErrSoundStreamNotReady)
+	}
+}
+
+// stubRateLookup returns a sampleRateFn closure that always reports
+// the supplied (PCMRate*, ok) pair regardless of the streamID asked
+// about. Test-helper for audioAdapter constructors.
+func stubRateLookup(rate uint8, ok bool) sampleRateFn {
+	return func(uint32) (gvsound.PCMParams, bool) {
+		return gvsound.PCMParams{Rate: rate}, ok
 	}
 }
 
