@@ -325,6 +325,58 @@ type MipTex struct {
 	Width   uint32
 	Height  uint32
 	Offsets [MipLevels]uint32
+
+	// slotOff is the byte offset of this miptex_t record into the
+	// parent MipTexLump's raw lump bytes. Combined with lumpRaw it
+	// powers [MipTex.Pixels]; kept unexported so the public surface
+	// stays the on-disk header. Set by [MipTexLump.MipTex].
+	slotOff int32
+	// lumpRaw is a back-pointer to the parent lump's raw bytes the
+	// Offsets index into. Same lifetime semantics as the parent
+	// *MipTexLump's raw slice (do not mutate).
+	lumpRaw []byte
+}
+
+// Pixels returns the palette-indexed pixel byte slice for mip level
+// `level` (0 = full resolution, 1 = half, 2 = quarter, 3 = eighth).
+// The returned slice aliases the BSP's LumpTextures bytes -- do not
+// mutate, and treat it as live only while the parent *File is alive.
+//
+// Pixel count per level (per tyrquake's miptex_t convention):
+//
+//	level 0: Width * Height
+//	level 1: (Width/2) * (Height/2)
+//	level 2: (Width/4) * (Height/4)
+//	level 3: (Width/8) * (Height/8)
+//
+// Returns ErrSectionOutOfRange when:
+//
+//   - level is outside [0, MipLevels)
+//   - the level's mipOffset is 0 (the upstream "level absent" sentinel)
+//     OR points past the lump bytes
+//   - the implied pixel span (offset + W*H) exceeds the lump
+//
+// tyrquake: the `(byte *)mt + mt->offsets[lev]` pointer arithmetic in
+// R_DrawSurface / Mod_LoadTexture.
+func (mt *MipTex) Pixels(level int) ([]byte, error) {
+	if level < 0 || level >= MipLevels {
+		return nil, ErrSectionOutOfRange
+	}
+	mipOff := mt.Offsets[level]
+	if mipOff == 0 {
+		return nil, ErrSectionOutOfRange
+	}
+	w := int(mt.Width) >> level
+	h := int(mt.Height) >> level
+	if w <= 0 || h <= 0 {
+		return nil, ErrSectionOutOfRange
+	}
+	abs := int64(mt.slotOff) + int64(mipOff)
+	end := abs + int64(w)*int64(h)
+	if end > int64(len(mt.lumpRaw)) {
+		return nil, ErrSectionOutOfRange
+	}
+	return mt.lumpRaw[abs:end], nil
 }
 
 // Textures returns the decoded LUMP_TEXTURES directory. Cached on
@@ -397,7 +449,13 @@ func (m *MipTexLump) MipTex(i int) (*MipTex, bool, error) {
 	}
 	w := binary.LittleEndian.Uint32(m.raw[off+16 : off+20])
 	h := binary.LittleEndian.Uint32(m.raw[off+20 : off+24])
-	mt := &MipTex{Name: name, Width: w, Height: h}
+	mt := &MipTex{
+		Name:    name,
+		Width:   w,
+		Height:  h,
+		slotOff: off,
+		lumpRaw: m.raw,
+	}
 	for j := 0; j < MipLevels; j++ {
 		inner := off + 24 + int32(j)*4
 		mt.Offsets[j] = binary.LittleEndian.Uint32(m.raw[inner : inner+4])

@@ -192,6 +192,42 @@ func (bm *BrushModel) NodeParent(i int) int {
 	return bm.nodes[i].ParentNode
 }
 
+// FaceMipTexIdx returns the LUMP_TEXTURES miptex index referenced by
+// the face at faceIdx, resolved through the face's TexInfo entry.
+//
+// Returns (-1, false, nil) when:
+//
+//   - faceIdx is out of [0, len(Faces)).
+//   - the face's TexInfo index is out of [0, len(TexInfos)) (corrupt
+//     BSP -- treated as "no texture", same shape as the renderer's
+//     missing-miptex fallback path).
+//
+// Returns the propagated error when the Faces or TexInfos lump fails
+// to decode. The decoded lumps are cached on the parent *bspfile.File
+// so per-frame calls don't re-decode.
+//
+// Used by the renderer's WAD/miptex bridge to pick the right pixel
+// buffer for each emitted SurfaceRef without round-tripping through
+// bsprender.NewBrushFaceVerts (which builds a full FaceVerts bundle).
+func (bm *BrushModel) FaceMipTexIdx(faceIdx int) (int, bool, error) {
+	faces, err := bm.File.Faces()
+	if err != nil {
+		return -1, false, err
+	}
+	if faceIdx < 0 || faceIdx >= len(faces) {
+		return -1, false, nil
+	}
+	ti := int(faces[faceIdx].TexInfo)
+	tis, err := bm.File.TexInfos()
+	if err != nil {
+		return -1, false, err
+	}
+	if ti < 0 || ti >= len(tis) {
+		return -1, false, nil
+	}
+	return int(tis[ti].MipTex), true, nil
+}
+
 // PointInLeaf descends the BSP from the root (node 0), using the
 // splitting plane at each interior node to pick the front (Children[0])
 // or back (Children[1]) child, until it reaches a leaf reference.

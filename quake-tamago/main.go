@@ -310,10 +310,24 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	fmt.Printf("QUAKE: BSP loaded -- %d nodes, %d leaves (PVS), %d faces, %d marksurfaces (synth=%v)\n",
 		bm.NumNodes(), bm.NumLeaves(), len(faces), len(marks), isSynth)
 
-	// 2. Synthetic 16x16 checker texture. Real miptex decode (using
-	//    the BSP's TexInfo -> Textures chain) is a follow-up; this
-	//    surface stays visually distinct from the sky-index clear.
-	tex := makeCheckerTex(16)
+	// 2. Synthetic 16x16 checker texture stays available as the
+	//    fallback for faces whose TexInfo points at a missing miptex
+	//    slot (offset == -1) or an out-of-range texinfo.
+	fallbackTex := makeCheckerTex(16)
+
+	// 2b. Real WAD/miptex bridge: pull every miptex's mip0 pixels out
+	//     of the BSP's LUMP_TEXTURES and stash one *render.Pic per
+	//     slot. Per-face texture pick happens inside Pre2DDraw via
+	//     BrushModel.FaceMipTexIdx. The pixels are palette-indexed in
+	//     the BSP's own (id1) palette; until the engine swaps its
+	//     synthetic palette for gfx/palette.lmp the visible colours
+	//     will look weird, but per-face texture variation is genuine.
+	miptexPics, loaded, total, err := loadMiptexPics(file)
+	if err != nil {
+		return fmt.Errorf("loadMiptexPics: %w", err)
+	}
+	fmt.Printf("QUAKE: loaded %d miptexes from BSP (total slots: %d, loaded: %d, null: %d)\n",
+		loaded, total, loaded, total-loaded)
 
 	// 3. Identity colormap: every (light, src) -> src. Lighting is
 	//    full-bright in this MVP; the colormap reuse keeps the path
@@ -469,6 +483,9 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 		}
 
 		// Rasterize each visible face via TransformFace + FillTexturedPolygon.
+		// Per-face texture pick: TexInfo.MiptexIdx -> miptexPics[idx].
+		// Faces that resolve to a null miptex slot OR a synthetic BSP
+		// with no Textures lump fall back to the checker.
 		for i := 0; i < surfaces.Len(); i++ {
 			ref := surfaces.Refs[i]
 			fv, err := bsprender.NewBrushFaceVerts(bm, ref.FaceIdx)
@@ -479,11 +496,69 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			if err != nil {
 				continue
 			}
+			tex := fallbackTex
+			if mtIdx, ok, _ := bm.FaceMipTexIdx(ref.FaceIdx); ok && mtIdx >= 0 && mtIdx < len(miptexPics) {
+				if p := miptexPics[mtIdx]; p != nil {
+					tex = p
+				}
+			}
 			_ = render.FillTexturedPolygon(fb, tex, &cm, 0, verts)
 		}
 		return nil
 	}
 	return nil
+}
+
+// loadMiptexPics decodes the BSP's LUMP_TEXTURES into one *render.Pic
+// per miptex slot, using each miptex's mip0 (full-resolution) pixels.
+// Null slots (the upstream "missing texture" sentinel, offset == -1)
+// land in the returned slice as nil; the per-face draw loop falls back
+// to the synthetic checker for those.
+//
+// The pixels are palette-indexed in the BSP's own (id1) palette; the
+// engine is still booted on a synthetic palette here, so on-screen the
+// colours look weird -- the GEOMETRY however is now correctly textured
+// per face. A future batch swaps the palette to gfx/palette.lmp.
+//
+// Returns (slice, loaded, total, err) where loaded is the count of
+// non-nil entries and total is the directory's slot count. A synthetic
+// BSP that lacks a textures lump returns ([], 0, 0, nil).
+func loadMiptexPics(file *bspfile.File) ([]*render.Pic, int, int, error) {
+	mtl, err := file.Textures()
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("file.Textures: %w", err)
+	}
+	total := int(mtl.NumMipTex)
+	out := make([]*render.Pic, total)
+	loaded := 0
+	for i := 0; i < total; i++ {
+		mt, ok, err := mtl.MipTex(i)
+		if err != nil {
+			// Skip the slot -- a single corrupt miptex shouldn't sink
+			// the whole bridge; the per-face draw loop falls back to
+			// the synthetic checker.
+			continue
+		}
+		if !ok || mt == nil {
+			continue
+		}
+		px, err := mt.Pixels(0)
+		if err != nil {
+			continue
+		}
+		// Pixels aliases the lump bytes; copy so the *render.Pic owns
+		// a stable buffer (the lump cache is long-lived but defensive
+		// copy keeps the renderer's invariants self-contained).
+		buf := make([]byte, len(px))
+		copy(buf, px)
+		out[i] = &render.Pic{
+			Width:  int(mt.Width),
+			Height: int(mt.Height),
+			Pixels: buf,
+		}
+		loaded++
+	}
+	return out, loaded, total, nil
 }
 
 // buildHost wires the embedded pak0 into a fully constructed

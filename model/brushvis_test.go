@@ -911,3 +911,93 @@ func TestBrushModel_PointInLeaf_PlanesDecodeError(t *testing.T) {
 		t.Errorf("planes decode error: got %d want -1", got)
 	}
 }
+
+// --- FaceMipTexIdx ---------------------------------------------------------
+
+// FaceMipTexIdx resolves face -> texinfo -> miptex on the BuildWithFaces
+// fixture (faces[0,1] TexInfo 0 -> MipTex 0; face 2 TexInfo 1 -> MipTex 1).
+func TestBrushModel_FaceMipTexIdx_HappyPath(t *testing.T) {
+	bm := loadSynthWithFaces(t)
+	cases := []struct {
+		faceIdx, wantIdx int
+		wantOK           bool
+	}{
+		{0, 0, true},
+		{1, 0, true},
+		{2, 1, true},
+	}
+	for _, tc := range cases {
+		idx, ok, err := bm.FaceMipTexIdx(tc.faceIdx)
+		if err != nil {
+			t.Fatalf("face %d: err %v", tc.faceIdx, err)
+		}
+		if ok != tc.wantOK || idx != tc.wantIdx {
+			t.Errorf("face %d: got (idx=%d, ok=%v) want (idx=%d, ok=%v)", tc.faceIdx, idx, ok, tc.wantIdx, tc.wantOK)
+		}
+	}
+}
+
+// face 3 references TexInfo 99 which is out of range; FaceMipTexIdx
+// reports (-1, false, nil) the same shape a missing miptex slot would.
+func TestBrushModel_FaceMipTexIdx_TexInfoOutOfRange(t *testing.T) {
+	bm := loadSynthWithFaces(t)
+	idx, ok, err := bm.FaceMipTexIdx(3)
+	if err != nil {
+		t.Fatalf("face 3: err %v", err)
+	}
+	if ok || idx != -1 {
+		t.Errorf("face 3 (TexInfo 99): got (idx=%d, ok=%v) want (idx=-1, ok=false)", idx, ok)
+	}
+}
+
+// Out-of-range face index reports (-1, false, nil) without touching
+// the TexInfos lump.
+func TestBrushModel_FaceMipTexIdx_FaceOutOfRange(t *testing.T) {
+	bm := loadSynthWithFaces(t)
+	for _, fi := range []int{-1, 9999} {
+		idx, ok, err := bm.FaceMipTexIdx(fi)
+		if err != nil || ok || idx != -1 {
+			t.Errorf("face %d: got (idx=%d, ok=%v, err=%v) want (-1, false, nil)", fi, idx, ok, err)
+		}
+	}
+}
+
+// Corrupt LumpFaces -> the cached decoder errors and the helper
+// propagates the error to the caller without panicking.
+func TestBrushModel_FaceMipTexIdx_FacesDecodeError(t *testing.T) {
+	data, size, err := synthbsp.BuildWithFaces()
+	if err != nil {
+		t.Fatalf("BuildWithFaces: %v", err)
+	}
+	// LumpFaces length -> non-multiple of faceSize (20).
+	const facesLumpLenOff = 4 + int(bspfile.LumpFaces)*8 + 4
+	binary.LittleEndian.PutUint32(data[facesLumpLenOff:facesLumpLenOff+4], 1)
+	f, err := bspfile.Open(bytes.NewReader(data), size)
+	if err != nil {
+		t.Fatalf("bspfile.Open: %v", err)
+	}
+	bm := &BrushModel{File: f}
+	if _, _, err := bm.FaceMipTexIdx(0); err == nil {
+		t.Fatal("expected error from corrupt faces lump")
+	}
+}
+
+// Corrupt LumpTexInfo -> the texinfo decoder errors after Faces() has
+// succeeded; helper surfaces the error.
+func TestBrushModel_FaceMipTexIdx_TexInfosDecodeError(t *testing.T) {
+	data, size, err := synthbsp.BuildWithFaces()
+	if err != nil {
+		t.Fatalf("BuildWithFaces: %v", err)
+	}
+	// LumpTexInfo length -> non-multiple of texInfoSize (40).
+	const tiLumpLenOff = 4 + int(bspfile.LumpTexInfo)*8 + 4
+	binary.LittleEndian.PutUint32(data[tiLumpLenOff:tiLumpLenOff+4], 1)
+	f, err := bspfile.Open(bytes.NewReader(data), size)
+	if err != nil {
+		t.Fatalf("bspfile.Open: %v", err)
+	}
+	bm := &BrushModel{File: f}
+	if _, _, err := bm.FaceMipTexIdx(0); err == nil {
+		t.Fatal("expected error from corrupt texinfo lump")
+	}
+}

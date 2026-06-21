@@ -552,6 +552,167 @@ func TestMipTex_NameFillsSlot(t *testing.T) {
 	}
 }
 
+// encodeMipTexLumpWithPixels builds a MipTexLump byte block that
+// includes per-level pixel payloads for one miptex entry: a single
+// miptex_t header at offset 4 (right after the offsets table) followed
+// by `levels` mip levels' worth of fill-byte pixels. mipOffsets[i] is
+// the offset (relative to the miptex_t header) to level i, or 0 to
+// mark a level as absent. Width/Height are the level-0 dimensions.
+func encodeMipTexLumpWithPixels(name string, width, height uint32, mipOffsets [MipLevels]uint32, mipFills [MipLevels]byte) []byte {
+	buf := &bytes.Buffer{}
+	_ = binary.Write(buf, binary.LittleEndian, int32(1)) // NumMipTex
+	_ = binary.Write(buf, binary.LittleEndian, int32(0)) // patched offset
+	out := buf.Bytes()
+	slotOff := int32(len(out))
+	binary.LittleEndian.PutUint32(out[4:8], uint32(slotOff))
+
+	nameBuf := make([]byte, 16)
+	copy(nameBuf, name)
+	out = append(out, nameBuf...)
+	var u [4]byte
+	binary.LittleEndian.PutUint32(u[:], width)
+	out = append(out, u[:]...)
+	binary.LittleEndian.PutUint32(u[:], height)
+	out = append(out, u[:]...)
+	for j := 0; j < MipLevels; j++ {
+		binary.LittleEndian.PutUint32(u[:], mipOffsets[j])
+		out = append(out, u[:]...)
+	}
+	// Now append pixel bytes per level, padding with zero up to the
+	// requested mipOffset so the lump layout matches the offsets table.
+	for j := 0; j < MipLevels; j++ {
+		mo := mipOffsets[j]
+		if mo == 0 {
+			continue
+		}
+		abs := int(slotOff) + int(mo)
+		for len(out) < abs {
+			out = append(out, 0)
+		}
+		w := int(width) >> j
+		h := int(height) >> j
+		if w < 1 {
+			w = 1
+		}
+		if h < 1 {
+			h = 1
+		}
+		fill := bytes.Repeat([]byte{mipFills[j]}, w*h)
+		out = append(out, fill...)
+	}
+	return out
+}
+
+func TestMipTex_PixelsHappyPath(t *testing.T) {
+	// 4x4 mip0 with fill 0xAB, 2x2 mip1 with fill 0xCD; levels 2/3 absent.
+	mipOff := [MipLevels]uint32{40, 40 + 16, 0, 0}
+	mipFill := [MipLevels]byte{0xAB, 0xCD, 0, 0}
+	raw, sz := buildExt(buildSpecExt{
+		textures: encodeMipTexLumpWithPixels("hello", 4, 4, mipOff, mipFill),
+	})
+	f, _ := Open(bytes.NewReader(raw), sz)
+	mtl, _ := f.Textures()
+	mt, ok, err := mtl.MipTex(0)
+	if err != nil || !ok || mt == nil {
+		t.Fatalf("MipTex(0): %v %v %+v", err, ok, mt)
+	}
+	px0, err := mt.Pixels(0)
+	if err != nil {
+		t.Fatalf("Pixels(0): %v", err)
+	}
+	if len(px0) != 16 {
+		t.Errorf("Pixels(0) len = %d, want 16", len(px0))
+	}
+	for i, b := range px0 {
+		if b != 0xAB {
+			t.Fatalf("Pixels(0)[%d] = %#x, want 0xAB", i, b)
+		}
+	}
+	px1, err := mt.Pixels(1)
+	if err != nil {
+		t.Fatalf("Pixels(1): %v", err)
+	}
+	if len(px1) != 4 {
+		t.Errorf("Pixels(1) len = %d, want 4", len(px1))
+	}
+	for _, b := range px1 {
+		if b != 0xCD {
+			t.Fatalf("Pixels(1) wrong fill: %#x", b)
+		}
+	}
+}
+
+func TestMipTex_PixelsLevelAbsentSentinel(t *testing.T) {
+	mipOff := [MipLevels]uint32{40, 0, 0, 0}
+	mipFill := [MipLevels]byte{0xAA, 0, 0, 0}
+	raw, sz := buildExt(buildSpecExt{
+		textures: encodeMipTexLumpWithPixels("solo", 2, 2, mipOff, mipFill),
+	})
+	f, _ := Open(bytes.NewReader(raw), sz)
+	mtl, _ := f.Textures()
+	mt, _, _ := mtl.MipTex(0)
+	if _, err := mt.Pixels(1); !errors.Is(err, ErrSectionOutOfRange) {
+		t.Errorf("Pixels(absent level): want ErrSectionOutOfRange, got %v", err)
+	}
+}
+
+func TestMipTex_PixelsLevelOutOfRange(t *testing.T) {
+	mipOff := [MipLevels]uint32{40, 0, 0, 0}
+	mipFill := [MipLevels]byte{0xAA, 0, 0, 0}
+	raw, sz := buildExt(buildSpecExt{
+		textures: encodeMipTexLumpWithPixels("solo", 2, 2, mipOff, mipFill),
+	})
+	f, _ := Open(bytes.NewReader(raw), sz)
+	mtl, _ := f.Textures()
+	mt, _, _ := mtl.MipTex(0)
+	if _, err := mt.Pixels(-1); !errors.Is(err, ErrSectionOutOfRange) {
+		t.Errorf("Pixels(-1): want ErrSectionOutOfRange, got %v", err)
+	}
+	if _, err := mt.Pixels(MipLevels); !errors.Is(err, ErrSectionOutOfRange) {
+		t.Errorf("Pixels(MipLevels): want ErrSectionOutOfRange, got %v", err)
+	}
+}
+
+func TestMipTex_PixelsZeroDimAfterShift(t *testing.T) {
+	// Width=1, level=3 -> 1>>3 == 0. Treat as out-of-range.
+	mipOff := [MipLevels]uint32{40, 0, 0, 41}
+	mipFill := [MipLevels]byte{0xAA, 0, 0, 0xBB}
+	raw, sz := buildExt(buildSpecExt{
+		textures: encodeMipTexLumpWithPixels("tiny", 1, 1, mipOff, mipFill),
+	})
+	f, _ := Open(bytes.NewReader(raw), sz)
+	mtl, _ := f.Textures()
+	mt, _, _ := mtl.MipTex(0)
+	if _, err := mt.Pixels(3); !errors.Is(err, ErrSectionOutOfRange) {
+		t.Errorf("Pixels(3) with zero shifted dim: want ErrSectionOutOfRange, got %v", err)
+	}
+}
+
+func TestMipTex_PixelsOffsetPastLump(t *testing.T) {
+	// Build a valid 4x4 miptex (so MipTex(0) decodes cleanly), then
+	// overwrite the encoded mip0 offset to point past the lump end.
+	mipOff := [MipLevels]uint32{40, 0, 0, 0}
+	mipFill := [MipLevels]byte{0x11, 0, 0, 0}
+	tex := encodeMipTexLumpWithPixels("evil", 4, 4, mipOff, mipFill)
+	// Layout: header(4) + offsets(4) + name(16) + W(4) + H(4) +
+	// mipOffsets(16) = 48 bytes; mip0 offset within miptex_t lives at
+	// bytes 8 + 16 + 4 + 4 = 32 (slot starts at byte 8). Bump it to
+	// a value whose abs+W*H lands past the lump bytes.
+	const slotOff = 8
+	const mipOffField = slotOff + 16 + 4 + 4 // start of Offsets[0]
+	binary.LittleEndian.PutUint32(tex[mipOffField:mipOffField+4], uint32(1<<20))
+	raw, sz := buildExt(buildSpecExt{textures: tex})
+	f, _ := Open(bytes.NewReader(raw), sz)
+	mtl, _ := f.Textures()
+	mt, ok, err := mtl.MipTex(0)
+	if err != nil || !ok {
+		t.Fatalf("MipTex(0) setup: err=%v ok=%v", err, ok)
+	}
+	if _, err := mt.Pixels(0); !errors.Is(err, ErrSectionOutOfRange) {
+		t.Errorf("Pixels(past-lump): want ErrSectionOutOfRange, got %v", err)
+	}
+}
+
 // Sanity: float precision in TexInfo's 8 floats round-trips.
 func TestTexInfos_FloatRoundTrip(t *testing.T) {
 	raw, sz := buildExt(buildSpecExt{
