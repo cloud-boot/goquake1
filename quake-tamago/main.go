@@ -191,23 +191,22 @@ func run() error {
 	return runDemo3D(runner.FrameBuffer, runner.RGBA, runner.Palette, be)
 }
 
-// runDemo3D paints a rotating, textured quad into the framebuffer
-// using FillPerspectiveLitTexturedPolygon, expands to RGBA, and
-// flushes via the virtio-gpu backend. Loops forever (the bare-metal
+// runDemo3D renders a textured cube room (6 walls) with the camera
+// rotating around the Y axis at the room centre, then flushes each
+// frame via the virtio-gpu backend. Loops forever (the bare-metal
 // binary has no clean exit path).
+//
+// This is the first interior-3D scene the engine renders on real
+// virtio-gpu hardware. Per face: build 4 world-space corners,
+// transform through the view matrix, perspective-divide to screen
+// XY, populate PerspLitTexturedVertex, fill via the perspective
+// rasterizer.
 func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be *virtio.Backend) error {
-	// Synthetic 8x8 checkerboard texture (palette indices 0/15).
-	tex := &render.Pic{Width: 8, Height: 8, Pixels: make([]byte, 64)}
-	for v := 0; v < 8; v++ {
-		for u := 0; u < 8; u++ {
-			if (u+v)&1 == 0 {
-				tex.Pixels[v*8+u] = 15 // light
-			} else {
-				tex.Pixels[v*8+u] = 0 // dark
-			}
-		}
-	}
-	// Identity colormap: every (light, src) -> src.
+	// Synthetic 16x16 checkerboard with two colour pairs so each
+	// wall is visually distinct after lighting + UV mapping.
+	tex := make4ColorChecker(16)
+	// Identity colormap: every (light, src) -> src. Each wall passes
+	// a different Light value so the colormap-row index varies.
 	var cm render.ColorMap
 	for light := 0; light < render.ColorMapRows; light++ {
 		for src := 0; src < render.ColorMapCols; src++ {
@@ -215,64 +214,103 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 		}
 	}
 
+	const (
+		fovX = 90.0
+		half = float32(100) // room half-extent (-100..+100 on every axis)
+	)
 	halfW := float32(fb.Width) / 2
 	halfH := float32(fb.Height) / 2
-	const fovX = 90.0
 	tanHalfX := float32(math.Tan(fovX / 2 * math.Pi / 180))
 	scale := halfW / tanHalfX
 
+	// Six cube faces, each a quad in world space (CCW from inside).
+	// faceVerts[face] = 4 corners; faceLight[face] = 0..40 light idx.
+	type face struct {
+		verts [4][3]float32
+		light int
+	}
+	faces := [6]face{
+		// Front wall (+Z, faces toward -Z)
+		{[4][3]float32{{-half, -half, +half}, {+half, -half, +half}, {+half, +half, +half}, {-half, +half, +half}}, 0},
+		// Back wall (-Z, faces toward +Z)
+		{[4][3]float32{{+half, -half, -half}, {-half, -half, -half}, {-half, +half, -half}, {+half, +half, -half}}, 8},
+		// Right wall (+X)
+		{[4][3]float32{{+half, -half, +half}, {+half, -half, -half}, {+half, +half, -half}, {+half, +half, +half}}, 16},
+		// Left wall (-X)
+		{[4][3]float32{{-half, -half, -half}, {-half, -half, +half}, {-half, +half, +half}, {-half, +half, -half}}, 24},
+		// Floor (-Y)
+		{[4][3]float32{{-half, -half, -half}, {+half, -half, -half}, {+half, -half, +half}, {-half, -half, +half}}, 32},
+		// Ceiling (+Y)
+		{[4][3]float32{{-half, +half, +half}, {+half, +half, +half}, {+half, +half, -half}, {-half, +half, -half}}, 4},
+	}
+	uvs := [4][2]float32{{0, 0}, {15, 0}, {15, 15}, {0, 15}}
+
 	for frame := 0; ; frame++ {
-		// Sky-blue background.
+		// Sky-index background (palette idx 0x10).
 		for i := range fb.Pixels {
 			fb.Pixels[i] = 0x10
 		}
 
-		// Rotating square in world space, depth 80, half-edge 40.
-		angle := float64(frame) * 2 * math.Pi / 180
-		c, s := float32(math.Cos(angle)), float32(math.Sin(angle))
-		const (
-			centerZ = float32(80)
-			half    = float32(40)
-		)
-		// 4 corners in world space (XY plane, rotated around Y axis
-		// so the quad tilts away/toward the camera frame by frame).
-		corners := [4][3]float32{
-			{-half * c, -half, centerZ - half*s},
-			{+half * c, -half, centerZ + half*s},
-			{+half * c, +half, centerZ + half*s},
-			{-half * c, +half, centerZ - half*s},
+		// Camera at room centre, rotating around the Y axis.
+		yawDeg := float32(frame) * 1.0
+		rd := &render.RefDef{
+			VRect:      render.VRect{Width: fb.Width, Height: fb.Height},
+			ViewAngles: [3]float32{0, yawDeg, 0},
+			ViewOrigin: [3]float32{0, 0, 0},
+			FovX:       fovX,
+			FovY:       fovX,
 		}
-		// UVs (texture pixels 0..7 across).
-		uvs := [4][2]float32{
-			{0, 0}, {7, 0}, {7, 7}, {0, 7},
-		}
-		// Project every vertex; reject if any Z too small.
-		var verts [4]render.PerspLitTexturedVertex
-		ok := true
-		for i := 0; i < 4; i++ {
-			z := corners[i][2]
-			if z < 1 {
-				ok = false
-				break
+		view := rd.SetupView()
+
+		for _, f := range faces {
+			// Transform every corner into view space.
+			var vp [4][3]float32
+			anyBehind := false
+			for i := 0; i < 4; i++ {
+				vp[i] = render.TransformAffine(view, f.verts[i])
+				if vp[i][2] < 1 {
+					anyBehind = true
+				}
 			}
-			invZ := 1 / z
-			verts[i] = render.PerspLitTexturedVertex{
-				X:     halfW + corners[i][0]*scale*invZ,
-				Y:     halfH - corners[i][1]*scale*invZ,
-				Z:     z,
-				U:     uvs[i][0],
-				V:     uvs[i][1],
-				Light: 0, // brightest row of the colormap (identity = src verbatim)
+			if anyBehind {
+				continue // skip faces partially/fully behind camera (no clipper yet)
 			}
-		}
-		if ok {
+			var verts [4]render.PerspLitTexturedVertex
+			for i := 0; i < 4; i++ {
+				invZ := 1 / vp[i][2]
+				verts[i] = render.PerspLitTexturedVertex{
+					X:     halfW + vp[i][0]*scale*invZ,
+					Y:     halfH - vp[i][1]*scale*invZ,
+					Z:     vp[i][2],
+					U:     uvs[i][0],
+					V:     uvs[i][1],
+					Light: float32(f.light),
+				}
+			}
 			_ = render.FillPerspectiveLitTexturedPolygon(fb, tex, &cm, verts[:])
 		}
 
-		// Expand palette -> RGBA, hand to virtio-gpu for flush.
 		_ = fb.Expand(rgba, palette)
 		_ = be.PresentFrame(rgba, fb.Width, fb.Height)
 	}
+}
+
+// make4ColorChecker returns an NxN texture with a 4-colour checker
+// pattern (palette indices cycling through 0, 15, 31, 47 by tile).
+func make4ColorChecker(n int) *render.Pic {
+	pixels := make([]byte, n*n)
+	colors := [4]byte{0, 15, 31, 47}
+	tile := n / 4
+	if tile < 1 {
+		tile = 1
+	}
+	for v := 0; v < n; v++ {
+		for u := 0; u < n; u++ {
+			idx := ((u / tile) + (v/tile)*2) & 3
+			pixels[v*n+u] = colors[idx]
+		}
+	}
+	return &render.Pic{Width: n, Height: n, Pixels: pixels}
 }
 
 // syntheticAssets returns an fs.FS backed by fstest.MapFS that holds
