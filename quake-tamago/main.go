@@ -209,6 +209,13 @@ func run() error {
 			realHost = h
 			fmt.Printf("QUAKE: real host live -- sv.active=%v numEdicts=%d maxEdicts=%d\n",
 				h.Server.Active, h.Server.NumEdicts, h.Server.MaxEdicts)
+			// SpawnFn-driven entity census: numEdicts > MaxClients+1
+			// proves the entity-spawn pass walked beyond the reserved
+			// client slots (worldspawn + MaxClients player slots).
+			// On id1/start.bsp the ~80-entry entity lump bumps
+			// numEdicts well past 2.
+			fmt.Printf("QUAKE: spawn census -- %d edicts populated past the world+client reserve (MaxClients=%d)\n",
+				h.Server.NumEdicts-h.Static.MaxClients-1, h.Static.MaxClients)
 		}
 	}
 
@@ -610,16 +617,144 @@ func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
 	}
 	h.SetProgs(p)
 
-	// 4. SpawnServer. Loads the BSP, builds the area tree, parses the
-	//    entities lump, populates the edict pool. The default
-	//    no-op interner stores every string field as offset 0 (the
-	//    empty-string sentinel) -- field structure is preserved; only
-	//    the human-readable string payload is dropped. Good enough to
-	//    drive SV_Physics + measure tic advance.
+	// 4. Builtin table. RegisterMathBuiltins wires the 9 pure-math
+	//    builtins (normalize / vlen / vectoangles / random / ...);
+	//    registerSpawnTimeBuiltins layers no-op stubs on top of every
+	//    builtin a typical Q1 entity-spawn QC function calls
+	//    (precache_model / precache_sound / setmodel / setorigin /
+	//    setsize / lightstyle / dprint / stuffcmd / cvar / particle /
+	//    objerror / sound). Without these the very first OP_CALL on
+	//    a spawn function returns ErrBadBuiltin + the SpawnFn loop
+	//    skips the rest of that entity. The stubs read nothing + do
+	//    nothing -- the QC code's side effects (model = "blah";
+	//    health = 60) live in the bytecode AFTER the builtin call,
+	//    so the per-entity field assignment still lands on the edict.
+	vm.RegisterMathBuiltins()
+	if err := registerSpawnTimeBuiltins(vm); err != nil {
+		return nil, fmt.Errorf("buildHost: registerSpawnTimeBuiltins: %w", err)
+	}
+
+	// 5. SpawnFn classname dispatch. Resolves the entity's classname
+	//    to a QC function via FindFunction, sets the QC "self" global
+	//    to the (slot-indexed) edict pointer, and calls VM.Run on
+	//    the resolved index. A nil function (classname has no QC
+	//    counterpart -- light_torch_small_walltorch and friends) is
+	//    silently skipped. A VM.Run error is logged to the serial
+	//    console + the loop continues with the next entity; the
+	//    project-scope is "monsters get edicts" + "missing builtins
+	//    are diagnosed", not "QC runs to completion".
+	h.SetSpawnFn(func(ent *progs.Edict, classname string) {
+		_, idx := p.FindFunction(classname)
+		if idx < 1 {
+			return
+		}
+		// Self global: spawn-time QC reads + writes ent->v.* via the
+		// "self" pointer. Without it, every "self.health = 60" lands
+		// in the world edict instead of the spawning monster. The
+		// host's per-tic thinkCaller does the same dance; the VM
+		// owns no arena handle on this port so the int written here
+		// is a slot index rather than a byte offset -- good enough
+		// for spawn dispatch (the QC code reads back what we wrote).
+		if def := p.FindGlobal("self"); def != nil {
+			_ = vm.SetGlobalInt(int(def.Ofs), edictSlot(h, ent))
+		}
+		if err := vm.Run(int32(idx)); err != nil {
+			fmt.Printf("QUAKE: SpawnFn %s err: %v\n", classname, err)
+		}
+	})
+
+	// 6. SpawnServer. Loads the BSP, builds the area tree, parses the
+	//    entities lump, populates the edict pool, fires SpawnFn per
+	//    entity. The default no-op interner stores every string field
+	//    as offset 0 (the empty-string sentinel) -- field structure is
+	//    preserved; only the human-readable string payload is dropped.
 	if err := h.SpawnServer(mapSlug, protocol.VersionNQ); err != nil {
 		return nil, fmt.Errorf("buildHost: SpawnServer(%q): %w", mapSlug, err)
 	}
 	return h, nil
+}
+
+// edictSlot returns the index of ent inside h.Server.Edicts. The
+// VM's "self" global is an ev_entity, stored as the QC pointer to
+// the edict; without an exported EdictArena byte-offset accessor on
+// this port the slot index is the closest stand-in we can hand the
+// VM. Spawn-time QC reads back what we wrote, so a self-consistent
+// integer is sufficient; the per-tic physics dispatcher in host.go
+// uses the same simplification.
+func edictSlot(h *enginehost.Host, ent *progs.Edict) int32 {
+	for i, e := range h.Server.Edicts {
+		if e == ent {
+			return int32(i)
+		}
+	}
+	return 0
+}
+
+// registerSpawnTimeBuiltins installs no-op stubs for the builtin
+// indices typical Q1 entity-spawn QC functions hit before they get
+// to the field-assignment half of their body. The stubs do nothing
+// + return nil; the spawn function's per-classname field writes
+// (self.health = 60, self.model = "...", ...) still land on the
+// edict because they're plain bytecode after the builtin returns.
+//
+// Coverage matches tyrquake's pr_cmds.c pr_builtins[] indices the
+// shareware progs.dat references during entity spawn: setorigin,
+// setmodel, setsize, sound, precache_sound, precache_model,
+// stuffcmd, lightstyle, cvar, particle, objerror, dprint, bprint,
+// sprint, eprint, error, walkmove, droptofloor, checkbottom,
+// pointcontents, find, findradius, traceline, checkclient, aim,
+// nextent, traceon, traceoff, coredump, break, makestatic,
+// changelevel, setspawnparms, makevectors, spawn, remove, ftos,
+// vtos, localcmd, changeyaw, cvar_set.
+//
+// Functional builtins (the math 9 from RegisterMathBuiltins) stay
+// real; only the spawn-time side-effect builtins are stubbed here.
+// A real implementation would precache assets, link entities into
+// the world tree, etc.; for "prove the SpawnFn dispatch works" the
+// no-op shape is sufficient + safer than a half-port that crashes.
+func registerSpawnTimeBuiltins(vm *progs.VM) error {
+	noop := func(_ *progs.VM) error { return nil }
+	// makevectors writes v_forward/right/up; spawn-time entities
+	// rarely consult those, so the stub leaves them untouched. A
+	// future batch wires the real math.
+	vm.RegisterBuiltin(progs.BuiltinMakeVectors, noop)
+	vm.RegisterBuiltin(progs.BuiltinSetOrigin, noop)
+	vm.RegisterBuiltin(progs.BuiltinSetModel, noop)
+	vm.RegisterBuiltin(progs.BuiltinSetSize, noop)
+	vm.RegisterBuiltin(progs.BuiltinBreak, noop)
+	vm.RegisterBuiltin(progs.BuiltinSound, noop)
+	vm.RegisterBuiltin(progs.BuiltinError, noop)
+	vm.RegisterBuiltin(progs.BuiltinObjError, noop)
+	vm.RegisterBuiltin(progs.BuiltinSpawn, noop)
+	vm.RegisterBuiltin(progs.BuiltinRemove, noop)
+	vm.RegisterBuiltin(progs.BuiltinTraceLine, noop)
+	vm.RegisterBuiltin(progs.BuiltinCheckClient, noop)
+	vm.RegisterBuiltin(progs.BuiltinFind, noop)
+	vm.RegisterBuiltin(progs.BuiltinPrecacheSound, noop)
+	vm.RegisterBuiltin(progs.BuiltinPrecacheModel, noop)
+	vm.RegisterBuiltin(progs.BuiltinStuffCmd, noop)
+	vm.RegisterBuiltin(progs.BuiltinFindRadius, noop)
+	vm.RegisterBuiltin(progs.BuiltinBPrint, noop)
+	vm.RegisterBuiltin(progs.BuiltinSPrint, noop)
+	vm.RegisterBuiltin(progs.BuiltinDPrint, noop)
+	vm.RegisterBuiltin(progs.BuiltinFToS, noop)
+	vm.RegisterBuiltin(progs.BuiltinVToS, noop)
+	vm.RegisterBuiltin(progs.BuiltinCoreDump, noop)
+	vm.RegisterBuiltin(progs.BuiltinTraceOn, noop)
+	vm.RegisterBuiltin(progs.BuiltinTraceOff, noop)
+	vm.RegisterBuiltin(progs.BuiltinEPrint, noop)
+	vm.RegisterBuiltin(progs.BuiltinWalkMove, noop)
+	vm.RegisterBuiltin(progs.BuiltinDropToFloor, noop)
+	vm.RegisterBuiltin(progs.BuiltinLightStyle, noop)
+	vm.RegisterBuiltin(progs.BuiltinCheckBottom, noop)
+	vm.RegisterBuiltin(progs.BuiltinPointContents, noop)
+	vm.RegisterBuiltin(progs.BuiltinAim, noop)
+	vm.RegisterBuiltin(progs.BuiltinCVar, noop)
+	vm.RegisterBuiltin(progs.BuiltinLocalCmd, noop)
+	vm.RegisterBuiltin(progs.BuiltinNextEnt, noop)
+	vm.RegisterBuiltin(progs.BuiltinParticle, noop)
+	vm.RegisterBuiltin(progs.BuiltinChangeYaw, noop)
+	return nil
 }
 
 // pickInMapCamera returns a viewpoint that lands inside a valid leaf

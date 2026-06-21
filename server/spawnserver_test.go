@@ -287,6 +287,42 @@ func TestSpawnServer_PopulatesSubmodels(t *testing.T) {
 	}
 }
 
+// Multi-entity lump: each entity past the world must land in a new
+// slot allocated by edictAt's NumEdicts++ branch. Hits the i != 0
+// path that the single-entity test does not exercise.
+func TestSpawnServer_AllocatesPostWorldSlots(t *testing.T) {
+	bspBytes := buildSpawnBSP(t, `{ "classname" "worldspawn" }`+
+		`{ "classname" "info_player_start" "origin" "1 2 3" }`+
+		`{ "classname" "monster_army" "origin" "10 20 30" }`, 1)
+	deps := makeDeps(t, bspBytes)
+	s := NewServer()
+	if err := s.SpawnServer("test", protocol.VersionNQ, deps); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	// Two non-world entities; reserve = MaxClients+1; allocator
+	// should bump NumEdicts twice past the reserve.
+	want := deps.Static.MaxClients + 1 + 2
+	if s.NumEdicts != want {
+		t.Errorf("NumEdicts got %d want %d (reserve+2 post-world entities)", s.NumEdicts, want)
+	}
+}
+
+// MaxEdicts cap: when entities exceed the cap, SpawnEntities surfaces
+// the nil-edict from edictAt as an error. Hits the slot >= MaxEdicts
+// guard in edictAt.
+func TestSpawnServer_OverMaxEdictsReturnsNil(t *testing.T) {
+	bspBytes := buildSpawnBSP(t, `{ "classname" "worldspawn" }`+
+		`{ "classname" "info_player_start" "origin" "1 2 3" }`+
+		`{ "classname" "monster_army" "origin" "10 20 30" }`, 1)
+	deps := makeDeps(t, bspBytes)
+	s := NewServer()
+	s.MaxEdicts = deps.Static.MaxClients + 2 // first non-world fits, second doesn't
+	err := s.SpawnServer("test", protocol.VersionNQ, deps)
+	if err == nil {
+		t.Fatalf("SpawnServer over-cap: got nil err, want failure")
+	}
+}
+
 // SpawnFn nil: entities still parse + assign but no spawn hook fires.
 func TestSpawnServer_NilSpawnFn(t *testing.T) {
 	bspBytes := buildSpawnBSP(t, `{ "classname" "worldspawn" }`, 1)

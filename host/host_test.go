@@ -774,3 +774,19 @@ func TestSetInterner(t *testing.T) {
 		t.Errorf("SetInterner override not honoured: got=%d called=%v", got, called)
 	}
 }
+
+func TestSetSpawnFn(t *testing.T) {
+	h, _ := makeHost(t, nil, 1)
+	if h.spawnFn != nil {
+		t.Errorf("spawnFn default: got non-nil, want nil")
+	}
+	called := 0
+	h.SetSpawnFn(func(_ *progs.Edict, _ string) { called++ })
+	if h.spawnFn == nil {
+		t.Errorf("SetSpawnFn did not install the hook")
+	}
+	h.spawnFn(nil, "info_player_start")
+	if called != 1 {
+		t.Errorf("installed hook not invoked: called=%d want 1", called)
+	}
+}

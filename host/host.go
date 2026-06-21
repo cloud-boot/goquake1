@@ -52,6 +52,15 @@ type Host struct {
 	// (the empty-string sentinel); production embedders override
 	// via [Host.SetInterner] once a real progs.StringInterner exists.
 	interner progs.StringInterner
+
+	// spawnFn is the per-entity QC spawn-dispatch hook SpawnServer
+	// hands to the entity-spawn pass. nil = entities still get their
+	// fields populated from the BSP entity lump but no per-classname
+	// QC initialiser runs (no monster health, no model, no solid).
+	// Wired by the embedder via [Host.SetSpawnFn] once the VM has
+	// a builtin table large enough for the spawn-time builtins
+	// (precache_*, setmodel, setorigin, ...) the QC code calls.
+	spawnFn func(ent *progs.Edict, classname string)
 }
 
 // ErrNilDep fires on a missing required NewHost dependency.
@@ -100,6 +109,23 @@ func NewHost(vm *progs.VM, cache *model.Cache, resolver server.FileResolver, max
 // interner once their progs's string table is appendable.
 func (h *Host) SetInterner(intern progs.StringInterner) {
 	h.interner = intern
+}
+
+// SetSpawnFn installs the per-entity QC spawn-dispatch hook that
+// [server.SpawnServer] hands to the entity-spawn pass. The hook is
+// invoked once per parsed entity (after AssignFields has populated
+// the edict's entvars) with the edict + its "classname" field value;
+// the production implementation typically resolves classname via
+// [progs.Progs.FindFunction], sets the QC "self" global to point at
+// ent, and calls [progs.VM.Run] on the function index.
+//
+// nil disables the dispatch -- entities still parse + assign but no
+// QC initialiser runs. The default for a fresh Host is nil since the
+// dispatch needs a builtin table the embedder owns (host.go can't
+// pre-wire it without growing a dependency on every progs builtin
+// the spawn-time QC code calls).
+func (h *Host) SetSpawnFn(fn func(ent *progs.Edict, classname string)) {
+	h.spawnFn = fn
 }
 
 // edictAt is the [world.PhysicsEdictResolver] the per-tic RunPhysics
@@ -216,11 +242,13 @@ func (h *Host) SpawnServer(mapName string, protocol int) error {
 		Progs:    h.findProgs(),
 		Static:   h.Static,
 		World:    h.World,
-		// SpawnFn is nil here: the per-entity QC spawn dispatch is
-		// future work (needs a classname -> function-index lookup
-		// the host doesn't own yet). Entities still parse + populate
-		// their fields; only the optional QC spawn hook is skipped.
-		SpawnFn: nil,
+		// SpawnFn is whatever [Host.SetSpawnFn] last installed; nil
+		// = entities still get their fields populated from the BSP
+		// entity lump but no per-classname QC initialiser runs. The
+		// embedder wires the real dispatch once the VM has a builtin
+		// table large enough for the spawn-time builtins the QC code
+		// calls (precache_*, setmodel, setorigin, ...).
+		SpawnFn: h.spawnFn,
 		// Interner is a noop-zero by default: every string field
 		// interns to offset 0 (the empty-string sentinel). The map
 		// still parses; only the human-readable string payload is

@@ -216,12 +216,26 @@ func (s *Server) SpawnServer(mapName string, protocol int, deps SpawnDeps) error
 	if err != nil {
 		return fmt.Errorf("server: parse entities: %w", err)
 	}
-	// edictAt indexes s.Edicts directly; bounds-checking is the Go
-	// runtime's job (SV_Error in the C upstream). A map with more
-	// entities than s.MaxEdicts will panic in SpawnEntities -- same
-	// "build-time invariant violated" posture as the area-tree pool
-	// guard. Real maps stay well under MaxEdicts (8192).
-	edictAt := func(i int) *progs.Edict { return s.Edicts[i] }
+	// edictAt is the slot allocator the entity-spawn pass calls per
+	// parsed entity. tyrquake: ED_LoadFromFile reserves entity[0] for
+	// worldspawn (sv.edicts[0]) and ED_Allocs every subsequent entity
+	// past the reserved client range (sv.num_edicts++). The Go port
+	// mirrors that exactly: entity index 0 -> slot 0; entity index >0
+	// -> s.NumEdicts++ (which already starts at MaxClients+1 from
+	// step 6, so the first non-world entity lands at the first
+	// post-client slot). Out-of-range returns nil; SpawnEntities then
+	// records the per-slot allocation failure + moves on.
+	edictAt := func(i int) *progs.Edict {
+		if i == 0 {
+			return s.Edicts[0]
+		}
+		slot := s.NumEdicts
+		if slot >= s.MaxEdicts {
+			return nil
+		}
+		s.NumEdicts++
+		return s.Edicts[slot]
+	}
 	if err := entparse.SpawnEntities(entFields, deps.Progs, edictAt, deps.Interner, deps.SpawnFn); err != nil {
 		return fmt.Errorf("server: spawn entities: %w", err)
 	}
