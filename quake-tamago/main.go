@@ -28,6 +28,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -50,6 +51,7 @@ import (
 	"github.com/go-quake1/engine/bspfile/synthbsp"
 	"github.com/go-quake1/engine/bsprender"
 	"github.com/go-quake1/engine/client"
+	"github.com/go-quake1/engine/embedpak"
 	"github.com/go-quake1/engine/model"
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/runloop"
@@ -195,23 +197,35 @@ func run() error {
 	return runDemo3D(runner.FrameBuffer, runner.RGBA, runner.Palette, be)
 }
 
-// runDemo3D renders a synthetic BSP via the full engine pipeline:
-// synthbsp.BuildWithFaces -> bspfile.Open -> model.LoadBrush ->
+// runDemo3D renders a BSP via the full engine pipeline:
+// (embedpak | synthbsp) -> bspfile.Open -> model.LoadBrush ->
 // bsprender.NewWalkContext + WalkWorld -> bsprender.TransformFace ->
 // render.FillTexturedPolygon -> virtio-gpu Flush. Loops forever (the
 // bare-metal binary has no clean exit path).
 //
-// This is the FIRST time the engine's BSP rendering path runs
-// end-to-end on real virtio-gpu hardware. The synthetic BSP carries
-// no LumpMarksurfaces, so a wrapped LeafFaces closure returns every
-// face index for the EMPTY non-sentinel leaf — the demo-only hack
-// that lets WalkWorld emit something while the real PVS+leaf-faces
-// wiring waits on a proper map asset (embedpak).
+// BSP source selection (one-time, at startup):
+//
+//   - Try embedpak.OpenAsFS(). When the operator has dropped a real
+//     pak0.pak into embedpak/empty.pak, the shareware archive is
+//     available and we open "maps/start.bsp" (or "maps/e1m1.bsp" as a
+//     fallback) out of it.
+//   - When the placeholder is still in place (ErrEmbedPakEmpty) OR
+//     neither canonical map is present, fall back to
+//     synthbsp.BuildWithFaces(): the always-available synthetic BSP
+//     that lets the rasterizer path stay exercised without any real
+//     id-Software assets.
+//
+// The synthetic BSP carries no LumpMarksurfaces, so a wrapped
+// LeafFaces closure returns every face index for the EMPTY non-
+// sentinel leaf — the demo-only hack that lets WalkWorld emit
+// something against the synthbsp. Real maps from pak0.pak carry valid
+// marksurfaces + PVS data and don't need the override (but it stays
+// harmless: the wrapper only fires for leaves with no marksurfaces).
 func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be *virtio.Backend) error {
-	// 1. Build the synthetic BSP -> bspfile.File -> *model.BrushModel.
-	bspBytes, size, err := synthbsp.BuildWithFaces()
+	// 1. Source the BSP bytes: real pak0.pak first, synthbsp fallback.
+	bspBytes, size, err := loadBSP()
 	if err != nil {
-		return fmt.Errorf("synthbsp.BuildWithFaces: %w", err)
+		return fmt.Errorf("loadBSP: %w", err)
 	}
 	file, err := bspfile.Open(bytes.NewReader(bspBytes), size)
 	if err != nil {
@@ -356,6 +370,55 @@ func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be 
 		_ = fb.Expand(rgba, palette)
 		_ = be.PresentFrame(rgba, fb.Width, fb.Height)
 	}
+}
+
+// loadBSP returns the BSP bytes + size to render. It walks the
+// preferred sources in order:
+//
+//  1. embedpak.OpenAsFS() — when a real pak0.pak has been dropped
+//     into embedpak/empty.pak, try "maps/start.bsp" (canonical entry
+//     map) then "maps/e1m1.bsp" (episode 1 first map).
+//  2. synthbsp.BuildWithFaces() — the always-available synthetic
+//     fallback. Used when the embedded pak is still the placeholder
+//     OR when neither canonical map is present in the supplied pak.
+//
+// The chosen path is logged on the serial console so the QEMU log
+// makes the source unambiguous.
+func loadBSP() ([]byte, int64, error) {
+	pakFS, err := embedpak.OpenAsFS()
+	if err == nil {
+		for _, mapName := range []string{"maps/start.bsp", "maps/e1m1.bsp"} {
+			data, ok := tryReadPakFile(pakFS, mapName)
+			if ok {
+				fmt.Printf("QUAKE: loaded %s from embedded pak0.pak (%d bytes)\n",
+					mapName, len(data))
+				return data, int64(len(data)), nil
+			}
+		}
+		fmt.Printf("QUAKE: embedded pak0.pak lacks maps/start.bsp and maps/e1m1.bsp; using synthbsp fallback\n")
+	} else if errors.Is(err, embedpak.ErrEmbedPakEmpty) {
+		fmt.Printf("QUAKE: using synthbsp fallback (drop real pak0.pak into embedpak/empty.pak)\n")
+	} else {
+		fmt.Printf("QUAKE: embedpak.OpenAsFS failed (%v); using synthbsp fallback\n", err)
+	}
+	return synthbsp.BuildWithFaces()
+}
+
+// tryReadPakFile opens name inside pakFS and returns its contents.
+// Reports (nil, false) when the entry is missing or unreadable so the
+// caller can probe the next candidate map without having to classify
+// the error.
+func tryReadPakFile(pakFS fs.FS, name string) ([]byte, bool) {
+	f, err := pakFS.Open(name)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
 }
 
 // makeCheckerTex returns an NxN texture with a 4-colour checker
