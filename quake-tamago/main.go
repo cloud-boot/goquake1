@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"time"
 
 	_ "github.com/go-virtio/validate/board"
@@ -181,9 +182,97 @@ func run() error {
 	runner.Console.Print("framebuffer wired; per-tick Compose2D + Flush\n")
 	runner.Screen.ConCurrent = runner.Screen.ConLines
 
-	// 9. Drive the main loop. Returns when QuitRequested or error.
-	fmt.Printf("QUAKE: entering RunUntilQuit\n")
-	return runner.RunUntilQuit()
+	// 9. Drive a 3D demo loop instead of the (still-empty) RunUntilQuit
+	//    path. Renders a rotating textured quad via the perspective
+	//    rasterizer + presents each frame through the virtio-gpu
+	//    Framebuffer.Flush. Proves the 3D path works end-to-end on
+	//    real virtio-gpu hardware.
+	fmt.Printf("QUAKE: entering demo3D loop\n")
+	return runDemo3D(runner.FrameBuffer, runner.RGBA, runner.Palette, be)
+}
+
+// runDemo3D paints a rotating, textured quad into the framebuffer
+// using FillPerspectiveLitTexturedPolygon, expands to RGBA, and
+// flushes via the virtio-gpu backend. Loops forever (the bare-metal
+// binary has no clean exit path).
+func runDemo3D(fb *render.FrameBuffer, rgba []byte, palette *render.Palette, be *virtio.Backend) error {
+	// Synthetic 8x8 checkerboard texture (palette indices 0/15).
+	tex := &render.Pic{Width: 8, Height: 8, Pixels: make([]byte, 64)}
+	for v := 0; v < 8; v++ {
+		for u := 0; u < 8; u++ {
+			if (u+v)&1 == 0 {
+				tex.Pixels[v*8+u] = 15 // light
+			} else {
+				tex.Pixels[v*8+u] = 0 // dark
+			}
+		}
+	}
+	// Identity colormap: every (light, src) -> src.
+	var cm render.ColorMap
+	for light := 0; light < render.ColorMapRows; light++ {
+		for src := 0; src < render.ColorMapCols; src++ {
+			cm[light][src] = byte(src)
+		}
+	}
+
+	halfW := float32(fb.Width) / 2
+	halfH := float32(fb.Height) / 2
+	const fovX = 90.0
+	tanHalfX := float32(math.Tan(fovX / 2 * math.Pi / 180))
+	scale := halfW / tanHalfX
+
+	for frame := 0; ; frame++ {
+		// Sky-blue background.
+		for i := range fb.Pixels {
+			fb.Pixels[i] = 0x10
+		}
+
+		// Rotating square in world space, depth 80, half-edge 40.
+		angle := float64(frame) * 2 * math.Pi / 180
+		c, s := float32(math.Cos(angle)), float32(math.Sin(angle))
+		const (
+			centerZ = float32(80)
+			half    = float32(40)
+		)
+		// 4 corners in world space (XY plane, rotated around Y axis
+		// so the quad tilts away/toward the camera frame by frame).
+		corners := [4][3]float32{
+			{-half * c, -half, centerZ - half*s},
+			{+half * c, -half, centerZ + half*s},
+			{+half * c, +half, centerZ + half*s},
+			{-half * c, +half, centerZ - half*s},
+		}
+		// UVs (texture pixels 0..7 across).
+		uvs := [4][2]float32{
+			{0, 0}, {7, 0}, {7, 7}, {0, 7},
+		}
+		// Project every vertex; reject if any Z too small.
+		var verts [4]render.PerspLitTexturedVertex
+		ok := true
+		for i := 0; i < 4; i++ {
+			z := corners[i][2]
+			if z < 1 {
+				ok = false
+				break
+			}
+			invZ := 1 / z
+			verts[i] = render.PerspLitTexturedVertex{
+				X:     halfW + corners[i][0]*scale*invZ,
+				Y:     halfH - corners[i][1]*scale*invZ,
+				Z:     z,
+				U:     uvs[i][0],
+				V:     uvs[i][1],
+				Light: 0, // brightest row of the colormap (identity = src verbatim)
+			}
+		}
+		if ok {
+			_ = render.FillPerspectiveLitTexturedPolygon(fb, tex, &cm, verts[:])
+		}
+
+		// Expand palette -> RGBA, hand to virtio-gpu for flush.
+		_ = fb.Expand(rgba, palette)
+		_ = be.PresentFrame(rgba, fb.Width, fb.Height)
+	}
 }
 
 // syntheticAssets returns an fs.FS backed by fstest.MapFS that holds
