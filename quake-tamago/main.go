@@ -86,6 +86,7 @@ import (
 	"github.com/go-quake1/engine/client"
 	"github.com/go-quake1/engine/embedpak"
 	enginehost "github.com/go-quake1/engine/host"
+	"github.com/go-quake1/engine/mathlib"
 	"github.com/go-quake1/engine/mdl"
 	"github.com/go-quake1/engine/model"
 	"github.com/go-quake1/engine/progs"
@@ -952,6 +953,19 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 		// delta above the entity's base origin.
 		origin[2] += runner.Client.ViewHeightOffset
 
+		// Publish the listener basis to the host so per-tic QC-driven
+		// sound dispatch (builtinSound / builtinAmbientSound) can drive
+		// sound.Spatialize via [enginehost.Host.StartSoundAt] /
+		// [enginehost.Host.AmbientSoundAt]. The right axis is the
+		// second return of mathlib.AngleVectors -- the listener's right
+		// ear projection that determines stereo balance. tyrquake's
+		// S_Update updates the listener every frame via
+		// AngleVectors(cl.viewangles, ...); this is the equivalent.
+		if realHost != nil {
+			_, lright, _ := mathlib.AngleVectors(mathlib.Vec3(viewAngles))
+			realHost.SetListener(origin, [3]float32(lright))
+		}
+
 		rd := &render.RefDef{
 			VRect:      render.VRect{Width: fb.Width, Height: fb.Height},
 			ViewAngles: viewAngles,
@@ -1079,6 +1093,27 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				surfaces.Len(),
 				active, enginesound.MixBufferStereoFrames,
 				soundsStarted, ambientsStarted)
+
+			// Sample spatialized channel: scan the dynamic + reserved
+			// channel pools for the FIRST active channel and log its
+			// (L, R) per-ear volumes. With Spatialize wired the values
+			// should diverge whenever the source isn't directly in
+			// front of the listener (centered = balanced; right of
+			// listener -> R > L; behind/far -> both attenuated).
+			// Without the listener basis OR with AttenuationNone the
+			// fall-through path leaves L == R (= master volume).
+			if realHost != nil && realHost.SoundPool() != nil {
+				pool := realHost.SoundPool()
+				for i := range pool.Channels {
+					if pool.Channels[i].Sfx == nil {
+						continue
+					}
+					ch := &pool.Channels[i]
+					fmt.Printf("QUAKE: spatialize sample tic %d -- ch[%d] ent=%d L=%d R=%d master=%v\n",
+						frame, i, ch.EntNum, ch.LeftVol, ch.RightVol, ch.Master)
+					break
+				}
+			}
 
 			// One-shot Entities-map census on the first per-60 log
 			// after the wire drain has populated svc_updates. Surfaces
@@ -2044,10 +2079,7 @@ func builtinSound(h *enginehost.Host) progs.Builtin {
 		chanF, _ := vm.GlobalFloat(progs.OfsParm1)
 		nameOff, _ := vm.GlobalInt(progs.OfsParm2)
 		volF, _ := vm.GlobalFloat(progs.OfsParm3)
-		// PARM4 = attenuation; carried for the future Spatialize wiring
-		// (read here so the per-arg layout is documented + future code
-		// only flips one line, not five).
-		_, _ = vm.GlobalFloat(progs.OfsParm4)
+		attenF, _ := vm.GlobalFloat(progs.OfsParm4)
 
 		name := vm.String(nameOff)
 		if name == "" {
@@ -2058,8 +2090,10 @@ func builtinSound(h *enginehost.Host) progs.Builtin {
 		// upstream's "no specific origin" sentinel; non-world slots are
 		// for entity-attached sounds (weapon fire, monster grunt, ...).
 		entIdx := 0
+		var entEdict *progs.Edict
 		if arena := vm.Arena(); arena != nil && entPtr != 0 {
 			if ed, _, err := arena.ResolvePointer(entPtr); err == nil {
+				entEdict = ed
 				for i, e := range h.Server.Edicts {
 					if e == ed {
 						entIdx = i
@@ -2085,7 +2119,21 @@ func builtinSound(h *enginehost.Host) progs.Builtin {
 			vol = 255
 		}
 
-		if _, err := h.StartSound(entIdx, channel, name, vol, -1, -1); err != nil {
+		// Source origin: the owning entity's origin entvars field
+		// (zero when the sound is world-owned or the lookup fails;
+		// Spatialize treats a zero source with a non-zero listener as
+		// "to the listener's left/right depending on the right axis").
+		var sourceOrigin [3]float32
+		if entEdict != nil {
+			if p := h.Progs(); p != nil {
+				if ev, err := progs.NewEntVars(p, entEdict); err == nil {
+					sourceOrigin, _ = ev.ReadVec3("origin")
+				}
+			}
+		}
+
+		atten := enginesound.SoundAttenuation(attenF)
+		if _, err := h.StartSoundAt(entIdx, channel, name, vol, atten, sourceOrigin); err != nil {
 			// Log + continue. The most common failure here is "sample
 			// not precached" -- a real bug in the asset path but not
 			// a reason to abort the per-tic dispatch.
@@ -2127,13 +2175,14 @@ func builtinAmbientSound(h *enginehost.Host) progs.Builtin {
 		if h == nil || h.SoundPool() == nil {
 			return nil
 		}
-		// Read the world-space anchor; carried for the future Spatialize
-		// wiring (the C upstream stores it on the static channel so
-		// SND_Spatialize can compute per-frame L/R falloff).
-		_, _ = vm.GlobalVector(progs.OfsParm0)
+		// Read the world-space anchor; the C upstream stores it on the
+		// static channel so SND_Spatialize computes per-frame L/R
+		// falloff. The Go port spatializes at fire-time using the
+		// listener basis the embedder publishes via Host.SetListener.
+		position, _ := vm.GlobalVector(progs.OfsParm0)
 		nameOff, _ := vm.GlobalInt(progs.OfsParm1)
 		volF, _ := vm.GlobalFloat(progs.OfsParm2)
-		_, _ = vm.GlobalFloat(progs.OfsParm3)
+		attenF, _ := vm.GlobalFloat(progs.OfsParm3)
 
 		name := vm.String(nameOff)
 		if name == "" {
@@ -2165,7 +2214,8 @@ func builtinAmbientSound(h *enginehost.Host) progs.Builtin {
 		if vol > 255 {
 			vol = 255
 		}
-		if _, err := h.AmbientSound(slot, 0, name, vol); err != nil {
+		atten := enginesound.SoundAttenuation(attenF)
+		if _, err := h.AmbientSoundAt(slot, 0, name, vol, position, atten); err != nil {
 			fmt.Printf("QUAKE: ambientsound(%q vol=%d slot=%d): %v\n", name, vol, slot, err)
 		}
 		return nil

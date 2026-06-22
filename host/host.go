@@ -149,6 +149,18 @@ type Host struct {
 	// path (ErrSoundLoadFailed). Decoupled from the host so the package
 	// stays free of any `pak` / `vfs` dependency.
 	soundLoader SoundLoader
+
+	// listenerSet records whether a per-tic listener context has been
+	// wired via [Host.SetListener]. Without one, the spatialize-then-
+	// allocate path in [Host.StartSoundAt] / [Host.AmbientSoundAt]
+	// degrades to the existing "full master volume on both ears"
+	// behaviour (= no stereo balance, no distance falloff). Tests +
+	// pre-signon embedders that never call SetListener get the
+	// unspatialized path verbatim; production quake-tamago calls
+	// SetListener every tic with the camera origin + right axis.
+	listenerSet    bool
+	listenerOrigin [3]float32
+	listenerRight  [3]float32
 }
 
 // ErrNilDep fires on a missing required NewHost dependency.

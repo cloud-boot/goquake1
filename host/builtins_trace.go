@@ -147,18 +147,33 @@ func (h *Host) TraceLine(start, end [3]float32, mode MoveMode, passEdict *progs.
 			}
 			if sol == server.SolidBSP {
 				// SOLID_BSP (sub-model doors / movers / breakables)
-				// clips need the per-entity model.BrushModel; the Go
-				// port's Server.Models[i] currently exposes only the
-				// raw *bspfile.File, not the *model.BrushModel
-				// world.HullForBounds requires. Skipped here -- the
-				// world hull already contains the static map CSG, so
-				// the trace still clips against the world. SOLID_BSP
-				// movers won't separately occlude; that costs nothing
-				// for the monster-sightline use case which only needs
-				// world + monster-bbox candidates. A follow-up batch
-				// that exposes per-entity BrushModels can drop this
-				// continue.
-				continue
+				// clips need the per-entity model.BrushModel. The
+				// modelindex field on the edict is the per-precache
+				// slot the worldmodel's submodel "*N" was carved into
+				// at SpawnServer time (Server.BrushModels[idx]).
+				// tyrquake: SV_HullForEntity's
+				// `model = sv.models[(int)ent->v.modelindex]` lookup.
+				miF, err := ev.ReadFloat("modelindex")
+				if err != nil {
+					// No modelindex field on this edict -> can't
+					// resolve the submodel hulls. Drop the candidate
+					// rather than fall through to the boxhull path
+					// (which would over-occlude with the entity's
+					// bbox, not its real BSP geometry).
+					continue
+				}
+				mi := int(miF)
+				if mi <= 0 || mi >= len(h.Server.BrushModels) {
+					continue
+				}
+				bm := h.Server.BrushModels[mi]
+				if bm == nil {
+					// Submodel slot carved nil at SpawnServer (corrupt
+					// bsp lump, or an alias/sprite precache slot). Skip
+					// rather than over-occlude with the bbox.
+					continue
+				}
+				tgt.BrushModel = bm
 			}
 			candidates = append(candidates, tgt)
 			candIdx = append(candIdx, idx)

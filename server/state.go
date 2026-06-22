@@ -68,8 +68,18 @@ type Server struct {
 
 	ModelPrecache []string       // [MaxModels], sentinel-terminated
 	Models        []*model.Model // parallel to ModelPrecache
-	SoundPrecache []string       // [MaxSounds], sentinel-terminated
-	LightStyles   []string       // [MaxLightStyles]
+	// BrushModels is the parallel-to-ModelPrecache slice of per-
+	// submodel [model.BrushModel] handles SpawnServer carves out of
+	// the worldmodel's `*N` submodels so SOLID_BSP entities (doors,
+	// lifts, train movers, breakables) can drive a per-entity
+	// clipping hull through [world.HullForBounds]. Slot 0 is the
+	// empty-string sentinel (nil); slot 1 is the worldmodel; slots
+	// 2..N hold the per-submodel BrushModels. Slots for non-brush
+	// precaches (.mdl alias / .spr sprite) stay nil -- the trace
+	// dispatcher checks for nil before reaching for Hulls.
+	BrushModels   []*model.BrushModel // parallel to ModelPrecache
+	SoundPrecache []string            // [MaxSounds], sentinel-terminated
+	LightStyles   []string            // [MaxLightStyles]
 
 	Edicts    []*progs.Edict // [MaxEdicts]
 	NumEdicts int            // first free slot
@@ -161,6 +171,7 @@ func NewServer() *Server {
 	return &Server{
 		ModelPrecache:    make([]string, MaxModels),
 		Models:           make([]*model.Model, MaxModels),
+		BrushModels:      make([]*model.BrushModel, MaxModels),
 		SoundPrecache:    make([]string, MaxSounds),
 		LightStyles:      make([]string, MaxLightStyles),
 		Datagram:         sizebuf.New(make([]byte, MaxDatagram)),
