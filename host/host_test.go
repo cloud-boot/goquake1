@@ -815,16 +815,51 @@ func TestWorldEdict_PostSpawnReturnsWorld(t *testing.T) {
 	}
 }
 
-// entityPointer returns 0 for nil + for a non-nil ent (current scope).
+// entityPointer returns 0 for nil ent, 0 for non-nil ent when no
+// arena is attached (pre-SpawnServer / test-stub shape), and the
+// arena byte-offset for non-nil ent post-SpawnServer (production
+// shape -- the value OP_STATE consumes via vm.selfEdict() to pick
+// which edict to write nextthink/frame/think into).
 func TestEntityPointer_NilEntIsZero(t *testing.T) {
 	h, _ := makeHost(t, nil, 1)
 	if got := h.entityPointer(nil); got != 0 {
 		t.Errorf("nil ent -> %d want 0", got)
 	}
-	// Non-nil branch: any *Edict (we synthesize one here) also
-	// returns 0 under the current scope.
+	// No-arena branch: any *Edict (we synthesize one here) returns
+	// 0 because h.Server.Arena is nil pre-SpawnServer.
 	if got := h.entityPointer(&progs.Edict{}); got != 0 {
-		t.Errorf("non-nil ent -> %d want 0", got)
+		t.Errorf("non-nil ent (no arena) -> %d want 0", got)
+	}
+}
+
+// entityPointer returns the arena byte-offset when an arena is
+// attached, matching what OP_STATE expects vm.selfEdict() to
+// produce. The world edict (slot 0) is byte 0; slot 1 is byte
+// FieldBytes(); etc.
+func TestEntityPointer_ArenaPointerForEdict(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if h.Server.Arena == nil {
+		t.Fatal("SpawnServer should populate Server.Arena")
+	}
+	// World edict -> byte offset 0.
+	if got := h.entityPointer(h.Server.Edicts[0]); got != 0 {
+		t.Errorf("world edict -> %d want 0", got)
+	}
+	// Slot 1 -> arena's MakePointer(1, 0).
+	if len(h.Server.Edicts) > 1 {
+		want := int(h.Server.Arena.PointerForEdict(h.Server.Edicts[1]))
+		if got := h.entityPointer(h.Server.Edicts[1]); got != want {
+			t.Errorf("slot-1 -> %d want %d", got, want)
+		}
+		// The slot-1 pointer must be non-zero so OP_STATE writes
+		// land on the dispatching edict rather than the world.
+		if want == 0 {
+			t.Error("slot-1 arena pointer should be non-zero")
+		}
 	}
 }
 

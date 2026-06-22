@@ -657,24 +657,30 @@ func (h *Host) thinkCaller(ent *progs.Edict, funcID int32) error {
 
 // entityPointer returns the QC entity-pointer (a byte offset into
 // the edict arena) for ent. Falls back to 0 (the world pointer)
-// when ent is nil, matching the upstream's "every nil ent is the
-// world" convention inside PR_ExecuteProgram.
+// when ent is nil OR when no arena is attached, matching the
+// upstream's "every nil ent is the world" convention inside
+// PR_ExecuteProgram.
 //
-// SCOPE NOTE: the VM has no exported arena accessor on this port,
-// so the host returns 0 for every entity here. The QC bridge still
-// sets self / other globals; their pointer value just always
-// references the world edict (index 0). A follow-up that exposes
-// the VM's arena will let entityPointer translate ent into the
-// arena's per-edict byte offset. The bridge's primary contract --
-// dispatch vm.Run(funcID) -- is satisfied either way.
+// With an arena present (the production path post-SpawnServer), the
+// per-edict byte offset is the value the arena's MakePointer encodes
+// for ent. This is what OP_STATE consumes via vm.selfEdict() to
+// resolve which edict's nextthink/frame/think fields to write -- so
+// returning 0 here for a non-world ent would silently divert every
+// post-spawn OP_STATE write onto the world edict (root cause of the
+// monster-think-chain breaking after the first dispatch: re-arms
+// land on the world, the monster's own .nextthink stays cleared,
+// and the walker never re-fires the chain).
 func (h *Host) entityPointer(ent *progs.Edict) int {
 	if ent == nil {
 		return 0
 	}
-	// Without an exported arena handle, the byte-offset is opaque
-	// from outside the VM. Return 0 as a sentinel; the test
-	// harness asserts the bridge's vm.Run contract directly.
-	return 0
+	if h.Server == nil || h.Server.Arena == nil {
+		// Pre-SpawnServer (test stubs that skip the map load). The
+		// QC bridge still dispatches vm.Run(funcID); only the per-
+		// edict pointer hand-off degrades to the world sentinel.
+		return 0
+	}
+	return int(h.Server.Arena.PointerForEdict(ent))
 }
 
 // worldEdict returns Server.Edicts[0] -- the world entity the C
