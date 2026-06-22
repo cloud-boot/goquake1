@@ -305,6 +305,19 @@ func TestSpawnServer_AllocatesPostWorldSlots(t *testing.T) {
 	if s.NumEdicts != want {
 		t.Errorf("NumEdicts got %d want %d (reserve+2 post-world entities)", s.NumEdicts, want)
 	}
+	// Every newly-allocated post-world slot must have Free=false so
+	// per-edict walks (CleanupEnts / SV_CreateBaseline / PVS) see it
+	// as live. Without the ED_Alloc-equivalent flip in edictAt the
+	// arena's Reset default Free=true would silently hide every
+	// parsed entity. The reserve [0..MaxClients] slots are not
+	// claimed by the entity-parse pass; the world (slot 0) is the
+	// arena's reset-default Free=false; client slots are managed by
+	// the netcode (not asserted here).
+	for slot := deps.Static.MaxClients + 1; slot < s.NumEdicts; slot++ {
+		if s.Edicts[slot].Free {
+			t.Errorf("Edicts[%d].Free: got true want false (edictAt must flip Free off)", slot)
+		}
+	}
 }
 
 // MaxEdicts cap: when entities exceed the cap, SpawnEntities surfaces

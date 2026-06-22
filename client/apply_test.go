@@ -489,8 +489,80 @@ func TestApply_UpdateFrags_OutOfRange_SilentSkip(t *testing.T) {
 	}
 }
 
+// --- DecodedBaseline ----------------------------------------------------
+
+// TestApply_Baseline_CachesIntoState verifies the per-entity baseline
+// is folded into State.Baselines keyed by EntityNum, with every field
+// copied verbatim. Mirrors the upstream cl_entities[ent].baseline write.
+func TestApply_Baseline_CachesIntoState(t *testing.T) {
+	s := NewState()
+	bl := DecodedBaseline{
+		EntityNum: 42,
+		ModelIdx:  7,
+		Frame:     3,
+		ColorMap:  2,
+		SkinNum:   1,
+		Origin:    [3]float32{8, 16, 24},
+		Angles:    [3]float32{0, 90, 180},
+		Alpha:     0,
+	}
+	if err := Apply(s, bl, 1.5); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	got, ok := s.Baselines[42]
+	if !ok {
+		t.Fatalf("Baselines[42] missing; map = %v", s.Baselines)
+	}
+	want := EntityBaseline{
+		ModelIdx: 7,
+		Frame:    3,
+		ColorMap: 2,
+		SkinNum:  1,
+		Origin:   [3]float32{8, 16, 24},
+		Angles:   [3]float32{0, 90, 180},
+		Alpha:    0,
+	}
+	if got != want {
+		t.Errorf("Baselines[42]: got %+v want %+v", got, want)
+	}
+}
+
+// Apply must lazily allocate Baselines if a caller built a State
+// without going through NewState (e.g. test stubs, partial-construction).
+func TestApply_Baseline_LazilyAllocatesMap(t *testing.T) {
+	s := &State{} // no NewState; Baselines is nil
+	if err := Apply(s, DecodedBaseline{EntityNum: 1, ModelIdx: 9}, 0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.Baselines == nil {
+		t.Fatal("Baselines: got nil want allocated")
+	}
+	if s.Baselines[1].ModelIdx != 9 {
+		t.Errorf("Baselines[1].ModelIdx: got %d want 9", s.Baselines[1].ModelIdx)
+	}
+}
+
+// Sequential baselines for distinct entity numbers all survive and
+// don't collide.
+func TestApply_Baseline_MultipleEntities(t *testing.T) {
+	s := NewState()
+	for i := 0; i < 10; i++ {
+		if err := Apply(s, DecodedBaseline{EntityNum: i, ModelIdx: i * 7}, 0); err != nil {
+			t.Fatalf("Apply[%d]: %v", i, err)
+		}
+	}
+	if len(s.Baselines) != 10 {
+		t.Errorf("Baselines len: got %d want 10", len(s.Baselines))
+	}
+	for i := 0; i < 10; i++ {
+		if s.Baselines[i].ModelIdx != i*7 {
+			t.Errorf("Baselines[%d].ModelIdx: got %d want %d", i, s.Baselines[i].ModelIdx, i*7)
+		}
+	}
+}
+
 // --- Documented no-op arms (Print/StuffText/Finale/Cutscene/SellScreen/
-// KilledMonster/FoundSecret/Particle/Sound/Baseline/Update) --------------
+// KilledMonster/FoundSecret/Particle/Sound/Update) -----------------------
 
 func TestApply_DocumentedNoOps_DoNotMutate(t *testing.T) {
 	cases := []struct {
@@ -506,7 +578,6 @@ func TestApply_DocumentedNoOps_DoNotMutate(t *testing.T) {
 		{"FoundSecret", DecodedFoundSecret{}},
 		{"Particle", DecodedParticle{Origin: [3]float32{1, 2, 3}, Count: 10}},
 		{"Sound", DecodedSound{EntityIdx: 5, SoundNum: 10, Volume: 200}},
-		{"Baseline", DecodedBaseline{EntityNum: 4, ModelIdx: 1}},
 		{"Update", DecodedUpdate{EntityNum: 4, Bits: 0xf0}},
 	}
 	for _, c := range cases {

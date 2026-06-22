@@ -281,6 +281,23 @@ func run() error {
 		if err := engineserver.SendSignonHandshake(hc, info); err != nil {
 			return fmt.Errorf("SendSignonHandshake: %w", err)
 		}
+		// Append per-entity baselines (svc_spawnbaseline) onto the same
+		// client.Message buffer. The upstream walks sv.signon AFTER the
+		// serverinfo trailer + before the per-stage signonnum byte-pairs;
+		// the Go port currently queues the four signonnum stages back-
+		// to-back inside SendSignonHandshake, so the baselines land after
+		// stage 4. Client-side state-cache semantics are insensitive to
+		// the relative order (applyBaseline is a pure map write, never
+		// gated on Connection state), so the visible effect on the
+		// client is the same: State.Baselines is populated by the time
+		// the first per-tic Tick finishes draining the queue.
+		blStat, err := realHost.Server.SendBaselines(hc, realHost.Progs(), realHost.Static.MaxClients)
+		if err != nil {
+			return fmt.Errorf("SendBaselines: %w", err)
+		}
+		fmt.Printf("QUAKE: svc_spawnbaseline broadcast -- emitted=%d skipped_free=%d skipped_nomodel=%d (out of %d edicts; total queued bytes=%d)\n",
+			blStat.Emitted, blStat.SkippedFree, blStat.SkippedNoModel,
+			realHost.Server.NumEdicts, hc.Message.Len())
 		// Mark the server-side client Spawned so the per-tic
 		// WriteClientData + SendClientFrames paths fire after the
 		// handshake queue. The upstream signon-stage 4 flips this on
@@ -645,10 +662,11 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 		// Logging the first few tics surfaces a regression if the
 		// loopback flush stops delivering bytes to the client decoder.
 		if frame < 6 {
-			fmt.Printf("QUAKE: signon trace tic %d -- clientConn=%d Spawned=%v viewh=%v health=%d\n",
+			fmt.Printf("QUAKE: signon trace tic %d -- clientConn=%d Spawned=%v viewh=%v health=%d baselines=%d\n",
 				frame, int(runner.Client.Connection),
 				runner.Client.Spawned,
-				runner.Client.ViewHeightOffset, runner.Client.Health)
+				runner.Client.ViewHeightOffset, runner.Client.Health,
+				len(runner.Client.Baselines))
 		}
 
 		// Per-frame face count log (sparse, every 60 frames) so the

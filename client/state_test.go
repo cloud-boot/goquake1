@@ -85,6 +85,14 @@ func TestNewState_InitializedFields(t *testing.T) {
 	if s.Message.Len() != 0 {
 		t.Errorf("Message.Len: got %d want 0", s.Message.Len())
 	}
+	// Baselines map allocated + empty so the per-entity baseline cache
+	// can be written to from frame 0 without a nil-check.
+	if s.Baselines == nil {
+		t.Fatal("Baselines: got nil want allocated")
+	}
+	if len(s.Baselines) != 0 {
+		t.Errorf("Baselines len: got %d want 0", len(s.Baselines))
+	}
 }
 
 // --- Clear ---------------------------------------------------------------
@@ -103,6 +111,7 @@ func TestState_Clear_WipesPerMapFields(t *testing.T) {
 	s.Stats[0] = 42
 	s.Items = 0xff
 	s.Ammo[2] = 50
+	s.Baselines[7] = EntityBaseline{ModelIdx: 13, Frame: 2}
 	// Pre-Clear: connection + spawned set so we can verify they
 	// are preserved by Clear (only Disconnect mutates them).
 	s.Connection = StateConnected
@@ -168,6 +177,14 @@ func TestState_Clear_WipesPerMapFields(t *testing.T) {
 	}
 	if s.Message.Len() != 0 {
 		t.Errorf("Message.Len post-Clear: got %d want 0", s.Message.Len())
+	}
+	// Baselines reset to a fresh empty map (not nil) so subsequent
+	// DecodedBaseline arms can write without a nil-check.
+	if s.Baselines == nil {
+		t.Fatal("Baselines: got nil post-Clear want allocated empty map")
+	}
+	if len(s.Baselines) != 0 {
+		t.Errorf("Baselines len post-Clear: got %d want 0", len(s.Baselines))
 	}
 }
 

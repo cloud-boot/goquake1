@@ -252,7 +252,20 @@ func (s *Server) SpawnServer(mapName string, protocol int, deps SpawnDeps) error
 			return nil
 		}
 		s.NumEdicts++
-		return s.Edicts[slot]
+		// Match the upstream's ED_Alloc semantics: the allocator
+		// claims a free slot + flips its Free flag false so subsequent
+		// walks (CleanupEnts, SV_CreateBaseline, server-side PVS) see
+		// it as live. The arena's Reset starts every non-world slot
+		// at Free=true so unclaimed slots stay invisible to those
+		// walks; without this flip the entity-spawn pass populates
+		// fields but leaves the slot administratively "free", which
+		// silently hides every parsed entity from every per-edict
+		// per-frame loop (SV_CreateBaseline skipped 539/540 slots in
+		// the bring-up before this fix).
+		e := s.Edicts[slot]
+		e.Free = false
+		e.FreeTime = 0
+		return e
 	}
 	if err := entparse.SpawnEntities(entFields, deps.Progs, edictAt, deps.Interner, deps.SpawnFn); err != nil {
 		return fmt.Errorf("server: spawn entities: %w", err)

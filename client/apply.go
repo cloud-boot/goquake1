@@ -119,6 +119,9 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 	case DecodedUpdateFrags:
 		applyUpdateFrags(state, m)
 		return nil
+	case DecodedBaseline:
+		applyBaseline(state, m)
+		return nil
 	case DecodedNop,
 		DecodedPrint,
 		DecodedStuffText,
@@ -129,7 +132,6 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 		DecodedFoundSecret,
 		DecodedParticle,
 		DecodedSound,
-		DecodedBaseline,
 		DecodedUpdate:
 		// Documented no-op arms:
 		//   - Nop:                       connection-alive heartbeat
@@ -137,7 +139,7 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 		//   - Finale / Cutscene / SellScreen: UI-state transitions
 		//   - KilledMonster / FoundSecret:    gameplay sound triggers
 		//   - Particle / Sound:          particle pool + sound mixer (separate layers)
-		//   - Baseline / Update:         per-entity state cache (separate layer)
+		//   - Update:                    per-tic delta cache (separate layer)
 		return nil
 	}
 	return fmt.Errorf("%w: %T", ErrApplyUnknown, msg)
@@ -229,4 +231,27 @@ func applyUpdateFrags(state *State, m DecodedUpdateFrags) {
 		return
 	}
 	state.Frags[m.Slot] = m.Frags
+}
+
+// applyBaseline handles svc_spawnbaseline: cache the per-entity
+// snapshot into [State.Baselines] keyed by EntityNum so per-tic
+// svc_update deltas (a follow-up batch) can resolve their omitted
+// fields against the entity's last-known-good state. Allocates the
+// map lazily so callers that constructed a State without going through
+// [NewState] don't crash on the first arm.
+// tyrquake: CL_ParseBaseline -- the per-entity body that copies the
+// decoded entity_state_t into cl_entities[entnum].baseline.
+func applyBaseline(state *State, m DecodedBaseline) {
+	if state.Baselines == nil {
+		state.Baselines = make(map[int]EntityBaseline)
+	}
+	state.Baselines[m.EntityNum] = EntityBaseline{
+		ModelIdx: m.ModelIdx,
+		Frame:    m.Frame,
+		ColorMap: m.ColorMap,
+		SkinNum:  m.SkinNum,
+		Origin:   m.Origin,
+		Angles:   m.Angles,
+		Alpha:    m.Alpha,
+	}
 }

@@ -45,6 +45,26 @@ const (
 // tyrquake: NQ/quakedef.h MAX_MSGLEN.
 const MaxClientMessage = 1 << 18
 
+// EntityBaseline is one per-entity snapshot the server emits during
+// the signon handshake (svc_spawnbaseline). The client caches every
+// baseline so future svc_update deltas can be resolved against the
+// last-known-good state of the entity. tyrquake: entity_state_t (the
+// e.baseline field on entity_t in the client-side CL_ParseBaseline
+// code path).
+//
+// The Alpha field is FITZ-only; vanilla NQ baselines always store 0
+// (ENTALPHA_DEFAULT). Mirrors the wire-decoded [DecodedBaseline] shape
+// minus the EntityNum (which is the map key).
+type EntityBaseline struct {
+	ModelIdx int
+	Frame    int
+	ColorMap int
+	SkinNum  int
+	Origin   [3]float32
+	Angles   [3]float32
+	Alpha    int
+}
+
 // LightStyle is one of the 64 named light animation strings.
 // Each byte is one frame; 'a' = dim, 'z' = bright. tyrquake:
 // lightstyle_t.map in NQ/client.h (the .length field is implicit
@@ -137,6 +157,20 @@ type State struct {
 	// [NewState] and preserved across [State.Clear] /
 	// [State.Disconnect]; only its contents are wiped.
 	Message *sizebuf.Buffer
+
+	// Baselines is the per-entity snapshot cache the [Apply] arm for
+	// [DecodedBaseline] fills as the server's signon-time
+	// svc_spawnbaseline broadcast streams in. Keyed by entity index
+	// (the same int the wire message carries). The map is allocated
+	// by [NewState] so the first DecodedBaseline arm never has to
+	// nil-check; [State.Clear] resets it to a fresh empty map so per-
+	// map state doesn't leak across SV_SpawnServer.
+	//
+	// Renderer integration (per-tic svc_update lerping, model dispatch,
+	// PVS culling) reads this map -- the current bring-up just proves
+	// the broadcast lands by counting Baselines after the handshake
+	// drain.
+	Baselines map[int]EntityBaseline
 }
 
 // ErrAlreadyConnected is returned by [State.SetConnecting] when
@@ -153,7 +187,8 @@ var ErrNotConnecting = errors.New("client: not in StateConnecting")
 // zero.
 func NewState() *State {
 	return &State{
-		Message: sizebuf.New(make([]byte, MaxClientMessage)),
+		Message:   sizebuf.New(make([]byte, MaxClientMessage)),
+		Baselines: make(map[int]EntityBaseline),
 	}
 }
 
@@ -173,6 +208,7 @@ func (s *State) Clear() {
 		Connection: s.Connection,
 		Spawned:    s.Spawned,
 		Message:    buf,
+		Baselines:  make(map[int]EntityBaseline),
 	}
 }
 
