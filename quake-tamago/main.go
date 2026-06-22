@@ -86,6 +86,7 @@ import (
 	"github.com/go-quake1/engine/client"
 	"github.com/go-quake1/engine/embedpak"
 	enginehost "github.com/go-quake1/engine/host"
+	"github.com/go-quake1/engine/mdl"
 	"github.com/go-quake1/engine/model"
 	"github.com/go-quake1/engine/progs"
 	"github.com/go-quake1/engine/protocol"
@@ -398,7 +399,32 @@ func run() error {
 	//     real host exists we pass it in so the per-frame camera can
 	//     follow the player edict at slot 1; nil falls back to the
 	//     static pickInMapCamera anchor.
-	if err := setupRenderer(runner, pakFS, realHost, playerSlot); err != nil {
+	//
+	//     Alias models (monsters/items/players .mdl) are pre-loaded
+	//     here from the authoritative server.Server.ModelPrecache so
+	//     the Pre2DDraw hook can iterate State.Entities + dispatch
+	//     render.DrawAlias per entity without re-opening the pak each
+	//     tic. Server-side precache is identical to what the client
+	//     mirrors over the wire (it IS the source the queued
+	//     svc_serverinfo bytes carry), so loading from the server side
+	//     avoids the chicken-and-egg of "client.State.ModelPrecache is
+	//     not populated until the first client.Tick drains the queue".
+	var (
+		aliasPrecache []string
+		aliasModels   []*mdl.Model
+		aliasSkins    []*render.Pic
+		aliasLoaded   int
+		aliasNames    int
+	)
+	if realHost != nil {
+		aliasPrecache = realHost.Server.ModelPrecache
+	} else {
+		aliasPrecache = clientState.ModelPrecache
+	}
+	aliasModels, aliasSkins, aliasLoaded, aliasNames = loadAliasModels(pakFS, aliasPrecache)
+	fmt.Printf("QUAKE: alias models loaded: %d / %d names\n",
+		aliasLoaded, aliasNames)
+	if err := setupRenderer(runner, pakFS, realHost, playerSlot, aliasModels, aliasSkins); err != nil {
 		return fmt.Errorf("setupRenderer: %w", err)
 	}
 
@@ -437,7 +463,7 @@ func run() error {
 // trace stack on purpose: the goal of this bring-up is "key press moves
 // the camera", not "physically correct movement". A follow-up batch
 // swaps the integrator for the real SV_Physics tick.
-func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int) error {
+func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int, aliasModels []*mdl.Model, aliasSkins []*render.Pic) error {
 	// 1. Source the BSP bytes: real pak0.pak first, synthbsp fallback.
 	bspBytes, size, err := loadBSP(pakFS)
 	if err != nil {
@@ -840,6 +866,66 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				}
 			}
 			_ = render.FillTexturedPolygon(fb, tex, &cm, 0, verts)
+		}
+
+		// Alias-model pass. Iterate the wire-mirrored State.Entities
+		// (the client's per-tic snapshot the server broadcast over
+		// svc_update) and rasterize one DrawAlias per entity whose
+		// ModelIdx resolves to a loaded .mdl. Entries with ModelIdx
+		// == 0 (no model) or aliasModels[ModelIdx] == nil (BSP
+		// submodel like "*1", or a missing/un-loadable .mdl) are
+		// silently skipped -- BSP submodels are already drawn by the
+		// world walk above, alien-format / missing entries have
+		// nothing to render here.
+		//
+		// SCOPE: single-frame draw (DrawAlias, not DrawAliasInterp);
+		// uniform lightLevel = 10 (the colormap is identity, so the
+		// per-vertex shading path is a follow-up). Skin texture: the
+		// per-entity SkinNum field is clamped to the model's available
+		// skins via the parallel aliasSkins slice (one *render.Pic per
+		// precache slot -- a single-skin model exposes its sole skin,
+		// multi-skin variants land in a future batch). On a render
+		// error we log + continue with the next entity so one bad
+		// entity doesn't sink the rest of the frame.
+		aliasRendered := 0
+		for _, es := range runner.Client.Entities {
+			if es.ModelIdx <= 0 || es.ModelIdx >= len(aliasModels) {
+				continue
+			}
+			am := aliasModels[es.ModelIdx]
+			if am == nil {
+				continue
+			}
+			skin := aliasSkins[es.ModelIdx]
+			if skin == nil {
+				skin = fallbackTex
+			}
+			frameIdx := es.Frame
+			if frameIdx < 0 || frameIdx >= len(am.Frames) {
+				frameIdx = 0
+			}
+			ent := render.AliasEntity{
+				Origin:     es.Origin,
+				AnglePitch: es.Angles[0],
+				AngleYaw:   es.Angles[1],
+				AngleRoll:  es.Angles[2],
+				FrameIdx:   frameIdx,
+				SkinIdx:    es.SkinNum,
+			}
+			if err := render.DrawAlias(fb, rd, &cm, 10, am, skin, ent); err != nil {
+				// Per-entity errors are non-fatal; log sparsely so
+				// one bad entity per tic doesn't drown the channel.
+				if frame%60 == 0 {
+					fmt.Printf("QUAKE: DrawAlias modelIdx=%d frame=%d err: %v\n",
+						es.ModelIdx, frameIdx, err)
+				}
+				continue
+			}
+			aliasRendered++
+		}
+		if frame%60 == 0 {
+			fmt.Printf("QUAKE: tic %d rendered %d alias entities\n",
+				frame, aliasRendered)
 		}
 		return nil
 	}
@@ -1753,6 +1839,111 @@ func seedSoundPool(pool *enginesound.Pool, pakFS fs.FS, names []string) int {
 		seeded++
 	}
 	return seeded
+}
+
+// loadAliasModels walks the model precache and opens every entry that
+// names an alias model (".mdl" suffix), returning two parallel slices
+// the Pre2DDraw alias pass indexes by EntityState.ModelIdx:
+//
+//   - models[i] = *mdl.Model decoded out of pakFS, or nil for slots
+//     that name a non-.mdl asset (BSP world/submodels like
+//     "*1"/"*2", sprites, missing files) -- a single source of "skip
+//     this entity" the per-tic loop nil-checks.
+//   - skins[i] = *render.Pic built from the first single-skin of the
+//     model, or nil when the model has no usable single skin (the
+//     per-tic loop falls back to the checker texture). Single-skin
+//     models (the common case) expose Skins[0].Single.Pixels at
+//     SkinWidth*SkinHeight bytes of palette indices; group skins are
+//     skipped in this commit (DrawAliasInterp wires the per-tic skin
+//     picker in a follow-up).
+//
+// Returns the two slices + the count of non-nil models loaded + the
+// count of names in the precache that ended in ".mdl" (lets the caller
+// log "loaded N / M names" so the QEMU serial log says how many of the
+// precache's alias slots actually decoded).
+//
+// The function is tolerant: any per-slot error (missing pak entry,
+// malformed .mdl) leaves models[i] = nil + continues to the next slot.
+// A nil pakFS returns ([], [], 0, 0) -- the placeholder-pak boot path
+// has no .mdl files to load anyway.
+func loadAliasModels(pakFS fs.FS, precache []string) ([]*mdl.Model, []*render.Pic, int, int) {
+	n := len(precache)
+	models := make([]*mdl.Model, n)
+	skins := make([]*render.Pic, n)
+	if pakFS == nil || n == 0 {
+		return models, skins, 0, 0
+	}
+	loaded := 0
+	names := 0
+	for i := 0; i < n; i++ {
+		name := precache[i]
+		if !hasSuffix(name, ".mdl") {
+			continue
+		}
+		names++
+		blob, ok := tryReadPakFile(pakFS, name)
+		if !ok {
+			continue
+		}
+		m, err := mdl.Load(bytes.NewReader(blob), int64(len(blob)))
+		if err != nil {
+			fmt.Printf("QUAKE: mdl.Load(%s) err: %v\n", name, err)
+			continue
+		}
+		models[i] = m
+		skins[i] = firstSkinAsPic(m)
+		loaded++
+	}
+	return models, skins, loaded, names
+}
+
+// firstSkinAsPic returns the model's first single-skin as a *render.Pic
+// (palette-indexed, SkinWidth x SkinHeight, byte-per-pixel). Group
+// skins (animated) collapse to the first sub-skin of the group; a
+// model with zero skins or a malformed first skin returns nil so the
+// caller can fall back to the checker texture.
+//
+// The pixels are copied (not aliased) so the Pic owns a stable buffer
+// independent of any future mutation of m.Skins[0].
+func firstSkinAsPic(m *mdl.Model) *render.Pic {
+	if m == nil || len(m.Skins) == 0 {
+		return nil
+	}
+	w := int(m.Header.SkinWidth)
+	h := int(m.Header.SkinHeight)
+	if w <= 0 || h <= 0 {
+		return nil
+	}
+	var src []byte
+	sk := m.Skins[0]
+	switch sk.Type {
+	case mdl.SkinSingle:
+		src = sk.Single.Pixels
+	case mdl.SkinGroup:
+		if sk.Group == nil || len(sk.Group.Skins) == 0 {
+			return nil
+		}
+		src = sk.Group.Skins[0].Pixels
+	default:
+		return nil
+	}
+	if len(src) != w*h {
+		return nil
+	}
+	pix := make([]byte, len(src))
+	copy(pix, src)
+	return &render.Pic{Width: w, Height: h, Pixels: pix}
+}
+
+// hasSuffix is a local strings.HasSuffix (the tamago std-lib subset
+// links strings cleanly, but keeping the dependency surface narrow is
+// the convention everywhere else in this binary -- see the bytes /
+// io.ReadAll usage above for the same call-it-yourself pattern).
+func hasSuffix(s, suffix string) bool {
+	if len(s) < len(suffix) {
+		return false
+	}
+	return s[len(s)-len(suffix):] == suffix
 }
 
 // halt is the tamago "spin forever after a fatal error" primitive.
