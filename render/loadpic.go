@@ -20,9 +20,9 @@ const PicHeaderSize = 8
 const PicMaxDim = 4096
 
 var (
-	ErrPicLumpShort  = errors.New("render: pic lump shorter than 8-byte header")
-	ErrPicLumpTrunc  = errors.New("render: pic lump body truncated (width*height > remaining bytes)")
-	ErrPicDimRange   = errors.New("render: pic dimensions out of range")
+	ErrPicLumpShort = errors.New("render: pic lump shorter than 8-byte header")
+	ErrPicLumpTrunc = errors.New("render: pic lump body truncated (width*height > remaining bytes)")
+	ErrPicDimRange  = errors.New("render: pic dimensions out of range")
 )
 
 // ParsePic decodes a WAD `pic` lump (the dpic8_t format) into a

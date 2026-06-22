@@ -35,9 +35,10 @@ var (
 // at y = 0..bandHeight-1 of the framebuffer.
 //
 // Returns:
-//   ErrSkyNilFB   fb == nil
-//   ErrSkyNilTex  skyTex == nil
-//   nil otherwise (bandHeight <= 0 is a silent no-op)
+//
+//	ErrSkyNilFB   fb == nil
+//	ErrSkyNilTex  skyTex == nil
+//	nil otherwise (bandHeight <= 0 is a silent no-op)
 func DrawSkyHorizon(fb *FrameBuffer, skyTex *Pic, viewYawDeg float32, timeSec float32, bandHeight int) error {
 	if fb == nil {
 		return ErrSkyNilFB

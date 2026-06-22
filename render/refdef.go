@@ -119,8 +119,8 @@ func (rd *RefDef) BuildFrustum() Frustum {
 	halfY := 90 - rd.FovY/2
 
 	var f Frustum
-	f[0].Normal = RotatePointAroundVector(up3, fwd3, -halfX) // left
-	f[1].Normal = RotatePointAroundVector(up3, fwd3, halfX)  // right
+	f[0].Normal = RotatePointAroundVector(up3, fwd3, -halfX)    // left
+	f[1].Normal = RotatePointAroundVector(up3, fwd3, halfX)     // right
 	f[2].Normal = RotatePointAroundVector(right3, fwd3, halfY)  // top
 	f[3].Normal = RotatePointAroundVector(right3, fwd3, -halfY) // bottom
 

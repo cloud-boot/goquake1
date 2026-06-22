@@ -14,9 +14,9 @@ import (
 const MaxPolyVerts = 64
 
 var (
-	ErrPolyTooFewVerts = errors.New("render: polygon needs >= 3 vertices")
+	ErrPolyTooFewVerts  = errors.New("render: polygon needs >= 3 vertices")
 	ErrPolyTooManyVerts = errors.New("render: polygon vertex count exceeds MaxPolyVerts")
-	ErrPolyNilFB       = errors.New("render: nil framebuffer in polygon fill")
+	ErrPolyNilFB        = errors.New("render: nil framebuffer in polygon fill")
 )
 
 // FillPolygon paints the convex 2D polygon defined by verts with

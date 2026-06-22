@@ -71,14 +71,14 @@ func LoadWav(name string, blob []byte) (*Sample, error) {
 	// Walk chunks starting at offset 12 (just past "WAVE").
 	pos := 12
 	var (
-		fmtSeen     bool
-		channels    int
-		sampleRate  int
-		bitsPerSam  int
-		dataSeen    bool
-		dataOffset  int
-		dataLength  int
-		loopStart   = -1
+		fmtSeen    bool
+		channels   int
+		sampleRate int
+		bitsPerSam int
+		dataSeen   bool
+		dataOffset int
+		dataLength int
+		loopStart  = -1
 	)
 	for pos+8 <= len(blob) {
 		var id [4]byte

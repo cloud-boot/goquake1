@@ -11,9 +11,9 @@ import "errors"
 type CrosshairStyle int
 
 const (
-	CrosshairNone  CrosshairStyle = 0
-	CrosshairPlus  CrosshairStyle = 1 // simple 3px '+' centred on the viewport
-	CrosshairBox   CrosshairStyle = 2 // hollow 5px outline box
+	CrosshairNone CrosshairStyle = 0
+	CrosshairPlus CrosshairStyle = 1 // simple 3px '+' centred on the viewport
+	CrosshairBox  CrosshairStyle = 2 // hollow 5px outline box
 )
 
 var ErrCrosshairNilFB = errors.New("render: nil framebuffer in DrawCrosshair")

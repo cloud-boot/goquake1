@@ -25,12 +25,12 @@ const FreeChannel = -1
 // Sample is one loaded sound effect's PCM data.
 // tyrquake: sfxcache_t in snd_mem.c.
 type Sample struct {
-	Name        string  // canonical name (e.g. "weapons/sshotgun.wav")
-	SampleRate  int     // Hz (typically 11025)
-	BitsPerSam  int     // 8 (signed byte) or 16 (signed short)
-	LoopStart   int     // -1 if not looped; else sample index to loop back to
-	NumSamples  int     // total sample count (NOT bytes)
-	Data        []byte  // raw PCM bytes
+	Name       string // canonical name (e.g. "weapons/sshotgun.wav")
+	SampleRate int    // Hz (typically 11025)
+	BitsPerSam int    // 8 (signed byte) or 16 (signed short)
+	LoopStart  int    // -1 if not looped; else sample index to loop back to
+	NumSamples int    // total sample count (NOT bytes)
+	Data       []byte // raw PCM bytes
 }
 
 // Channel is one active mixer voice. tyrquake: channel_t in snd.h.
@@ -66,9 +66,9 @@ type Pool struct {
 }
 
 var (
-	ErrPoolBadReserve  = errors.New("sound: ReservedStatic must be in [0, MaxChannels]")
-	ErrPoolNoFreeSlot  = errors.New("sound: pool exhausted (no slot can be allocated)")
-	ErrChannelSlotBad  = errors.New("sound: channel slot index out of range")
+	ErrPoolBadReserve = errors.New("sound: ReservedStatic must be in [0, MaxChannels]")
+	ErrPoolNoFreeSlot = errors.New("sound: pool exhausted (no slot can be allocated)")
+	ErrChannelSlotBad = errors.New("sound: channel slot index out of range")
 )
 
 // NewPool returns a fresh pool with reservedStatic ambient slots.

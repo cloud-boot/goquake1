@@ -37,11 +37,11 @@ func DefaultTestSceneOpts() TestSceneOpts {
 
 // RenderTestScene paints a self-contained smoke-test scene into fb:
 //
-//   1. Top band: TestPatternBars colorbars (opts.NumBars stripes from
-//      BarsStartIdx)
-//   2. Banner text just below the bars (centered horizontally,
-//      using DrawCenteredString with the white glyph set)
-//   3. Crosshair (Plus style) at the centre of the framebuffer
+//  1. Top band: TestPatternBars colorbars (opts.NumBars stripes from
+//     BarsStartIdx)
+//  2. Banner text just below the bars (centered horizontally,
+//     using DrawCenteredString with the white glyph set)
+//  3. Crosshair (Plus style) at the centre of the framebuffer
 //
 // Useful as a backend smoke-test: any backend that produces a
 // recognizable colorbar+banner+crosshair frame is wired correctly.

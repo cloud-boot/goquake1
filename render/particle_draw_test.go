@@ -17,9 +17,9 @@ func newDrawCtx(t *testing.T) (*FrameBuffer, *RefDef, *Pool) {
 	}
 	rd, err := NewRefDef(
 		VRect{Width: 320, Height: 200},
-		[3]float32{0, 0, 0},     // zero angles -> forward = +X
-		[3]float32{0, 0, 0},     // at world origin
-		90,                      // 90deg fov
+		[3]float32{0, 0, 0}, // zero angles -> forward = +X
+		[3]float32{0, 0, 0}, // at world origin
+		90,                  // 90deg fov
 	)
 	if err != nil {
 		t.Fatalf("NewRefDef: %v", err)

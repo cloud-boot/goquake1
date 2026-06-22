@@ -13,10 +13,10 @@ import "math"
 type SoundAttenuation float32
 
 const (
-	AttenuationNone   SoundAttenuation = 0   // no distance falloff (UI / global)
-	AttenuationNormal SoundAttenuation = 1   // standard gameplay
-	AttenuationIdle   SoundAttenuation = 2   // monster idle sounds (short range)
-	AttenuationStatic SoundAttenuation = 3   // env_sound entities (very short range)
+	AttenuationNone   SoundAttenuation = 0 // no distance falloff (UI / global)
+	AttenuationNormal SoundAttenuation = 1 // standard gameplay
+	AttenuationIdle   SoundAttenuation = 2 // monster idle sounds (short range)
+	AttenuationStatic SoundAttenuation = 3 // env_sound entities (very short range)
 )
 
 // SoundFalloffDist is the distance (in world units) at which an
@@ -31,17 +31,17 @@ const MaxVolume = 255
 
 // SpatializeIn is the per-sound bundle passed to Spatialize.
 type SpatializeIn struct {
-	ListenerOrigin  [3]float32     // viewer position
-	ListenerRight   [3]float32     // viewer right axis (for L/R stereo split)
-	SoundOrigin     [3]float32     // sound's world position
-	MasterVolume    int            // 0..MaxVolume, the sound's base volume
-	Attenuation     SoundAttenuation
+	ListenerOrigin [3]float32 // viewer position
+	ListenerRight  [3]float32 // viewer right axis (for L/R stereo split)
+	SoundOrigin    [3]float32 // sound's world position
+	MasterVolume   int        // 0..MaxVolume, the sound's base volume
+	Attenuation    SoundAttenuation
 }
 
 // SpatializeOut is the per-sound result the mixer consumes.
 type SpatializeOut struct {
-	LeftVol  int  // 0..MaxVolume (clamped)
-	RightVol int  // 0..MaxVolume (clamped)
+	LeftVol  int // 0..MaxVolume (clamped)
+	RightVol int // 0..MaxVolume (clamped)
 }
 
 // Spatialize computes the per-ear volumes for one sound at the

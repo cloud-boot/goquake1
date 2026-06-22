@@ -61,8 +61,8 @@ func makeWavLump() []byte {
 	fmtChunk := make([]byte, 24)
 	copy(fmtChunk[0:4], []byte{'f', 'm', 't', ' '})
 	binary.LittleEndian.PutUint32(fmtChunk[4:8], 16)
-	binary.LittleEndian.PutUint16(fmtChunk[8:10], 1)     // PCM
-	binary.LittleEndian.PutUint16(fmtChunk[10:12], 1)    // mono
+	binary.LittleEndian.PutUint16(fmtChunk[8:10], 1)  // PCM
+	binary.LittleEndian.PutUint16(fmtChunk[10:12], 1) // mono
 	binary.LittleEndian.PutUint32(fmtChunk[12:16], 11025)
 	binary.LittleEndian.PutUint32(fmtChunk[16:20], 11025)
 	binary.LittleEndian.PutUint16(fmtChunk[20:22], 1)

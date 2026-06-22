@@ -124,10 +124,10 @@ func TestAlloc_EvictionByRemaining(t *testing.T) {
 	// slot with the smallest remaining wins eviction.
 	for i := 0; i < MaxChannels; i++ {
 		p.Channels[i] = Channel{
-			Sfx:      &Sample{},
-			Position: 0,
-			EndPos:   1000 + i*10, // slot 0 has lowest EndPos
-			EntNum:   i,
+			Sfx:        &Sample{},
+			Position:   0,
+			EndPos:     1000 + i*10, // slot 0 has lowest EndPos
+			EntNum:     i,
 			EntChannel: 1,
 		}
 	}

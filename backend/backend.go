@@ -38,11 +38,11 @@ const (
 // this every tic; the host loop hands it to the client tick's
 // MovementButtons state.
 type InputSnapshot struct {
-	KeysDown []KeyCode // keys pressed since last poll
-	KeysUp   []KeyCode // keys released since last poll
-	MouseDX  float32   // pixels horizontal since last poll
-	MouseDY  float32   // pixels vertical since last poll
-	QuitRequested bool // window close button / signal
+	KeysDown      []KeyCode // keys pressed since last poll
+	KeysUp        []KeyCode // keys released since last poll
+	MouseDX       float32   // pixels horizontal since last poll
+	MouseDY       float32   // pixels vertical since last poll
+	QuitRequested bool      // window close button / signal
 }
 
 // Display is the per-frame video surface contract.
@@ -108,7 +108,7 @@ var ErrUnsupported = errors.New("backend: feature unsupported on this platform")
 type NoAudio struct{}
 
 func (NoAudio) QueueAudio(_ []sound.StereoSample) error { return nil }
-func (NoAudio) SampleRate() int                          { return 22050 }
+func (NoAudio) SampleRate() int                         { return 22050 }
 
 // NoInput is a stub Input that returns empty snapshots forever.
 type NoInput struct{}

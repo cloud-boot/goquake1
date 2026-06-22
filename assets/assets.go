@@ -40,7 +40,7 @@ func NewSet() *Set {
 }
 
 var (
-	ErrAssetsNilVFS    = errors.New("assets: nil vfs.SearchPath")
+	ErrAssetsNilVFS       = errors.New("assets: nil vfs.SearchPath")
 	ErrAssetsConcharsSize = errors.New("assets: conchars.lmp not exactly 16384 bytes")
 )
 

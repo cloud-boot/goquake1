@@ -91,11 +91,12 @@ func ApplyViewOffset(origin [3]float32, viewHeightOffset float32) [3]float32 {
 // camera is on the front side, otherwise back-child first.
 //
 // `pl.Normal . p - pl.Dist`:
-//   > 0 -> front
-//   < 0 -> back
-//   = 0 -> on the plane (degenerate; the BSP traversal treats this
-//          as "front" for the side selection, but the side returned
-//          here is the unambiguous mathematical answer)
+//
+//	> 0 -> front
+//	< 0 -> back
+//	= 0 -> on the plane (degenerate; the BSP traversal treats this
+//	       as "front" for the side selection, but the side returned
+//	       here is the unambiguous mathematical answer)
 func PlaneSide(p [3]float32, pl Plane) int {
 	d := pl.Normal[0]*p[0] + pl.Normal[1]*p[1] + pl.Normal[2]*p[2] - pl.Dist
 	switch {

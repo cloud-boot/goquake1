@@ -23,10 +23,10 @@ import "github.com/go-quake1/engine/sound"
 // (programmatic frame capture, never "looks fine to me").
 type Recorder struct {
 	Width, Height int
-	Frames        [][]byte                // each: copy of one rgba presented
-	Audio         [][]sound.StereoSample  // each: copy of one queued slice
-	NowVal        float64                 // returned by Now(); test sets it explicitly
-	Input         InputSnapshot           // returned by PollInput on each call
+	Frames        [][]byte               // each: copy of one rgba presented
+	Audio         [][]sound.StereoSample // each: copy of one queued slice
+	NowVal        float64                // returned by Now(); test sets it explicitly
+	Input         InputSnapshot          // returned by PollInput on each call
 	PollCount     int
 }
 

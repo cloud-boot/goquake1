@@ -32,8 +32,8 @@ var (
 // Backend is the ASCII-art backend. Wraps an io.Writer + a target
 // character grid resolution.
 type Backend struct {
-	Width, Height int    // pixel framebuffer dimensions
-	Cols, Rows    int    // target ASCII grid
+	Width, Height int // pixel framebuffer dimensions
+	Cols, Rows    int // target ASCII grid
 	W             io.Writer
 
 	tick          int
