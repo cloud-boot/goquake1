@@ -80,6 +80,7 @@ import (
 	"github.com/go-quake1/engine/client"
 	"github.com/go-quake1/engine/embedpak"
 	enginehost "github.com/go-quake1/engine/host"
+	"github.com/go-quake1/engine/mathlib"
 	"github.com/go-quake1/engine/model"
 	"github.com/go-quake1/engine/progs"
 	"github.com/go-quake1/engine/protocol"
@@ -239,15 +240,62 @@ func run() error {
 	}
 
 	// 8. Build a loopback NetConn pair. The single-player path serves
-	//    both client + server in this process; the engine's runloop
-	//    only holds the client-side handle (the server-side handle is
-	//    plumbed through the host's ConnectLoopback in a follow-up
-	//    batch that wires the client tick).
-	cli, _ := engineserver.NewLoopbackConn()
+	//    both client + server in this process; when a real host is wired
+	//    we route the pair through Host.ConnectLoopback so the server-
+	//    side handle is bound to a Static.Clients slot (active+spawned),
+	//    which is what server.ReadClientMoves consumes per-tic.
+	//
+	//    Without a real host (stubHost path) ConnectLoopback can't run --
+	//    there's no Static.Clients pool to bind into -- so we fall back
+	//    to a bare loopback whose server side is silently dropped.
+	var cli engineserver.NetConn
+	playerSlot := 0 // 1-based edict index of the local player; 0 = no host
+	if realHost != nil {
+		conn, slotIdx, cerr := realHost.ConnectLoopback()
+		if cerr != nil {
+			return fmt.Errorf("ConnectLoopback: %w", cerr)
+		}
+		cli = conn
+		// The host's Static.Clients[slotIdx] is now bound; its Edict
+		// lives at Server.Edicts[slotIdx+1]. The single-player loop
+		// expects slot 0 -> edict 1.
+		playerSlot = slotIdx + 1
+		// Mark the server-side client Spawned so SendClientFrames will
+		// build per-frame messages for it (PreparePerClientMessage
+		// short-circuits on !Active || !Spawned). ConnectClient leaves
+		// Spawned=false; the upstream signon-stage 4 flips it. We have
+		// no handshake yet, so flip it directly.
+		realHost.Static.Clients[slotIdx].Spawned = true
+		fmt.Printf("QUAKE: loopback bound -- client slot %d -> edict %d (active+spawned)\n",
+			slotIdx, playerSlot)
+	} else {
+		cli, _ = engineserver.NewLoopbackConn()
+	}
 
-	// 9. Pick the HostFramer the runner drives per-tic. When the real
-	//    host built successfully it goes straight in; otherwise the
-	//    stub keeps RunFrame's host.Frame call infallible.
+	// 9. Build the client state. When a real host is wired we force
+	//    Connection straight to StateConnected so client.Tick's
+	//    outbound clc_move path fires from frame 0 (no signon
+	//    handshake to drive it through StateConnecting -> StateConnected
+	//    yet -- the wire-format serverinfo / signonnum messages aren't
+	//    being emitted by the loopback server side). PlayerNum=playerSlot
+	//    so any per-tic camera-follow that consults state.PlayerNum
+	//    targets the right edict.
+	clientState := client.NewState()
+	if realHost != nil {
+		if err := clientState.SetConnecting(); err != nil {
+			return fmt.Errorf("client.SetConnecting: %w", err)
+		}
+		if err := clientState.MarkSpawned(); err != nil {
+			return fmt.Errorf("client.MarkSpawned: %w", err)
+		}
+		clientState.PlayerNum = playerSlot
+		fmt.Printf("QUAKE: client forced to StateConnected (PlayerNum=%d) -- clc_move outbound enabled\n",
+			playerSlot)
+	}
+
+	// 9b. Pick the HostFramer the runner drives per-tic. When the real
+	//     host built successfully it goes straight in; otherwise the
+	//     stub keeps RunFrame's host.Frame call infallible.
 	var hostFramer runloop.HostFramer = stubHost{}
 	if realHost != nil {
 		hostFramer = realHost
@@ -260,7 +308,7 @@ func run() error {
 	runner, err := runloop.NewRunnerFromVFS(runloop.SetupOpts{
 		VFS:            v,
 		Host:           hostFramer,
-		Client:         client.NewState(),
+		Client:         clientState,
 		Conn:           cli,
 		Backend:        be,
 		BackgroundIdx:  0x20, // pleasant grey background from the synthetic palette
@@ -305,7 +353,7 @@ func run() error {
 	//     real host exists we pass it in so the per-frame camera can
 	//     follow the player edict at slot 1; nil falls back to the
 	//     static pickInMapCamera anchor.
-	if err := setupRenderer(runner, pakFS, realHost); err != nil {
+	if err := setupRenderer(runner, pakFS, realHost, playerSlot); err != nil {
 		return fmt.Errorf("setupRenderer: %w", err)
 	}
 
@@ -325,13 +373,22 @@ func run() error {
 // into the same per-tic schedule.
 //
 // CAMERA: when realHost is non-nil the per-frame Pre2DDraw closure
-// asks realHost.EdictOrigin(1) (the player slot) and uses the
-// returned origin + a ViewHeightOffset eye-height nudge as the
-// ViewOrigin. A zero origin (the bytecode default until SpawnFn is
-// wired) or an error falls back to camOrigin -- the static
-// pickInMapCamera anchor. Camera angles come from client.Tick
-// (mouse + WASD) regardless of the position source.
-func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host) error {
+// asks realHost.EdictOrigin(playerSlot) (the local player edict, slot
+// 1 in the standard single-player loop) and uses the returned origin
+// + a ViewHeightOffset eye-height nudge as the ViewOrigin. A zero
+// origin (the bytecode default until SpawnFn is wired) or an error
+// falls back to camOrigin -- the static pickInMapCamera anchor.
+//
+// PLAYER MOVEMENT: each tic the closure first drains the loopback
+// server-side queue via server.ReadClientMoves -- consuming whatever
+// clc_move the runner's client.Tick step just sent -- then applies the
+// resulting UserCmd to the player edict's "origin" field via a minimal
+// in-line integrator (forward/right basis from viewangles * forwardMove/
+// sideMove * dt). This bypasses the full SV_Physics_Walk + worldmodel
+// trace stack on purpose: the goal of this bring-up is "key press moves
+// the camera", not "physically correct movement". A follow-up batch
+// swaps the integrator for the real SV_Physics tick.
+func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int) error {
 	// 1. Source the BSP bytes: real pak0.pak first, synthbsp fallback.
 	bspBytes, size, err := loadBSP(pakFS)
 	if err != nil {
@@ -437,11 +494,29 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	var surfaces bsprender.SurfaceList
 	frameCount := 0
 
+	// Seed the player edict's origin with the lattice-probe anchor when
+	// the QC spawn pass left it at the zero vector (the bytecode
+	// default for entities the entity-spawn parser doesn't relocate
+	// via info_player_start). Without this seed the per-tic integrator
+	// below would integrate FROM the world origin (which sits inside a
+	// solid leaf) and the lattice fallback in the camera-pick code
+	// would mask the player's actual position from view.
+	if realHost != nil && playerSlot > 0 && !isSynth {
+		if eo, err := realHost.EdictOrigin(playerSlot); err == nil {
+			if eo[0] == 0 && eo[1] == 0 && eo[2] == 0 {
+				_ = writePlayerOrigin(realHost, playerSlot, camOrigin)
+				fmt.Printf("QUAKE: seeded player edict %d origin = %v (was zero)\n",
+					playerSlot, camOrigin)
+			}
+		}
+	}
+
 	// 6. Pre2DDraw closure. Runs per-tic from RunFrame BEFORE the 2D
 	//    Compose; viewAngles is the (pitch, yaw, roll) the client tick
 	//    has just refreshed from mouse + arrow keys. viewOrigin is the
 	//    runner's anchor; we offset it by client.State.ViewHeightOffset
 	//    so jumping/crouching still nudges the camera.
+	const playerStepSpeed float32 = 320.0 // units / sec at full forward press
 	runner.Pre2DDraw = func(fb *render.FrameBuffer, viewOrigin, viewAngles [3]float32) error {
 		frame := frameCount
 		frameCount++
@@ -454,16 +529,33 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			fb.Pixels[i] = 0x10
 		}
 
+		// Drain the loopback server-side clc_move queue and integrate
+		// the latest UserCmd into the player edict's origin. This is
+		// the MVP stand-in for SV_Physics_Walk: just enough to make a
+		// key press visibly move the camera. A follow-up batch wires
+		// the real ground-physics integrator + worldmodel trace.
+		movesApplied := 0
+		if realHost != nil && playerSlot > 0 {
+			c := realHost.Static.Clients[playerSlot-1]
+			n, err := engineserver.ReadClientMoves(c)
+			if err != nil {
+				return fmt.Errorf("ReadClientMoves: %w", err)
+			}
+			movesApplied = n
+			if n > 0 {
+				_ = integratePlayerCmd(realHost, playerSlot, c.Cmd, playerStepSpeed, runloop.MinFrameTime)
+			}
+		}
+
 		// Pick the camera anchor for this frame. When the real host
-		// is wired we ask it for slot 1 (the local player edict).
-		// Until SpawnFn is wired the player edict's origin field
-		// stays at the bytecode default (zero vector); in that case
-		// (or on any error) we fall back to camOrigin -- the static
-		// pickInMapCamera anchor that always lands inside a leaf.
+		// is wired we ask it for the local player edict's slot. Until
+		// SpawnFn (or the seed above) populates a non-zero origin we
+		// fall back to camOrigin -- the static pickInMapCamera anchor
+		// that always lands inside a leaf.
 		origin := viewOrigin
 		fromEdict := false
-		if realHost != nil {
-			if eo, err := realHost.EdictOrigin(1); err == nil && (eo[0] != 0 || eo[1] != 0 || eo[2] != 0) {
+		if realHost != nil && playerSlot > 0 {
+			if eo, err := realHost.EdictOrigin(playerSlot); err == nil && (eo[0] != 0 || eo[1] != 0 || eo[2] != 0) {
 				origin = eo
 				fromEdict = true
 			}
@@ -530,8 +622,10 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			if runner.SoundPool != nil {
 				active = runner.SoundPool.ActiveCount()
 			}
-			fmt.Printf("QUAKE: tic %d -- sv.time-driven; viewOrigin=%v fromEdict=%v; %d surfaces emitted; audio: %d active channels, %d samples mixed\n",
-				frame, origin, fromEdict, surfaces.Len(), active, enginesound.MixBufferStereoFrames)
+			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v fromEdict=%v viewAngles=%v movesApplied=%d clientConn=%d; %d surfaces; audio: %d active, %d mixed\n",
+				frame, origin, fromEdict, viewAngles, movesApplied,
+				int(runner.Client.Connection), surfaces.Len(),
+				active, enginesound.MixBufferStereoFrames)
 		}
 
 		// Rasterize each visible face via TransformFace + FillTexturedPolygon.
@@ -920,6 +1014,103 @@ func pickInMapCamera(bm *model.BrushModel, file *bspfile.File) [3]float32 {
 		}
 	}
 	return centre
+}
+
+// writePlayerOrigin overwrites the QC "origin" vector on the player
+// edict at slot. Returns nil on success, or the propagated EntVars
+// error -- typically [progs.ErrFieldNotFound] when the bound Progs's
+// FieldDefs table lacks "origin" (test stubs that strip the field).
+//
+// Used by setupRenderer at startup to seed the player edict's origin
+// with the pickInMapCamera lattice anchor when the QC spawn pass left
+// it at the zero vector (which sits inside a solid leaf and would
+// trap the per-tic integrator below at the world origin).
+func writePlayerOrigin(h *enginehost.Host, slot int, origin [3]float32) error {
+	if h == nil || slot < 0 || slot >= len(h.Server.Edicts) {
+		return enginehost.ErrNoEdict
+	}
+	ent := h.Server.Edicts[slot]
+	if ent == nil {
+		return enginehost.ErrNoEdict
+	}
+	p := h.Progs()
+	if p == nil {
+		return enginehost.ErrNoProgs
+	}
+	v, err := progs.NewEntVars(p, ent)
+	if err != nil {
+		return err
+	}
+	return v.WriteVec3("origin", origin)
+}
+
+// integratePlayerCmd applies one UserCmd to the player edict's origin
+// via a minimal in-line integrator: forward / right basis from the
+// command's viewangles * forwardMove / sideMove * dt + upMove on the
+// Z axis. This is the MVP stand-in for SV_Physics_Walk -- enough to
+// make a key press visibly move the camera in-map. A follow-up batch
+// swaps it for the real ground-physics + worldmodel-trace tick.
+//
+// speedScale is the conversion from the wire's int16 forward/side
+// magnitude (which client.BaseMove emits at cl_forwardspeed * dt
+// units; typical Quake range +/- 200) to world units per second. A
+// value of 1.0 means "the wire magnitude already is units/sec";
+// playerStepSpeed defaults to 320 which is sv_maxspeed's default.
+//
+// Returns the propagated EntVars error or nil; out-of-range slot OR
+// nil edict returns [enginehost.ErrNoEdict].
+func integratePlayerCmd(h *enginehost.Host, slot int, cmd engineserver.UserCmd, speedScale, dt float32) error {
+	if h == nil || slot < 0 || slot >= len(h.Server.Edicts) {
+		return enginehost.ErrNoEdict
+	}
+	ent := h.Server.Edicts[slot]
+	if ent == nil {
+		return enginehost.ErrNoEdict
+	}
+	p := h.Progs()
+	if p == nil {
+		return enginehost.ErrNoProgs
+	}
+	v, err := progs.NewEntVars(p, ent)
+	if err != nil {
+		return err
+	}
+	cur, err := v.ReadVec3("origin")
+	if err != nil {
+		return err
+	}
+	// Project the per-axis move scalars onto the world via the
+	// forward/right basis derived from viewangles. The wire's
+	// forwardmove / sidemove magnitudes are normalized to roughly
+	// +/-1 (sign of the button press); scale * dt gives the
+	// per-tic delta in world units.
+	forward, right, _ := mathlib.AngleVectors(cmd.ViewAngles)
+	dx := forward[0]*sign(cmd.ForwardMove) + right[0]*sign(cmd.SideMove)
+	dy := forward[1]*sign(cmd.ForwardMove) + right[1]*sign(cmd.SideMove)
+	dz := forward[2]*sign(cmd.ForwardMove) + right[2]*sign(cmd.SideMove) + sign(cmd.UpMove)
+	step := speedScale * dt
+	next := [3]float32{
+		cur[0] + dx*step,
+		cur[1] + dy*step,
+		cur[2] + dz*step,
+	}
+	return v.WriteVec3("origin", next)
+}
+
+// sign returns -1 for negative inputs, 0 for zero, +1 for positive.
+// Used by integratePlayerCmd to collapse the wire's int16 magnitude
+// (which encodes per-axis "pressed in this direction" -- the raw
+// magnitude is the cl_forwardspeed * dt product BaseMove emits, which
+// varies frame-to-frame) into a stable per-tic direction vector.
+func sign(f float32) float32 {
+	switch {
+	case f > 0:
+		return 1
+	case f < 0:
+		return -1
+	default:
+		return 0
+	}
 }
 
 // loadBSP returns the BSP bytes + size to render. Sources, in order:

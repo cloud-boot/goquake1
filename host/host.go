@@ -432,6 +432,16 @@ func (h *Host) SetProgs(p *progs.Progs) {
 	h.progsRef = p
 }
 
+// Progs returns the [progs.Progs] last installed via [Host.SetProgs]
+// (nil if none). Exposed so embedders that need to issue ad-hoc
+// EntVars reads / writes against the host's edict pool can construct
+// the [progs.EntVars] view without re-loading the bytecode. The host
+// itself uses the unexported alias [Host.findProgs] internally so the
+// accessor surface stays narrow + opt-in.
+func (h *Host) Progs() *progs.Progs {
+	return h.progsRef
+}
+
 // ErrNoEdict fires when [Host.EdictOrigin] is asked for a slot that
 // has no live edict -- either SpawnServer has not run (the pool is
 // empty) or the requested slot is past the end of the allocated pool.

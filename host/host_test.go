@@ -811,3 +811,20 @@ func TestSetSpawnFn(t *testing.T) {
 		t.Errorf("installed hook not invoked: called=%d want 1", called)
 	}
 }
+
+func TestProgs_DefaultNil(t *testing.T) {
+	h, _ := makeHost(t, nil, 1)
+	// makeHost installs a Progs via SetProgs; clear it to assert the
+	// nil-default surface.
+	h.SetProgs(nil)
+	if h.Progs() != nil {
+		t.Errorf("Progs() = %v want nil after SetProgs(nil)", h.Progs())
+	}
+}
+
+func TestProgs_ReturnsInstalled(t *testing.T) {
+	h, p := makeHost(t, nil, 1)
+	if got := h.Progs(); got != p {
+		t.Errorf("Progs() = %p want %p (the Progs installed via SetProgs)", got, p)
+	}
+}
