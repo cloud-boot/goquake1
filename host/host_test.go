@@ -435,6 +435,27 @@ func TestSpawnServer_PropagatesError(t *testing.T) {
 	}
 }
 
+// SetOnArenaReady installs the arena-publication hook the Host's
+// SpawnServer pipes into SpawnDeps. The hook must fire with the
+// same arena that lands on Server.Arena, BEFORE entity-spawn runs.
+func TestSetOnArenaReady_HookFiresDuringSpawnServer(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	var seen *progs.EdictArena
+	h.SetOnArenaReady(func(a *progs.EdictArena) {
+		seen = a
+	})
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if seen == nil {
+		t.Fatal("OnArenaReady hook should have fired")
+	}
+	if seen != h.Server.Arena {
+		t.Error("hook arena should match Server.Arena")
+	}
+}
+
 // --- ConnectLoopback ------------------------------------------------------
 
 func TestConnectLoopback_HappyPath(t *testing.T) {

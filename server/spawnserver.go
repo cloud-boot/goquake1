@@ -41,20 +41,28 @@ type AreaClearer interface {
 //
 // Optional:
 //
-//	SpawnFn  -- per-entity QC spawn dispatch. nil = entities get
-//	            their fields populated but no spawn hook fires.
-//	Interner -- progs.StringInterner the AssignFields layer uses
-//	            for string-typed fields (classname etc.). nil
-//	            means string fields error on assign -- callers
-//	            that want to ingest a map must supply one.
+//	SpawnFn       -- per-entity QC spawn dispatch. nil = entities get
+//	                 their fields populated but no spawn hook fires.
+//	Interner      -- progs.StringInterner the AssignFields layer uses
+//	                 for string-typed fields (classname etc.). nil
+//	                 means string fields error on assign -- callers
+//	                 that want to ingest a map must supply one.
+//	OnArenaReady  -- fires once, right after the per-map EdictArena
+//	                 is allocated + reset, BEFORE the entity-spawn
+//	                 pass runs. Lets the embedder hand the arena to
+//	                 their VM (via [progs.VM.SetArena]) so the
+//	                 entity-pointer opcodes resolve during SpawnFn.
+//	                 nil = skip; the arena is still stored on
+//	                 Server.Arena for post-spawn pickup.
 type SpawnDeps struct {
-	Cache    *model.Cache
-	Resolver FileResolver
-	Progs    *progs.Progs
-	Static   *Static
-	World    AreaClearer
-	SpawnFn  func(ent *progs.Edict, classname string)
-	Interner progs.StringInterner
+	Cache        *model.Cache
+	Resolver     FileResolver
+	Progs        *progs.Progs
+	Static       *Static
+	World        AreaClearer
+	SpawnFn      func(ent *progs.Edict, classname string)
+	Interner     progs.StringInterner
+	OnArenaReady func(arena *progs.EdictArena)
 }
 
 // ErrSpawnServerNilDeps fires on missing required deps.
@@ -178,6 +186,16 @@ func (s *Server) SpawnServer(mapName string, protocol int, deps SpawnDeps) error
 		// matches Cap exactly so the error path is unreachable.
 		e, _ := arena.Get(i)
 		s.Edicts[i] = e
+	}
+	// Publish the arena onto the Server so callers can pick it up
+	// post-SpawnServer, and fire the optional OnArenaReady hook so
+	// embedders that need it live for the upcoming entity-spawn
+	// pass (e.g. progs.VM.SetArena callers, whose entity-pointer
+	// opcodes resolve via this arena) wire it in BEFORE SpawnFn
+	// dispatches the first entity.
+	s.Arena = arena
+	if deps.OnArenaReady != nil {
+		deps.OnArenaReady(arena)
 	}
 	// World at idx 0, clients at idx 1..MaxClients. NumEdicts marks
 	// the first free slot, so the entity-spawn pass starts past the

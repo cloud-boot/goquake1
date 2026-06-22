@@ -75,6 +75,18 @@ type Server struct {
 	NumEdicts int            // first free slot
 	MaxEdicts int            // cap on entity allocation
 
+	// Arena is the per-map edict pool that backs every Edicts[i]'s
+	// Fields slice. SpawnServer allocates a fresh one sized to
+	// MaxEdicts; the VM needs a handle (via [progs.VM.SetArena]) so
+	// the entity-pointer opcodes (OP_ADDRESS / OP_LOAD_ENT /
+	// OP_STORE_P_*) can resolve QC pointers back to *Edict + field
+	// byte-offset. Embedders that wire the arena onto their VM read
+	// it from here AFTER SpawnServer returns -- or, to make it
+	// available during the entity-spawn pass (which runs SpawnFn
+	// per entity + needs the arena live for self.field = X writes),
+	// pass an OnArenaReady hook via [SpawnDeps].
+	Arena *progs.EdictArena
+
 	State ServerState
 
 	// Datagram (unreliable, per-tick): temp-entities, particle bursts,

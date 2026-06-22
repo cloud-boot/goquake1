@@ -556,6 +556,89 @@ func TestSpawnServer_AssignFieldsError(t *testing.T) {
 	}
 }
 
+// --- Arena publication ----------------------------------------------------
+
+// Server.Arena is populated after a successful SpawnServer + matches
+// the cap the SpawnDeps + Server.MaxEdicts agree on. The arena lives
+// on Server.Arena so embedders that don't pass an OnArenaReady hook
+// can still pick it up post-spawn.
+func TestSpawnServer_PublishesArena(t *testing.T) {
+	bspBytes := buildSpawnBSP(t, `{ "classname" "worldspawn" }`, 1)
+	deps := makeDeps(t, bspBytes)
+	s := NewServer()
+	if err := s.SpawnServer("test", protocol.VersionNQ, deps); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if s.Arena == nil {
+		t.Fatal("Server.Arena should be non-nil after SpawnServer")
+	}
+	if got := s.Arena.Cap(); got != s.MaxEdicts {
+		t.Errorf("Arena.Cap got %d want MaxEdicts (%d)", got, s.MaxEdicts)
+	}
+	// The arena's slot 0 must be the same *Edict as Server.Edicts[0]
+	// -- the per-slot pointer aliasing the spawn-pass relies on.
+	e0, err := s.Arena.Get(0)
+	if err != nil {
+		t.Fatalf("Arena.Get(0): %v", err)
+	}
+	if e0 != s.Edicts[0] {
+		t.Error("Arena.Get(0) should alias Server.Edicts[0]")
+	}
+}
+
+// OnArenaReady fires once, AFTER the arena is allocated + BEFORE the
+// entity-spawn pass dispatches SpawnFn. The order matters: production
+// embedders use the hook to wire vm.SetArena so the spawn-time entity-
+// pointer opcodes resolve. This test asserts both invariants by
+// recording the relative call order.
+func TestSpawnServer_OnArenaReadyFiresBeforeSpawnFn(t *testing.T) {
+	bspBytes := buildSpawnBSP(t, `{ "classname" "worldspawn" }`, 1)
+	deps := makeDeps(t, bspBytes)
+	var order []string
+	var seenArena *progs.EdictArena
+	deps.OnArenaReady = func(a *progs.EdictArena) {
+		order = append(order, "arena")
+		seenArena = a
+	}
+	deps.SpawnFn = func(ent *progs.Edict, classname string) {
+		order = append(order, "spawn:"+classname)
+	}
+	s := NewServer()
+	if err := s.SpawnServer("test", protocol.VersionNQ, deps); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if len(order) < 2 {
+		t.Fatalf("order got %v want [arena, spawn:worldspawn]", order)
+	}
+	if order[0] != "arena" {
+		t.Errorf("first call got %q want %q", order[0], "arena")
+	}
+	if order[1] != "spawn:worldspawn" {
+		t.Errorf("second call got %q want %q", order[1], "spawn:worldspawn")
+	}
+	if seenArena == nil {
+		t.Fatal("OnArenaReady should receive a non-nil arena")
+	}
+	if seenArena != s.Arena {
+		t.Error("OnArenaReady arena should be the one stashed on Server.Arena")
+	}
+}
+
+// Nil OnArenaReady is the default: SpawnServer must not panic + the
+// arena still lands on Server.Arena.
+func TestSpawnServer_NilOnArenaReady(t *testing.T) {
+	bspBytes := buildSpawnBSP(t, `{ "classname" "worldspawn" }`, 1)
+	deps := makeDeps(t, bspBytes)
+	deps.OnArenaReady = nil
+	s := NewServer()
+	if err := s.SpawnServer("test", protocol.VersionNQ, deps); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if s.Arena == nil {
+		t.Error("Server.Arena should be non-nil even with nil OnArenaReady")
+	}
+}
+
 // --- AreaClearer satisfaction --------------------------------------------
 
 // Build-time check that *fakeWorld -- and by structural contract,

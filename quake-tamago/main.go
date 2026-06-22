@@ -664,7 +664,21 @@ func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
 		return nil, fmt.Errorf("buildHost: registerSpawnTimeBuiltins: %w", err)
 	}
 
-	// 5. SpawnFn classname dispatch. Resolves the entity's classname
+	// 5. Arena hand-off. SpawnServer allocates the per-map EdictArena
+	//    BEFORE the entity-spawn pass walks the entities lump; the
+	//    OnArenaReady hook fires there so vm.SetArena lands BEFORE
+	//    the first SpawnFn dispatches. Without this, every entity-
+	//    pointer opcode (OP_ADDRESS / OP_LOAD_ENT / OP_STORE_P_*)
+	//    the spawn QC issues for "self.field = X" returns
+	//    progs.ErrNoArena + the per-entity SpawnFn aborts. The
+	//    hook also prints a one-line census so the serial console
+	//    shows the wiring took effect.
+	h.SetOnArenaReady(func(arena *progs.EdictArena) {
+		vm.SetArena(arena)
+		fmt.Printf("QUAKE: arena attached -- %d edicts in arena\n", arena.Cap())
+	})
+
+	// 6. SpawnFn classname dispatch. Resolves the entity's classname
 	//    to a QC function via FindFunction, sets the QC "self" global
 	//    to the (slot-indexed) edict pointer, and calls VM.Run on
 	//    the resolved index. A nil function (classname has no QC
@@ -679,21 +693,21 @@ func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
 			return
 		}
 		// Self global: spawn-time QC reads + writes ent->v.* via the
-		// "self" pointer. Without it, every "self.health = 60" lands
-		// in the world edict instead of the spawning monster. The
-		// host's per-tic thinkCaller does the same dance; the VM
-		// owns no arena handle on this port so the int written here
-		// is a slot index rather than a byte offset -- good enough
-		// for spawn dispatch (the QC code reads back what we wrote).
+		// "self" pointer. With the arena now wired (step 5), the
+		// "self" value is the real per-edict byte-offset pointer the
+		// arena's MakePointer produces -- the entity-pointer opcodes
+		// in spawn QC will resolve it back to ent's field block via
+		// arena.ResolvePointer. A nil Server.Arena (test stubs that
+		// skip SpawnServer) falls back to the slot index.
 		if def := p.FindGlobal("self"); def != nil {
-			_ = vm.SetGlobalInt(int(def.Ofs), edictSlot(h, ent))
+			_ = vm.SetGlobalInt(int(def.Ofs), edictSelfPointer(h, ent))
 		}
 		if err := vm.Run(int32(idx)); err != nil {
 			fmt.Printf("QUAKE: SpawnFn %s err: %v\n", classname, err)
 		}
 	})
 
-	// 6. SpawnServer. Loads the BSP, builds the area tree, parses the
+	// 7. SpawnServer. Loads the BSP, builds the area tree, parses the
 	//    entities lump, populates the edict pool, fires SpawnFn per
 	//    entity. The default no-op interner stores every string field
 	//    as offset 0 (the empty-string sentinel) -- field structure is
@@ -704,13 +718,24 @@ func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
 	return h, nil
 }
 
-// edictSlot returns the index of ent inside h.Server.Edicts. The
-// VM's "self" global is an ev_entity, stored as the QC pointer to
-// the edict; without an exported EdictArena byte-offset accessor on
-// this port the slot index is the closest stand-in we can hand the
-// VM. Spawn-time QC reads back what we wrote, so a self-consistent
-// integer is sufficient; the per-tic physics dispatcher in host.go
-// uses the same simplification.
+// edictSelfPointer returns the QC "self" pointer for ent: the per-
+// edict byte offset the arena's MakePointer encodes when the host
+// has an arena attached (the production path now that step 5 wires
+// vm.SetArena via OnArenaReady), falling back to the slot index for
+// test stubs that skip SpawnServer entirely (no arena -> the VM
+// won't see entity-pointer opcodes anyway, so a self-consistent int
+// is sufficient).
+func edictSelfPointer(h *enginehost.Host, ent *progs.Edict) int32 {
+	if h.Server.Arena != nil {
+		return h.Server.Arena.PointerForEdict(ent)
+	}
+	return edictSlot(h, ent)
+}
+
+// edictSlot returns the index of ent inside h.Server.Edicts. Used
+// as the no-arena fallback for [edictSelfPointer]; spawn-time QC
+// reads back what we wrote, so a self-consistent integer satisfies
+// the "self" hand-off when the entity-pointer opcodes don't fire.
 func edictSlot(h *enginehost.Host, ent *progs.Edict) int32 {
 	for i, e := range h.Server.Edicts {
 		if e == ent {

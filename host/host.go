@@ -61,6 +61,15 @@ type Host struct {
 	// a builtin table large enough for the spawn-time builtins
 	// (precache_*, setmodel, setorigin, ...) the QC code calls.
 	spawnFn func(ent *progs.Edict, classname string)
+
+	// onArenaReady is the per-SpawnServer arena-publication hook.
+	// SpawnServer calls it once, AFTER the EdictArena is allocated
+	// + BEFORE the entity-spawn pass runs. Wired by the embedder
+	// via [Host.SetOnArenaReady]; the production callback is
+	// vm.SetArena so the per-entity SpawnFn dispatches see live
+	// entity-pointer opcodes. nil = arena is still published on
+	// Server.Arena but not handed to the VM mid-SpawnServer.
+	onArenaReady func(arena *progs.EdictArena)
 }
 
 // ErrNilDep fires on a missing required NewHost dependency.
@@ -126,6 +135,21 @@ func (h *Host) SetInterner(intern progs.StringInterner) {
 // the spawn-time QC code calls).
 func (h *Host) SetSpawnFn(fn func(ent *progs.Edict, classname string)) {
 	h.spawnFn = fn
+}
+
+// SetOnArenaReady installs the arena-publication hook
+// [server.SpawnServer] fires once per map load, right after the
+// per-map [progs.EdictArena] is allocated + reset and BEFORE the
+// entity-spawn pass dispatches the first SpawnFn. Production
+// embedders pass [progs.VM.SetArena] (or a closure wrapping it)
+// so the VM has the arena handle the entity-pointer opcodes
+// (OP_ADDRESS / OP_LOAD_ENT / OP_STORE_P_*) need to resolve
+// self.field = X writes inside spawn-time QC.
+//
+// nil disables the hook; the arena is still stashed on
+// Server.Arena so callers can pick it up post-SpawnServer.
+func (h *Host) SetOnArenaReady(fn func(arena *progs.EdictArena)) {
+	h.onArenaReady = fn
 }
 
 // edictAt is the [world.PhysicsEdictResolver] the per-tic RunPhysics
@@ -255,6 +279,10 @@ func (h *Host) SpawnServer(mapName string, protocol int) error {
 		// dropped. Production embedders override via [Host.SetInterner]
 		// once a real progs.StringInterner exists.
 		Interner: h.interner,
+		// OnArenaReady is the per-SpawnServer arena-publication
+		// hook; nil = arena is still stashed on Server.Arena post-
+		// SpawnServer, just not handed to the VM mid-spawn.
+		OnArenaReady: h.onArenaReady,
 	}
 	return h.Server.SpawnServer(mapName, protocol, deps)
 }
