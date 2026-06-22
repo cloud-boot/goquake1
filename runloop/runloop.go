@@ -131,9 +131,14 @@ var (
 // notify overlay + client.Tick stamp messages with.
 //
 // SHORT-CIRCUITS:
-//   - if r.Client.Connection == [client.StateDisconnected], the
-//     client.Tick call is SKIPPED (there's no clc_move to send when
-//     not connected, and the inbound drain is moot with no peer)
+//   - client.Tick ALWAYS runs (no Connection-based skip): the wire-
+//     driven signon handshake (server.SendSignonHandshake -> client's
+//     applySignonNum stage 1) needs the inbound drain to fire even
+//     when state.Connection == StateDisconnected; without it the
+//     stage-1 byte that transitions the client into StateConnecting
+//     would never be read. Tick's OWN guard short-circuits the
+//     OUTBOUND clc_move build pre-StateConnected, so a pre-signon
+//     Tick is a pure inbound-drain (no spurious clc_move).
 //   - if r.SoundPool == nil or len(r.MixBuffer) == 0, the audio steps
 //     are SKIPPED (a video-only backend works fine without audio)
 //   - if Backend's QueueAudio returns [backend.ErrUnsupported], that
@@ -178,24 +183,28 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 	}
 
 	// 4) Client tick: drain inbound, send clc_move (post-signon only).
-	//    SHORT-CIRCUIT when disconnected -- nothing to send + nothing
-	//    to receive.
-	if r.Client.Connection != client.StateDisconnected {
-		in := client.TickInput{
-			Buttons:     r.Buttons,
-			MouseDX:     snap.MouseDX,
-			MouseDY:     snap.MouseDY,
-			Sensitivity: 1,
-			Speeds:      r.Speeds,
-			Dt:          dt,
-			NowSec:      nowSec,
-		}
-		out, err := client.Tick(r.Client, r.Conn, in, r.ViewAngles)
-		if err != nil {
-			return err
-		}
-		r.ViewAngles = out.ViewAngles
+	//    ALWAYS runs: the wire-driven signon handshake needs the
+	//    inbound drain to fire even when state.Connection ==
+	//    StateDisconnected -- otherwise the server's stage-1 signon
+	//    byte (which transitions the client to StateConnecting) is
+	//    never read, and the lifecycle deadlocks. The OUTBOUND
+	//    clc_move build inside Tick is itself gated on StateConnected
+	//    so a pre-signon Tick is a pure inbound-drain (no spurious
+	//    clc_move on the wire before the handshake completes).
+	in := client.TickInput{
+		Buttons:     r.Buttons,
+		MouseDX:     snap.MouseDX,
+		MouseDY:     snap.MouseDY,
+		Sensitivity: 1,
+		Speeds:      r.Speeds,
+		Dt:          dt,
+		NowSec:      nowSec,
 	}
+	out, err := client.Tick(r.Client, r.Conn, in, r.ViewAngles)
+	if err != nil {
+		return err
+	}
+	r.ViewAngles = out.ViewAngles
 
 	// 5) Optional 3D pass. The closure owns the BSP walk +
 	//    rasterization; on return r.FrameBuffer holds the rendered

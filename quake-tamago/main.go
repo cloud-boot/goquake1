@@ -260,36 +260,54 @@ func run() error {
 		// lives at Server.Edicts[slotIdx+1]. The single-player loop
 		// expects slot 0 -> edict 1.
 		playerSlot = slotIdx + 1
-		// Mark the server-side client Spawned so SendClientFrames will
-		// build per-frame messages for it (PreparePerClientMessage
-		// short-circuits on !Active || !Spawned). ConnectClient leaves
-		// Spawned=false; the upstream signon-stage 4 flips it. We have
-		// no handshake yet, so flip it directly.
-		realHost.Static.Clients[slotIdx].Spawned = true
-		fmt.Printf("QUAKE: loopback bound -- client slot %d -> edict %d (active+spawned)\n",
-			slotIdx, playerSlot)
+		// Queue the wire signon handshake into the server-side client
+		// Message buffer. The first per-tic FlushClientMessage drains
+		// these bytes through the loopback NetConn; client.Tick's
+		// SvcReader parses each svc_serverinfo + svc_signonnum stage
+		// byte-pair and applySignonNum walks the lifecycle
+		// StateDisconnected -> StateConnecting (stage 1) ->
+		// StateConnected (stage 4). No manual SetConnecting /
+		// MarkSpawned poke -- the server's wire stream drives the
+		// client lifecycle, matching the upstream NQ protocol.
+		hc := realHost.Static.Clients[slotIdx]
+		info := engineserver.ServerInfo{
+			Protocol:      protocol.VersionNQ,
+			MaxClients:    realHost.Static.MaxClients,
+			GameType:      engineserver.GameTypeCoop,
+			LevelName:     "the slipgate complex",
+			ModelPrecache: realHost.Server.ModelPrecache,
+			SoundPrecache: realHost.Server.SoundPrecache,
+		}
+		if err := engineserver.SendSignonHandshake(hc, info); err != nil {
+			return fmt.Errorf("SendSignonHandshake: %w", err)
+		}
+		// Mark the server-side client Spawned so the per-tic
+		// WriteClientData + SendClientFrames paths fire after the
+		// handshake queue. The upstream signon-stage 4 flips this on
+		// the server too via a clc_stringcmd "spawn", which the Go
+		// port doesn't parse yet -- we anticipate the post-handshake
+		// state so the per-tic svc_clientdata snapshot lands on the
+		// wire from tic 1 (alongside the queued signon bytes that
+		// drive the client's StateDisconnected -> StateConnected walk).
+		hc.Spawned = true
+		fmt.Printf("QUAKE: loopback bound -- client slot %d -> edict %d (active+spawned); wire signon queued (%d bytes)\n",
+			slotIdx, playerSlot, hc.Message.Len())
 	} else {
 		cli, _ = engineserver.NewLoopbackConn()
 	}
 
-	// 9. Build the client state. When a real host is wired we force
-	//    Connection straight to StateConnected so client.Tick's
-	//    outbound clc_move path fires from frame 0 (no signon
-	//    handshake to drive it through StateConnecting -> StateConnected
-	//    yet -- the wire-format serverinfo / signonnum messages aren't
-	//    being emitted by the loopback server side). PlayerNum=playerSlot
-	//    so any per-tic camera-follow that consults state.PlayerNum
-	//    targets the right edict.
+	// 9. Build the client state. Connection stays at StateDisconnected;
+	//    the wire signon bytes queued above drive the lifecycle
+	//    transition client-side via applySignonNum stages 1..4 on the
+	//    first per-tic client.Tick inbound drain. PlayerNum is re-set
+	//    AFTER the runner exists (in step 12-equivalent) because
+	//    applyServerInfo zeroes it when the queued svc_serverinfo
+	//    bytes are parsed. For now the pre-tic value just makes the
+	//    pre-first-frame log line non-zero.
 	clientState := client.NewState()
 	if realHost != nil {
-		if err := clientState.SetConnecting(); err != nil {
-			return fmt.Errorf("client.SetConnecting: %w", err)
-		}
-		if err := clientState.MarkSpawned(); err != nil {
-			return fmt.Errorf("client.MarkSpawned: %w", err)
-		}
 		clientState.PlayerNum = playerSlot
-		fmt.Printf("QUAKE: client forced to StateConnected (PlayerNum=%d) -- clc_move outbound enabled\n",
+		fmt.Printf("QUAKE: client state initialised StateDisconnected -- wire signon drives the lifecycle (PlayerNum=%d)\n",
 			playerSlot)
 	}
 
@@ -619,6 +637,18 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 		surfaces.Reset()
 		if err := bsprender.WalkWorld(walkCtx, 0, rd.ViewOrigin, frustum, stampFrame, &surfaces); err != nil {
 			return fmt.Errorf("WalkWorld: %w", err)
+		}
+
+		// Early-tic signon trace: the wire-driven handshake should
+		// transition Disconnected -> Connecting (tic 0, stage 1) ->
+		// Connected (tic 0, stage 4) inside a single client.Tick call.
+		// Logging the first few tics surfaces a regression if the
+		// loopback flush stops delivering bytes to the client decoder.
+		if frame < 6 {
+			fmt.Printf("QUAKE: signon trace tic %d -- clientConn=%d Spawned=%v viewh=%v health=%d\n",
+				frame, int(runner.Client.Connection),
+				runner.Client.Spawned,
+				runner.Client.ViewHeightOffset, runner.Client.Health)
 		}
 
 		// Per-frame face count log (sparse, every 60 frames) so the

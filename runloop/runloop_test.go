@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-quake1/engine/backend"
 	"github.com/go-quake1/engine/client"
+	"github.com/go-quake1/engine/protocol"
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/server"
 	"github.com/go-quake1/engine/sound"
@@ -85,8 +86,11 @@ func makeCharsSheet() *render.Pic {
 }
 
 // newRunner builds a minimal Runner wired to a Recorder backend +
-// loopback NetConn. The Client is left in StateDisconnected (so
-// client.Tick is short-circuited) unless the test overrides.
+// loopback NetConn. The Client is left in StateDisconnected unless
+// the test overrides; client.Tick still runs each frame (the
+// inbound drain is needed for the wire-driven signon handshake)
+// but the OUTBOUND clc_move build is gated on StateConnected inside
+// Tick, so a pre-signon disconnected client produces no wire traffic.
 func newRunner(t *testing.T, b backend.Backend) (*Runner, *server.LoopbackConn) {
 	t.Helper()
 	const w, h = (1 + render.MinConsoleWidth) * render.CharWidth, 64
@@ -208,10 +212,53 @@ func TestRunFrame_HappyDisconnected(t *testing.T) {
 	if len(rec.Audio) != 1 {
 		t.Fatalf("rec.Audio len = %d want 1", len(rec.Audio))
 	}
-	// Disconnected -> client.Tick skipped -> loopback outbox empty.
+	// Disconnected -> client.Tick still runs (the wire-driven signon
+	// handshake needs the inbound drain) but Tick's OUTBOUND short-
+	// circuit means no clc_move is sent -> loopback outbox empty.
 	kind, _, _ := loop.ReadMessage()
 	if kind != server.MessageNone {
-		t.Fatalf("loop ReadMessage kind = %v want MessageNone (client.Tick should be skipped)", kind)
+		t.Fatalf("loop ReadMessage kind = %v want MessageNone (Tick outbound is gated on StateConnected)", kind)
+	}
+}
+
+// TestRunFrame_WireSignonDrivesStateConnected proves the wire-driven
+// signon handshake works end-to-end through RunFrame: starting from
+// StateDisconnected with the server-side queue already holding the
+// stage byte-pair sequence SendSignonHandshake emits, ONE RunFrame
+// call drains the inbound bytes via client.Tick + Apply walks the
+// state through Connecting (stage 1) to Connected (stage 4). Without
+// the "client.Tick always runs" change in RunFrame the deadlock
+// would persist: the inbound drain is the only path the stage-1
+// byte can travel, but it was previously gated behind a
+// Connection != StateDisconnected guard.
+func TestRunFrame_WireSignonDrivesStateConnected(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	r, _ := newRunner(t, rec)
+	// Use a fresh loopback pair so the test can push bytes from the
+	// server side without the newRunner's stub server-half being lost.
+	clientSide, serverSide := server.NewLoopbackConn()
+	r.Conn = clientSide
+	// State starts at StateDisconnected; the wire path is the only
+	// driver. Pre-stage the stage byte-pair tail SendSignonHandshake
+	// would queue (the serverinfo prefix has its own apply tests; the
+	// stage bytes alone are sufficient to drive the lifecycle).
+	if _, err := serverSide.SendReliable([]byte{
+		protocol.SvcSignonNum, 1,
+		protocol.SvcSignonNum, 2,
+		protocol.SvcSignonNum, 3,
+		protocol.SvcSignonNum, 4,
+	}); err != nil {
+		t.Fatalf("SendReliable: %v", err)
+	}
+
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	if r.Client.Connection != client.StateConnected {
+		t.Fatalf("Connection = %v want StateConnected (wire signon path failed)", r.Client.Connection)
+	}
+	if !r.Client.Spawned {
+		t.Error("Spawned = false; want true (stage 4 should MarkSpawned)")
 	}
 }
 
