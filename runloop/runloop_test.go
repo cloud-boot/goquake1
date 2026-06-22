@@ -368,11 +368,13 @@ func TestRunFrame_PaintErrorPropagates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
-	// Park a 16-bit channel in the pool: sound.Paint rejects with
-	// ErrMixBadFormat before any output is written.
+	// Park a 24-bit channel in the pool: the mixer accepts 8 and 16
+	// (batch 59 landed the 16-bit path), so an unknown bit-depth is
+	// what now trips sound.Paint's pre-flight ErrMixBadFormat guard
+	// before any output is written.
 	pool.Channels[0].Sfx = &sound.Sample{
-		BitsPerSam: 16,
-		Data:       []byte{0, 0, 0, 0},
+		BitsPerSam: 24,
+		Data:       []byte{0, 0, 0, 0, 0, 0},
 		NumSamples: 2,
 	}
 	pool.Channels[0].EndPos = 2
