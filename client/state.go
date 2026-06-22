@@ -125,6 +125,16 @@ type State struct {
 	Connection ConnectionState
 	Spawned    bool
 
+	// SentSpawn latches once the client has emitted the canonical
+	// "spawn" clc_stringcmd (the wire trigger the server uses to flip
+	// its own Client.Spawned + queue svc_signonnum(4)). [client.Tick]
+	// reads + sets this so the stringcmd is sent exactly once per
+	// signon: on the FIRST post-StateConnecting tick the client sends
+	// "spawn", then latches the flag so subsequent ticks don't
+	// retransmit. Reset by [State.Disconnect] / [State.Clear] so a
+	// reconnect flow re-arms the emission.
+	SentSpawn bool
+
 	// Time is the client's view of simulation time, between MsgTime
 	// and OldTime so the renderer can lerp other state. OldTime is
 	// the previous tick we received from the server. tyrquake:
@@ -245,6 +255,7 @@ func (s *State) Clear() {
 	*s = State{
 		Connection: s.Connection,
 		Spawned:    s.Spawned,
+		SentSpawn:  s.SentSpawn,
 		Message:    buf,
 		Baselines:  make(map[int]EntityBaseline),
 		Entities:   make(map[int]EntityState),
@@ -261,6 +272,7 @@ func (s *State) Clear() {
 func (s *State) Disconnect() {
 	s.Connection = StateDisconnected
 	s.Spawned = false
+	s.SentSpawn = false
 	s.Clear()
 }
 

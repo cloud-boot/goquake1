@@ -241,3 +241,246 @@ func TestReadClientMoves_TransportError(t *testing.T) {
 		t.Fatalf("n = %d want 0", n)
 	}
 }
+
+// encodeStringCmd builds a wire-shape clc_stringcmd datagram (opcode
+// + NUL-terminated payload). Mirrors client.EncodeClcStringCmd
+// without importing the client package (the server test stays
+// dependency-free).
+func encodeStringCmd(t *testing.T, payload string) []byte {
+	t.Helper()
+	buf := sizebuf.New(make([]byte, 128))
+	if err := msg.WriteByte(buf, protocol.ClcStringCmd); err != nil {
+		t.Fatalf("WriteByte ClcStringCmd: %v", err)
+	}
+	if err := msg.WriteString(buf, payload); err != nil {
+		t.Fatalf("WriteString: %v", err)
+	}
+	out := make([]byte, len(buf.Bytes()))
+	copy(out, buf.Bytes())
+	return out
+}
+
+func TestReadClientMoves_StringCmdSpawn(t *testing.T) {
+	cli, srv := NewLoopbackConn()
+	if _, err := cli.SendReliable(encodeStringCmd(t, "spawn")); err != nil {
+		t.Fatalf("SendReliable: %v", err)
+	}
+	c := NewClient()
+	c.Active = true
+	c.NetConnection = srv
+	n, err := ReadClientMoves(c)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("n = %d want 1", n)
+	}
+	if !c.Spawned {
+		t.Error("Spawned: got false want true (spawn stringcmd should flip)")
+	}
+	// Server queued svc_signonnum(4) onto c.Message in response.
+	if c.Message.Len() != 2 {
+		t.Fatalf("Message.Len() = %d want 2 (signonnum + stage byte)", c.Message.Len())
+	}
+	bytes := c.Message.Bytes()
+	if bytes[0] != protocol.SvcSignonNum || bytes[1] != SignonStageSpawn {
+		t.Errorf("queued bytes = %v want [SvcSignonNum(%d) %d]",
+			bytes, protocol.SvcSignonNum, SignonStageSpawn)
+	}
+}
+
+func TestReadClientMoves_StringCmdBegin(t *testing.T) {
+	cli, srv := NewLoopbackConn()
+	if _, err := cli.SendReliable(encodeStringCmd(t, "begin")); err != nil {
+		t.Fatalf("SendReliable: %v", err)
+	}
+	c := NewClient()
+	c.Active = true
+	c.NetConnection = srv
+	if _, err := ReadClientMoves(c); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if !c.Spawned {
+		t.Error("Spawned: begin should flip Spawned (alias of spawn)")
+	}
+}
+
+func TestReadClientMoves_StringCmdParseError(t *testing.T) {
+	// "spawn" parser tries to queue svc_signonnum(4); a pre-filled
+	// 1-byte Message buffer overflows on the first WriteByte. The
+	// error propagates through ReadClientMoves -> ParseClcStringCmd.
+	cli, srv := NewLoopbackConn()
+	if _, err := cli.SendReliable(encodeStringCmd(t, "spawn")); err != nil {
+		t.Fatalf("SendReliable: %v", err)
+	}
+	c := NewClient()
+	c.Active = true
+	c.NetConnection = srv
+	c.Message = sizebuf.New(make([]byte, 1))
+	if err := c.Message.Write([]byte{0xFF}); err != nil {
+		t.Fatalf("pre-fill: %v", err)
+	}
+	n, err := ReadClientMoves(c)
+	if err == nil {
+		t.Fatal("got nil err, want overflow propagation")
+	}
+	if n != 0 {
+		t.Fatalf("n = %d want 0 (error fired before applied++)", n)
+	}
+}
+
+func TestReadClientMoves_StringCmdShort(t *testing.T) {
+	cli, srv := NewLoopbackConn()
+	// Opcode alone -- no NUL terminator; ReadString reads past EOF.
+	if _, err := cli.SendReliable([]byte{protocol.ClcStringCmd}); err != nil {
+		t.Fatalf("SendReliable: %v", err)
+	}
+	c := NewClient()
+	c.NetConnection = srv
+	n, err := ReadClientMoves(c)
+	if !errors.Is(err, ErrShortClcStringCmd) {
+		t.Fatalf("err = %v want ErrShortClcStringCmd", err)
+	}
+	if n != 0 {
+		t.Fatalf("n = %d want 0", n)
+	}
+}
+
+// --- ParseClcStringCmd direct unit tests ----------------------------
+
+func TestParseClcStringCmd_NilClient(t *testing.T) {
+	if err := ParseClcStringCmd(nil, "spawn"); err != nil {
+		t.Errorf("got %v want nil", err)
+	}
+}
+
+func TestParseClcStringCmd_EmptyPayload(t *testing.T) {
+	c := NewClient()
+	c.Active = true
+	if err := ParseClcStringCmd(c, ""); err != nil {
+		t.Errorf("got %v want nil", err)
+	}
+	if c.Spawned {
+		t.Error("Spawned: empty payload should not flip")
+	}
+}
+
+func TestParseClcStringCmd_WhitespaceOnlyPayload(t *testing.T) {
+	c := NewClient()
+	c.Active = true
+	if err := ParseClcStringCmd(c, "   "); err != nil {
+		t.Errorf("got %v want nil", err)
+	}
+	if c.Spawned {
+		t.Error("Spawned: whitespace-only payload should not flip")
+	}
+}
+
+func TestParseClcStringCmd_Prespawn(t *testing.T) {
+	c := NewClient()
+	c.Active = true
+	if err := ParseClcStringCmd(c, "prespawn 0 123456"); err != nil {
+		t.Errorf("got %v want nil", err)
+	}
+	if c.Spawned {
+		t.Error("Spawned: prespawn should NOT flip (it's a no-op in the Go port)")
+	}
+	if c.Message != nil && c.Message.Len() != 0 {
+		t.Errorf("Message: got %d bytes, want 0 (prespawn shouldn't queue)", c.Message.Len())
+	}
+}
+
+func TestParseClcStringCmd_SpawnFlipsAndQueues(t *testing.T) {
+	c := NewClient()
+	c.Active = true
+	if err := ParseClcStringCmd(c, "spawn"); err != nil {
+		t.Fatalf("ParseClcStringCmd: %v", err)
+	}
+	if !c.Spawned {
+		t.Error("Spawned: spawn should flip")
+	}
+	if c.Message.Len() != 2 {
+		t.Fatalf("Message.Len = %d want 2", c.Message.Len())
+	}
+	if c.Message.Bytes()[1] != SignonStageSpawn {
+		t.Errorf("stage byte = %d want %d", c.Message.Bytes()[1], SignonStageSpawn)
+	}
+}
+
+func TestParseClcStringCmd_SpawnNoMessage(t *testing.T) {
+	// spawn arm: nil Message should not panic; Spawned still flips.
+	c := NewClient()
+	c.Active = true
+	c.Message = nil
+	if err := ParseClcStringCmd(c, "spawn"); err != nil {
+		t.Errorf("got %v want nil", err)
+	}
+	if !c.Spawned {
+		t.Error("Spawned: spawn arm should still flip even with nil Message")
+	}
+}
+
+func TestParseClcStringCmd_SpawnOverflow(t *testing.T) {
+	// Constrain Message to 1 byte so EncodeSignonNum's first WriteByte
+	// for SvcSignonNum overflows. Spawned still flips (set BEFORE the
+	// encode call -- matches the upstream's eager assignment).
+	c := NewClient()
+	c.Active = true
+	c.Message = sizebuf.New(make([]byte, 1))
+	if err := c.Message.Write([]byte{0xFF}); err != nil {
+		t.Fatalf("pre-fill: %v", err)
+	}
+	if err := ParseClcStringCmd(c, "spawn"); err == nil {
+		t.Error("got nil err on overflow want propagation")
+	}
+}
+
+func TestParseClcStringCmd_NameSets(t *testing.T) {
+	c := NewClient()
+	c.Active = true
+	if err := ParseClcStringCmd(c, "name Ranger"); err != nil {
+		t.Fatalf("ParseClcStringCmd: %v", err)
+	}
+	if c.Name != "Ranger" {
+		t.Errorf("Name = %q want %q", c.Name, "Ranger")
+	}
+}
+
+func TestParseClcStringCmd_NameTrims(t *testing.T) {
+	c := NewClient()
+	c.Active = true
+	if err := ParseClcStringCmd(c, "name   Ranger  "); err != nil {
+		t.Fatalf("ParseClcStringCmd: %v", err)
+	}
+	if c.Name != "Ranger" {
+		t.Errorf("Name = %q want %q (whitespace trim)", c.Name, "Ranger")
+	}
+}
+
+func TestParseClcStringCmd_UnknownCommand(t *testing.T) {
+	c := NewClient()
+	c.Active = true
+	if err := ParseClcStringCmd(c, "kill"); err != nil {
+		t.Errorf("got %v want nil (unknowns are silent skip)", err)
+	}
+	if c.Spawned {
+		t.Error("Spawned: unknown cmd should not flip")
+	}
+}
+
+func TestSplitFirstWord_Cases(t *testing.T) {
+	cases := []struct {
+		in, w, r string
+	}{
+		{"spawn", "spawn", ""},
+		{"name X", "name", "X"},
+		{"a b c", "a", "b c"},
+	}
+	for _, tc := range cases {
+		w, r := splitFirstWord(tc.in)
+		if w != tc.w || r != tc.r {
+			t.Errorf("splitFirstWord(%q) = (%q, %q) want (%q, %q)",
+				tc.in, w, r, tc.w, tc.r)
+		}
+	}
+}

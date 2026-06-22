@@ -260,15 +260,19 @@ func run() error {
 		// lives at Server.Edicts[slotIdx+1]. The single-player loop
 		// expects slot 0 -> edict 1.
 		playerSlot = slotIdx + 1
-		// Queue the wire signon handshake into the server-side client
-		// Message buffer. The first per-tic FlushClientMessage drains
-		// these bytes through the loopback NetConn; client.Tick's
-		// SvcReader parses each svc_serverinfo + svc_signonnum stage
-		// byte-pair and applySignonNum walks the lifecycle
-		// StateDisconnected -> StateConnecting (stage 1) ->
-		// StateConnected (stage 4). No manual SetConnecting /
-		// MarkSpawned poke -- the server's wire stream drives the
-		// client lifecycle, matching the upstream NQ protocol.
+		// Queue the wire signon prefix (svc_serverinfo + signonnum 1/2/3)
+		// into the server-side client Message buffer. The first per-tic
+		// FlushClientMessage drains these bytes through the loopback
+		// NetConn; client.Tick's SvcReader parses each pair and
+		// applySignonNum walks the client into StateConnecting on stage 1.
+		//
+		// Stage 4 is INTENTIONALLY not queued here -- it now flows via
+		// the wire as a side-effect of the client's "spawn" clc_stringcmd:
+		// client.Tick sees StateConnecting + emits clc_stringcmd "spawn"
+		// once; server.ReadClientMoves -> ParseClcStringCmd flips
+		// hc.Spawned + queues svc_signonnum(4) onto hc.Message; the next
+		// per-tic flush delivers stage 4 to the client + Apply transitions
+		// to StateConnected. End-to-end wire-driven, no manual poke.
 		hc := realHost.Static.Clients[slotIdx]
 		info := engineserver.ServerInfo{
 			Protocol:      protocol.VersionNQ,
@@ -278,19 +282,15 @@ func run() error {
 			ModelPrecache: realHost.Server.ModelPrecache,
 			SoundPrecache: realHost.Server.SoundPrecache,
 		}
-		if err := engineserver.SendSignonHandshake(hc, info); err != nil {
-			return fmt.Errorf("SendSignonHandshake: %w", err)
+		if err := engineserver.SendServerInfo(hc, info); err != nil {
+			return fmt.Errorf("SendServerInfo: %w", err)
 		}
 		// Append per-entity baselines (svc_spawnbaseline) onto the same
-		// client.Message buffer. The upstream walks sv.signon AFTER the
-		// serverinfo trailer + before the per-stage signonnum byte-pairs;
-		// the Go port currently queues the four signonnum stages back-
-		// to-back inside SendSignonHandshake, so the baselines land after
-		// stage 4. Client-side state-cache semantics are insensitive to
-		// the relative order (applyBaseline is a pure map write, never
-		// gated on Connection state), so the visible effect on the
-		// client is the same: State.Baselines is populated by the time
-		// the first per-tic Tick finishes draining the queue.
+		// client.Message buffer. Baselines are queued up front (no
+		// per-tic gating); the client's applyBaseline arm caches them
+		// into State.Baselines as soon as the first Tick drains the
+		// queue. Pre-stage-4 placement keeps the cache populated by
+		// the time MarkSpawned fires.
 		blStat, err := realHost.Server.SendBaselines(hc, realHost.Progs(), realHost.Static.MaxClients)
 		if err != nil {
 			return fmt.Errorf("SendBaselines: %w", err)
@@ -298,16 +298,7 @@ func run() error {
 		fmt.Printf("QUAKE: svc_spawnbaseline broadcast -- emitted=%d skipped_free=%d skipped_nomodel=%d (out of %d edicts; total queued bytes=%d)\n",
 			blStat.Emitted, blStat.SkippedFree, blStat.SkippedNoModel,
 			realHost.Server.NumEdicts, hc.Message.Len())
-		// Mark the server-side client Spawned so the per-tic
-		// WriteClientData + SendClientFrames paths fire after the
-		// handshake queue. The upstream signon-stage 4 flips this on
-		// the server too via a clc_stringcmd "spawn", which the Go
-		// port doesn't parse yet -- we anticipate the post-handshake
-		// state so the per-tic svc_clientdata snapshot lands on the
-		// wire from tic 1 (alongside the queued signon bytes that
-		// drive the client's StateDisconnected -> StateConnected walk).
-		hc.Spawned = true
-		fmt.Printf("QUAKE: loopback bound -- client slot %d -> edict %d (active+spawned); wire signon queued (%d bytes)\n",
+		fmt.Printf("QUAKE: loopback bound -- client slot %d -> edict %d (active, awaiting wire 'spawn'); wire signon prefix queued (%d bytes)\n",
 			slotIdx, playerSlot, hc.Message.Len())
 	} else {
 		cli, _ = engineserver.NewLoopbackConn()
@@ -528,6 +519,12 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	markCtx := bsprender.NewMarkContext(bm)
 	var surfaces bsprender.SurfaceList
 	frameCount := 0
+	// loggedWireSpawn latches the one-shot "server flipped Spawned via
+	// wire 'spawn' clc_stringcmd" trace so the line appears at most
+	// once per process lifetime. Pre-batch-73 the flip happened via a
+	// manual hc.Spawned = true poke in run(); the closure now watches
+	// the server-side client struct each tic + logs the transition.
+	loggedWireSpawn := false
 
 	// Seed the player edict so the host's per-tic RunPhysics actually
 	// dispatches PhysicsWalk for slot 1:
@@ -667,6 +664,19 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				runner.Client.Spawned,
 				runner.Client.ViewHeightOffset, runner.Client.Health,
 				len(runner.Client.Baselines))
+		}
+
+		// One-shot wire-driven Spawned trace. The server-side flip
+		// happens inside server.ParseClcStringCmd when the client's
+		// "spawn" stringcmd hits ReadClientMoves; logging it here
+		// proves the wire path drove the transition (vs the legacy
+		// manual hc.Spawned = true poke that lived in run()).
+		if !loggedWireSpawn && realHost != nil && playerSlot > 0 {
+			if c := realHost.Static.Clients[playerSlot-1]; c != nil && c.Spawned {
+				fmt.Printf("QUAKE: server flipped Spawned via 'spawn' clc_stringcmd (tic %d, slot %d)\n",
+					frame, playerSlot-1)
+				loggedWireSpawn = true
+			}
 		}
 
 		// Per-frame face count log (sparse, every 60 frames) so the

@@ -45,11 +45,12 @@ func pushFromServer(t *testing.T, srv server.NetConn, data []byte) {
 // else is a stub. Used by TestTick_SendUnreliableError to verify the
 // error propagates verbatim.
 type faultyConn struct {
-	readErr error // returned by ReadMessage; nil = "no messages"
-	sendErr error // returned by SendUnreliable
+	readErr    error // returned by ReadMessage; nil = "no messages"
+	sendErr    error // returned by SendUnreliable
+	sendRelErr error // returned by SendReliable
 }
 
-func (f *faultyConn) SendReliable(b []byte) (int, error)   { return len(b), nil }
+func (f *faultyConn) SendReliable(b []byte) (int, error)   { return len(b), f.sendRelErr }
 func (f *faultyConn) SendUnreliable(b []byte) (int, error) { return 0, f.sendErr }
 func (f *faultyConn) ReadMessage() (server.MessageKind, []byte, error) {
 	if f.readErr != nil {
@@ -284,14 +285,80 @@ func TestTick_OutboundShortCircuit_Connecting(t *testing.T) {
 		t.Fatalf("Tick: %v", err)
 	}
 	if out.SentMove {
-		t.Error("SentMove: got true want false")
+		t.Error("SentMove: got true want false (clc_move gated on StateConnected)")
 	}
-	kind, _, err := srv.ReadMessage()
+	// StateConnecting fires the one-shot wire 'spawn' clc_stringcmd
+	// (the server-side ParseClcStringCmd trigger); it is the ONLY
+	// outbound the connecting tick produces. The clc_move path stays
+	// gated on StateConnected (out.SentMove guarded above).
+	kind, data, err := srv.ReadMessage()
 	if err != nil {
 		t.Fatalf("server ReadMessage: %v", err)
 	}
+	if kind != server.MessageReliable {
+		t.Fatalf("server inbox: got kind=%v want MessageReliable (spawn stringcmd)", kind)
+	}
+	if len(data) < 2 || data[0] != protocol.ClcStringCmd {
+		t.Fatalf("data: got %v want ClcStringCmd+payload", data)
+	}
+	if string(data[1:len(data)-1]) != "spawn" {
+		t.Errorf("payload: got %q want \"spawn\"", string(data[1:len(data)-1]))
+	}
+	if !st.SentSpawn {
+		t.Error("SentSpawn: got false want true (latch should flip on emit)")
+	}
+}
+
+// TestTick_SpawnStringCmd_SendReliableError propagates the conn's
+// SendReliable failure when the wire 'spawn' emit hits a fault.
+func TestTick_SpawnStringCmd_SendReliableError(t *testing.T) {
+	st := NewState()
+	if err := st.SetConnecting(); err != nil {
+		t.Fatalf("SetConnecting: %v", err)
+	}
+	sentinel := errors.New("relsend boom")
+	conn := &faultyConn{sendRelErr: sentinel}
+	if _, err := Tick(st, conn, defaultTickInput(), [3]float32{}); !errors.Is(err, sentinel) {
+		t.Errorf("got %v want sentinel", err)
+	}
+	if st.SentSpawn {
+		t.Error("SentSpawn: got true want false (error must not latch)")
+	}
+}
+
+// TestTick_SpawnStringCmdEmittedOnce verifies the SentSpawn latch:
+// the FIRST StateConnecting tick emits the stringcmd; the SECOND
+// tick is a pure inbound-drain (no retransmit). Matches the wire
+// contract -- the server-side ParseClcStringCmd needs exactly one
+// "spawn" to flip Client.Spawned + queue signonnum(4).
+func TestTick_SpawnStringCmdEmittedOnce(t *testing.T) {
+	st := NewState()
+	if err := st.SetConnecting(); err != nil {
+		t.Fatalf("SetConnecting: %v", err)
+	}
+	cli, srv := server.NewLoopbackConn()
+
+	// First tick: spawn stringcmd.
+	if _, err := Tick(st, cli, defaultTickInput(), [3]float32{}); err != nil {
+		t.Fatalf("Tick 1: %v", err)
+	}
+	if !st.SentSpawn {
+		t.Fatal("SentSpawn after tick 1: got false want true")
+	}
+	if _, _, err := srv.ReadMessage(); err != nil {
+		t.Fatalf("drain tick 1 msg: %v", err)
+	}
+
+	// Second tick: SHOULD NOT retransmit; server inbox empty.
+	if _, err := Tick(st, cli, defaultTickInput(), [3]float32{}); err != nil {
+		t.Fatalf("Tick 2: %v", err)
+	}
+	kind, _, err := srv.ReadMessage()
+	if err != nil {
+		t.Fatalf("server ReadMessage tick 2: %v", err)
+	}
 	if kind != server.MessageNone {
-		t.Errorf("server inbox: got kind=%v want MessageNone", kind)
+		t.Errorf("server inbox tick 2: got kind=%v want MessageNone (latch failed)", kind)
 	}
 }
 

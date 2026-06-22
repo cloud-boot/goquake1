@@ -151,6 +151,35 @@ func Tick(
 		}
 	}
 
+	// OUTBOUND SIGNON STRINGCMD ------------------------------------
+	// Once the inbound drain has advanced state.Connection past
+	// StateDisconnected (the server's svc_signonnum stage-1 byte fires
+	// applySignonNum's SetConnecting path), the client is responsible
+	// for emitting the canonical "spawn" clc_stringcmd ONCE so the
+	// server's ParseClcStringCmd parser flips Client.Spawned + queues
+	// the matching svc_signonnum(4) reply. Stages 2 + 3 from the
+	// server are advisory acknowledgements; we don't wait for them --
+	// the minimal NQ-loopback flow short-circuits the round-trip and
+	// just sends "spawn" the moment we see StateConnecting. The
+	// SentSpawn flag latches the emission so subsequent ticks don't
+	// retransmit; State.Disconnect clears it so a reconnect re-arms.
+	//
+	// The send goes through SendReliable so the loopback peer reads
+	// the bytes as MessageReliable (matching the inbound shape the
+	// server's ReadClientMoves expects for clc_stringcmd).
+	if state.Connection == StateConnecting && !state.SentSpawn {
+		buf := sizebuf.New(make([]byte, tickOutBufSize))
+		// EncodeClcStringCmd can only fail on a nil buf or an empty
+		// command; the literal "spawn" + the freshly-allocated buf
+		// above structurally rule both out, so the err return is
+		// unreachable (matches the EncodeClcMove pattern below).
+		_ = EncodeClcStringCmd(buf, "spawn")
+		if _, err := conn.SendReliable(buf.Bytes()); err != nil {
+			return TickOutput{}, err
+		}
+		state.SentSpawn = true
+	}
+
 	// OUTBOUND ------------------------------------------------------
 	if state.Connection != StateConnected {
 		return out, nil

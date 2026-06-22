@@ -62,3 +62,51 @@ func SendSignonHandshake(client *Client, info ServerInfo) error {
 	client.SendSignon = false
 	return nil
 }
+
+// SendServerInfo queues the post-connect handshake prefix: the
+// svc_serverinfo payload (which already terminates with
+// svc_signonnum(1)) followed by stages 2 and 3 -- the "precache /
+// baseline acknowledged, awaiting spawn stringcmd" markers. Stage 4
+// is INTENTIONALLY omitted; the wire-driven flow waits for the
+// client's "spawn" / "begin" clc_stringcmd ([ParseClcStringCmd])
+// before flipping client.Spawned + emitting stage 4.
+//
+// Use SendServerInfo when the caller intends to let the client drive
+// the final transition (the canonical NQ flow). The legacy
+// [SendSignonHandshake] -- which front-loads stages 2-4 in a single
+// burst, including the stage-4 byte the client uses as
+// StateConnected -- remains for tests + callers that want the older
+// "all-in-one" shape.
+//
+// Returns:
+//
+//   - nil on success (handshake prefix queued; client.SendSignon
+//     flipped false).
+//   - ErrEmptyLevelName when info.LevelName is empty (propagated from
+//     EncodeServerInfo).
+//   - the propagated msg.Write* / sizebuf overflow error otherwise.
+//
+// Silent no-op when client is nil, inactive, or has no Message buffer
+// -- matches [SendSignonHandshake].
+func SendServerInfo(client *Client, info ServerInfo) error {
+	if client == nil || !client.Active || client.Message == nil {
+		return nil
+	}
+	if err := EncodeServerInfo(client.Message, info); err != nil {
+		return err
+	}
+	// Stages 2 + 3 are the upstream's "precaches checked, baselines
+	// drained, ready for spawn" acknowledgements. The Go port currently
+	// queues all baselines up front (caller's SendBaselines call
+	// post-SendServerInfo), so 2 + 3 are pure markers: they bring the
+	// client's applySignonNum past stage 1 without forcing the per-tic
+	// loop to retransmit. Stage 4 is held back -- it's emitted by
+	// ParseClcStringCmd in response to the inbound "spawn".
+	for stage := 2; stage <= 3; stage++ {
+		if err := EncodeSignonNum(client.Message, stage); err != nil {
+			return err
+		}
+	}
+	client.SendSignon = false
+	return nil
+}
