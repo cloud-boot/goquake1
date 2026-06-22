@@ -818,6 +818,34 @@ func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
 		fmt.Printf("QUAKE: arena attached -- %d edicts in arena\n", arena.Cap())
 	})
 
+	// 5b. OP_STATE wiring. Monster-spawn QC (monster_zombie, ...)
+	//     invokes OP_STATE to seed the entity's animation state +
+	//     schedule the first think (".frame = N; .nextthink = time+0.1;
+	//     .think = fn"). The VM defers the three field writes to the
+	//     embedder so the entvars_t layout stays per-Progs rather than
+	//     hard-coded; without SetStateHooks + SetStateFieldOffsets the
+	//     spawn function aborts with ErrNoStateHooks. The selfEdict
+	//     callback reads the "self" QC global the SpawnFn dispatch
+	//     just seeded (step 6) -- a single source of truth for "which
+	//     edict is OP_STATE writing into". timeSource pulls sv.time
+	//     from the host so the scheduled nextthink uses the same clock
+	//     the per-tic runthink loop will eventually consult; the
+	//     reference scheduler is a separate concern, this wiring just
+	//     makes the spawn-time field assignment succeed.
+	if selfDef := p.FindGlobal("self"); selfDef != nil {
+		selfOfs := int(selfDef.Ofs)
+		vm.SetStateHooks(
+			func() float32 { return float32(h.Server.Time) },
+			func() int32 {
+				v, _ := vm.GlobalInt(selfOfs)
+				return v
+			},
+		)
+	}
+	if frameDef, nextThinkDef, thinkDef := p.FindField("frame"), p.FindField("nextthink"), p.FindField("think"); frameDef != nil && nextThinkDef != nil && thinkDef != nil {
+		vm.SetStateFieldOffsets(int(nextThinkDef.Ofs), int(frameDef.Ofs), int(thinkDef.Ofs))
+	}
+
 	// 6. SpawnFn classname dispatch. Resolves the entity's classname
 	//    to a QC function via FindFunction, sets the QC "self" global
 	//    to the (slot-indexed) edict pointer, and calls VM.Run on
