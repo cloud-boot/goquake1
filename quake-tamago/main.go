@@ -525,7 +525,22 @@ func run() error {
 	aliasModels, aliasSkins, aliasLoaded, aliasNames = loadAliasModels(pakFS, aliasPrecache)
 	fmt.Printf("QUAKE: alias models loaded: %d / %d names\n",
 		aliasLoaded, aliasNames)
-	if err := setupRenderer(runner, pakFS, realHost, playerSlot, aliasModels, aliasSkins); err != nil {
+
+	// 12b. Load HUD/sbar assets. tyrquake's Sbar_Init walks a fixed list
+	//      of gfx/*.lmp pic lumps; the loader returns a populated
+	//      [render.SBarAssets] plus the count of slots that resolved +
+	//      a short sample of missing names so the QEMU serial log proves
+	//      which assets the pak shipped. nil pakFS -> empty bundle +
+	//      DrawSBar's early-return-on-nil-BG keeps the renderer silent.
+	sbarAssets, sbarLoaded, sbarTotal, sbarMissing := loadSBarAssets(pakFS)
+	sample := sbarMissing
+	if len(sample) > 8 {
+		sample = sample[:8]
+	}
+	fmt.Printf("QUAKE: sbar -- loaded %d/%d assets, missing: %v\n",
+		sbarLoaded, sbarTotal, sample)
+
+	if err := setupRenderer(runner, pakFS, realHost, playerSlot, aliasModels, aliasSkins, sbarAssets); err != nil {
 		return fmt.Errorf("setupRenderer: %w", err)
 	}
 
@@ -564,7 +579,7 @@ func run() error {
 // trace stack on purpose: the goal of this bring-up is "key press moves
 // the camera", not "physically correct movement". A follow-up batch
 // swaps the integrator for the real SV_Physics tick.
-func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int, aliasModels []*mdl.Model, aliasSkins []*render.Pic) error {
+func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int, aliasModels []*mdl.Model, aliasSkins []*render.Pic, sbarAssets *render.SBarAssets) error {
 	// 1. Source the BSP bytes: real pak0.pak first, synthbsp fallback.
 	bspBytes, size, err := loadBSP(pakFS)
 	if err != nil {
@@ -1249,6 +1264,20 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 					}
 					fmt.Printf("QUAKE: alias shade sample modelIdx=%d verts=%d distinct=%d min=%d max=%d\n",
 						sampleES.ModelIdx, len(lights), len(seen), lmin, lmax)
+				}
+			}
+		}
+
+		// HUD/sbar pass. Runs AFTER the alias entities (so monsters /
+		// items don't paint over the status bar) and BEFORE Compose2D
+		// (so the 2D notify + console layers still overlay on top of
+		// the bar -- matches the upstream draw order in SCR_UpdateScreen).
+		// DrawSBar early-returns on nil assets so the placeholder-pak
+		// boot path (no real gfx/sbar.lmp) silently skips.
+		if sbarAssets != nil {
+			if err := render.DrawSBar(fb, runner.Client, sbarAssets); err != nil {
+				if frame%60 == 0 {
+					fmt.Printf("QUAKE: DrawSBar err: %v\n", err)
 				}
 			}
 		}
@@ -2660,6 +2689,135 @@ func hasSuffix(s, suffix string) bool {
 		return false
 	}
 	return s[len(s)-len(suffix):] == suffix
+}
+
+// loadSBarAssets opens the canonical sbar pic lumps out of pakFS via
+// render.ParsePic and returns a populated *render.SBarAssets bundle +
+// the count of slots resolved + the total attempted + a list of
+// missing names (one entry per attempted lump that pakFS doesn't
+// ship, e.g. the deathmatch ranking faces the single-player layout
+// doesn't need but the upstream init pass still asks for).
+//
+// The list mirrors tyrquake's Sbar_Init pic table in NQ/sbar.c: the
+// 320x24 main bar + the inventory strip + the 7 single-player weapon
+// icons + 4 ammo icons + 5 health face pairs (rest+pained) + 3 armor
+// tiers + 2 keys + 4 powerups + 4 sigils + 10 white digits + 10 red
+// digits + the minus variants. Every lookup is best-effort; a missing
+// lump logs once + leaves the corresponding slot nil so DrawSBar's
+// drawIfNotNil + early-return-on-nil-BG path skips it silently.
+//
+// nil pakFS returns (nil, 0, 0, nil) -- the placeholder-pak boot path
+// has no sbar lumps to load, and DrawSBar's nil-assets contract
+// (ErrSbarNilAssets) is honoured by the caller's nil-guard.
+func loadSBarAssets(pakFS fs.FS) (*render.SBarAssets, int, int, []string) {
+	if pakFS == nil {
+		return nil, 0, 0, nil
+	}
+	a := &render.SBarAssets{}
+	loaded, total := 0, 0
+	var missing []string
+
+	// load names a single lump + slots its parsed Pic into `dst`. The
+	// nested closure shares the running counters; a missing lump
+	// appends to `missing` + logs once so the QEMU serial channel
+	// surfaces the gap without drowning the log.
+	load := func(name string, dst **render.Pic) {
+		total++
+		blob, ok := tryReadPakFile(pakFS, name)
+		if !ok {
+			missing = append(missing, name)
+			fmt.Printf("QUAKE: sbar asset %s missing -- skipping\n", name)
+			return
+		}
+		pic, err := render.ParsePic(blob)
+		if err != nil {
+			missing = append(missing, name)
+			fmt.Printf("QUAKE: sbar asset %s ParsePic err: %v -- skipping\n", name, err)
+			return
+		}
+		*dst = pic
+		loaded++
+	}
+
+	// Main bar + inventory strip.
+	load("gfx/sbar.lmp", &a.BG)
+	load("gfx/ibar.lmp", &a.IBar)
+
+	// White + red digit sets (10 each) + the minus variants. The minus
+	// pics aren't part of SBarAssets's typed slots (DrawNumber never
+	// renders a negative), so the loader probes them for log fidelity
+	// only and discards the parsed Pic afterwards.
+	for i := 0; i < 10; i++ {
+		load(fmt.Sprintf("gfx/num_%d.lmp", i), &a.Nums[i])
+	}
+	for i := 0; i < 10; i++ {
+		load(fmt.Sprintf("gfx/anum_%d.lmp", i), &a.AltNums[i])
+	}
+	var scratch *render.Pic
+	load("gfx/num_minus.lmp", &scratch)
+	scratch = nil
+	load("gfx/anum_minus.lmp", &scratch)
+	scratch = nil
+
+	// Ammo icons (shells / nails / rockets / cells -- the order matches
+	// pickAmmoIcon's else-if chain in render/sbar.go).
+	load("gfx/sb_shells.lmp", &a.Ammo[0])
+	load("gfx/sb_nails.lmp", &a.Ammo[1])
+	load("gfx/sb_rocket.lmp", &a.Ammo[2])
+	load("gfx/sb_cells.lmp", &a.Ammo[3])
+
+	// Face pairs (5 health bands x {rest, pained}). The pak names are
+	// 1-indexed; map face1..face5 -> Faces[0..4][0] (rest) and
+	// face_p1..face_p5 -> Faces[0..4][1] (pained), mirroring the
+	// (row, col) shape PickFaceFrame returns. Upstream order matches:
+	// face1 = gibbed/near-death, face5 = healthy.
+	for i := 0; i < 5; i++ {
+		load(fmt.Sprintf("gfx/face%d.lmp", i+1), &a.Faces[i][0])
+	}
+	for i := 0; i < 5; i++ {
+		load(fmt.Sprintf("gfx/face_p%d.lmp", i+1), &a.Faces[i][1])
+	}
+
+	// Armor (green / yellow / red).
+	load("gfx/sb_armor1.lmp", &a.Armor[0])
+	load("gfx/sb_armor2.lmp", &a.Armor[1])
+	load("gfx/sb_armor3.lmp", &a.Armor[2])
+
+	// Weapon icons (single-player set, 7 slots). Names per tyrquake's
+	// sb_weapons[] in NQ/sbar.c: axe / shotgun / super-shotgun / nail
+	// gun / super-nail / rocket / lightning. Each row in the upstream
+	// table also has a "glow" variant for the just-picked-up flash;
+	// the static-layout port only consumes the base icon, but the
+	// glows are still probed so the log shows the pak shipped them.
+	weaponBase := []string{
+		"gfx/sb_axe.lmp",
+		"gfx/sb_sg.lmp",
+		"gfx/sb_ssg.lmp",
+		"gfx/sb_ng.lmp",
+		"gfx/sb_sng.lmp",
+		"gfx/sb_rl.lmp",
+		"gfx/sb_lg.lmp",
+	}
+	for i, name := range weaponBase {
+		load(name, &a.Weapons[i])
+	}
+	for _, name := range []string{"gfx/sb_axeg.lmp"} {
+		load(name, &scratch)
+		scratch = nil
+	}
+
+	// Keys + powerups + sigils.
+	load("gfx/sb_key1.lmp", &a.Key[0])
+	load("gfx/sb_key2.lmp", &a.Key[1])
+	load("gfx/sb_invis.lmp", &a.Invis)
+	load("gfx/sb_invuln.lmp", &a.Invuln)
+	load("gfx/sb_quad.lmp", &a.Quad)
+	load("gfx/sb_suit.lmp", &a.Suit)
+	for i := 0; i < 4; i++ {
+		load(fmt.Sprintf("gfx/sb_sigil%d.lmp", i+1), &a.Sigil[i])
+	}
+
+	return a, loaded, total, missing
 }
 
 // halt is the tamago "spin forever after a fatal error" primitive.
