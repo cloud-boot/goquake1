@@ -180,23 +180,42 @@ type sampleRateFn func(streamID uint32) (gvsound.PCMParams, bool)
 // audioAdapter satisfies virtio.AudioDevice by serialising each
 // StereoSample as 2 int16 little-endian (L then R) and forwarding the
 // byte buffer to the virtio-sound tx queue.
+//
+// When sourceRate (the engine mixer's sample rate) differs from the
+// device's negotiated rate, every WritePCM batch is upsampled via
+// nearest-neighbor (sample-and-hold) so the device receives the correct
+// number of frames per second. The upsampler runs on the StereoSample
+// slice BEFORE serialisation so the byte path stays bit-exact for the
+// no-upsample case (sourceRate == deviceRate or sourceRate == 0).
+//
+// droppedFrames counts ErrXferTimeout occurrences -- the device's data
+// queue back-pressure (one xfer buffer per Write, busy-poll bounded).
+// The runloop calls WritePCM per-tic; if the device is still consuming
+// the previous batch we drop this tic's payload silently rather than
+// stalling the loop. The counter is exposed via DroppedFrames() so
+// out-of-band telemetry can surface it.
 type audioAdapter struct {
-	write      writePCMFn
-	streamID   uint32
-	rateLookup sampleRateFn
+	write         writePCMFn
+	streamID      uint32
+	rateLookup    sampleRateFn
+	sourceRate    int // engine mixer Hz; 0 -> upsampler disabled
+	droppedFrames uint64
 }
 
 // WrapAudio adapts *sound.VirtioSound to virtio.AudioDevice.
 //
 // WritePCM serialises each StereoSample as 2 int16 little-endian
 // (L then R) and forwards the byte buffer to the device's tx queue
-// via snd.Write(streamID, …).
+// via snd.Write(streamID, …). When the engine mixer rate differs from
+// the device-negotiated rate, the wrapper upsamples (nearest-neighbor
+// sample-and-hold) before serialisation so the device receives the
+// correct frame count per wall-clock second.
 //
 // IMPORTANT: this assumes a stream has ALREADY been negotiated —
 // the caller must have driven PCMSetParams → PCMPrepare → PCMStart for
-// streamID before the first WritePCM. The wrapper performs no control-
-// queue work; if the stream is not RUNNING the device will reject the
-// transfer with gvsound.ErrDeviceStatus.
+// streamID before the first WritePCM (see [SetupAudio]). The wrapper
+// performs no control-queue work; if the stream is not RUNNING the
+// device will reject the transfer with gvsound.ErrDeviceStatus.
 //
 // SampleRate is best-effort. virtio-sound has no "current rate"
 // accessor; the wrapper queries StreamParams(streamID), which is
@@ -206,47 +225,121 @@ type audioAdapter struct {
 //
 // `streamID` is the playback stream the caller pre-allocated via the
 // device's control queue.
-func WrapAudio(snd *gvsound.VirtioSound, streamID uint32) virtio.AudioDevice {
+//
+// `sourceRate` is the engine mixer's Hz; pass 0 to disable upsampling
+// (then the wrapper passes the StereoSample slice through verbatim).
+func WrapAudio(snd *gvsound.VirtioSound, streamID uint32, sourceRate int) virtio.AudioDevice {
 	return &audioAdapter{
 		write:      snd.Write,
 		streamID:   streamID,
 		rateLookup: snd.StreamParams,
+		sourceRate: sourceRate,
 	}
 }
 
 // WritePCM forwards `samples` to the underlying device. Returns nil on
 // a zero-length input (nothing to push) without touching the device.
 // Returns [ErrSoundStreamNotReady] (which wraps [backend.ErrUnsupported])
-// when SampleRate() reports 0, the sentinel value virtio-sound uses
-// when no PCMSetParams has been issued for the wrapper's streamID:
+// when the device-negotiated rate is 0, the sentinel value virtio-sound
+// uses when no PCMSetParams has been issued for the wrapper's streamID:
 // pushing a payload at that state would either time out at the device
 // (no queue descriptor produced) or be rejected with ErrDeviceStatus.
 // The guard keeps the engine's audio path optional without requiring
 // callers to drive the full handshake just to stay quiet.
+//
+// When the engine's sourceRate differs from the device-negotiated rate,
+// `samples` is upsampled via nearest-neighbor (sample-and-hold) before
+// serialisation so the device receives the correct frames-per-second
+// count. The upsampler is a no-op when sourceRate == 0 (caller didn't
+// supply one) or sourceRate == deviceRate (1:1 match -- the byte path
+// stays bit-exact for the no-upsample case).
 func (a *audioAdapter) WritePCM(samples []sound.StereoSample) error {
 	if len(samples) == 0 {
 		return nil
 	}
-	if a.SampleRate() == 0 {
+	devRate := a.deviceSampleRate()
+	if devRate == 0 {
 		return ErrSoundStreamNotReady
 	}
-	buf := serializeStereo(samples)
+	upsampled := resampleNearest(samples, a.sourceRate, devRate)
+	buf := serializeStereo(upsampled)
 	_, err := a.write(a.streamID, buf)
+	if err != nil && errors.Is(err, gvsound.ErrXferTimeout) {
+		// Back-pressure: the device's tx queue is still consuming
+		// the previous batch (one-xfer-at-a-time + busy-poll).
+		// Drop this tic's frames rather than stalling the runloop;
+		// the counter is exposed via DroppedFrames so the caller
+		// can surface the loss without interleaving log lines per
+		// drop. A proper fix needs queue-depth + async submission
+		// in go-virtio/sound (out of scope for the engine wrapper).
+		a.droppedFrames++
+		return nil
+	}
 	return err
 }
 
-// SampleRate returns the negotiated stream sample rate in Hz. Falls
-// back to 0 when no PCMSetParams has been issued for the wrapper's
-// streamID (virtio.Backend's caller logic then substitutes its 22050 Hz
-// default via the nil-AudioDevice path — but a non-nil wrapper that
-// can't yet report a rate is a configuration error the caller should
-// surface separately).
+// DroppedFrames returns the cumulative count of WritePCM batches the
+// wrapper had to drop because the underlying virtio-snd tx queue was
+// still busy with a prior batch (ErrXferTimeout). Useful for periodic
+// runloop logging without spamming the serial console per drop.
+func (a *audioAdapter) DroppedFrames() uint64 { return a.droppedFrames }
+
+// SampleRate returns the engine-facing sample rate. The engine's
+// runloop calls Backend.SampleRate() to know what rate to mix at; we
+// hand back the engine mixer's sourceRate (the rate the engine
+// PRODUCES, not the rate the device CONSUMES), since the wrapper
+// upsamples internally. Falls back to the device-negotiated rate when
+// no sourceRate was supplied, and to 0 when the stream has not been
+// negotiated yet.
 func (a *audioAdapter) SampleRate() int {
+	if a.sourceRate > 0 {
+		return a.sourceRate
+	}
+	return a.deviceSampleRate()
+}
+
+// deviceSampleRate returns the device-negotiated PCM rate in Hz, or 0
+// when PCMSetParams has not been issued for the wrapper's streamID.
+// Internal accessor used by the upsampler's "do I need to resample?"
+// branch and the WritePCM "stream not ready" guard.
+func (a *audioAdapter) deviceSampleRate() int {
 	params, ok := a.rateLookup(a.streamID)
 	if !ok {
 		return 0
 	}
 	return pcmRateHz(params.Rate)
+}
+
+// resampleNearest expands `in` from sourceRate to deviceRate by
+// nearest-neighbor (sample-and-hold). When sourceRate == 0 (upsampler
+// disabled) or sourceRate == deviceRate (1:1 match) the input is
+// returned verbatim, no allocation. For upsampling (deviceRate >
+// sourceRate) every input frame is replicated `deviceRate/sourceRate`
+// times -- audio quality is intentionally minimal; the goal is
+// proof-of-life at the wire layer, not faithful reconstruction. A
+// proper polyphase resampler is a follow-up.
+//
+// Downsampling (deviceRate < sourceRate) decimates by the same ratio
+// (every Nth frame) -- not used by the Quake mixer (11025 -> 44100 is
+// always up) but kept symmetric for completeness.
+func resampleNearest(in []sound.StereoSample, sourceRate, deviceRate int) []sound.StereoSample {
+	if sourceRate <= 0 || sourceRate == deviceRate || deviceRate <= 0 {
+		return in
+	}
+	outLen := len(in) * deviceRate / sourceRate
+	if outLen == 0 {
+		return in[:0]
+	}
+	out := make([]sound.StereoSample, outLen)
+	for i := 0; i < outLen; i++ {
+		// srcIdx is provably in range: i ranges over [0, outLen) where
+		// outLen = len(in)*deviceRate/sourceRate, so the maximum
+		// srcIdx = (outLen-1)*sourceRate/deviceRate < len(in) by
+		// integer-division monotonicity. No clamp needed.
+		srcIdx := i * sourceRate / deviceRate
+		out[i] = in[srcIdx]
+	}
+	return out
 }
 
 // serializeStereo packs `samples` into a single byte slice as

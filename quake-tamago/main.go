@@ -238,12 +238,34 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("OpenVirtioSound: %w", err)
 		}
-		// streamID 0; the PCMSetParams → PCMPrepare → PCMStart
-		// handshake is a follow-up. SampleRate() returns 0 until then,
-		// which the realdev wrapper documents as the "not yet
-		// negotiated" sentinel.
-		audioDev = realdev.WrapAudio(vs, 0)
-		fmt.Printf("QUAKE: sound=%#04x:%#04x\n", sndDev.Vendor, sndDev.Device)
+		// Diagnostic PCMInfo dump -- helps debug rate / format
+		// mismatches when SetupAudio rejects a tuple.
+		if infos, ierr := vs.PCMInfo(); ierr == nil {
+			for i, e := range infos {
+				fmt.Printf("QUAKE: snd-stream[%d] dir=%d rates=%#x formats=%#x ch=%d-%d\n",
+					i, e.Direction, e.Rates, e.Formats, e.ChannelsMin, e.ChannelsMax)
+			}
+		} else {
+			fmt.Printf("QUAKE: snd-PCMInfo err=%v\n", ierr)
+		}
+		// Drive the PCM lifecycle: PCMInfo -> PCMSetParams -> PCMPrepare
+		// -> PCMStart. After this the device DMA-consumes from the tx
+		// virtqueue and emits PCM to the host audio backend (the
+		// -audiodev wav,id=audio0 path used by `task qemu-headless`
+		// writes the mixed result to /tmp/quake-audio.wav). The engine
+		// mixer paints 11025 Hz stereo S16 frames; the WrapAudio
+		// adapter upsamples to the negotiated device rate before
+		// pushing to the tx virtqueue. A failure here logs + falls
+		// through to silent operation so the renderer still boots and
+		// we can see the PCMInfo dump above.
+		res, serr := realdev.SetupAudio(vs, realdev.DefaultAudioStreamConfig)
+		if serr != nil {
+			fmt.Printf("QUAKE: SetupAudio err=%v (engine runs silent)\n", serr)
+		} else {
+			audioDev = realdev.WrapAudio(vs, res.StreamID, enginesound.DefaultSampleRate)
+			fmt.Printf("QUAKE: sound=%#04x:%#04x stream=%d device-rate=%dHz mixer-rate=%dHz ch=%d fmt=%d (virtio-snd stream started)\n",
+				sndDev.Vendor, sndDev.Device, res.StreamID, res.Rate, enginesound.DefaultSampleRate, res.Channels, res.Format)
+		}
 	} else {
 		fmt.Printf("QUAKE: no virtio-snd device; engine runs silent\n")
 	}

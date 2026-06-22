@@ -299,7 +299,7 @@ func TestTranslateEvent_DroppedClasses(t *testing.T) {
 // (real snd.Write / snd.StreamParams require the device's unexported
 // virtqueue + per-stream registry).
 func TestWrapAudio(t *testing.T) {
-	got := WrapAudio(&gvsound.VirtioSound{}, 0)
+	got := WrapAudio(&gvsound.VirtioSound{}, 0, 0)
 	if got == nil {
 		t.Fatalf("WrapAudio returned nil")
 	}
@@ -489,6 +489,165 @@ func TestErrSoundStreamNotReady_IsExported(t *testing.T) {
 func stubRateLookup(rate uint8, ok bool) sampleRateFn {
 	return func(uint32) (gvsound.PCMParams, bool) {
 		return gvsound.PCMParams{Rate: rate}, ok
+	}
+}
+
+// TestAudioAdapter_SampleRate_SourceRateWins: when sourceRate > 0 the
+// SampleRate accessor MUST return it (the engine mixer's rate), not the
+// device-negotiated rate. The runloop uses SampleRate() to size its
+// per-tic mix buffer; reporting the device rate while the wrapper
+// upsamples internally would double-rate every batch.
+func TestAudioAdapter_SampleRate_SourceRateWins(t *testing.T) {
+	a := &audioAdapter{
+		sourceRate: 11025,
+		rateLookup: stubRateLookup(gvsound.PCMRate48000, true),
+	}
+	if got := a.SampleRate(); got != 11025 {
+		t.Fatalf("SampleRate (sourceRate=11025, dev=48000) = %d want 11025", got)
+	}
+}
+
+// TestAudioAdapter_DeviceSampleRate_NotNegotiated covers the
+// device-side accessor's fallback when StreamParams reports not-ready.
+func TestAudioAdapter_DeviceSampleRate_NotNegotiated(t *testing.T) {
+	a := &audioAdapter{rateLookup: stubRateLookup(0, false)}
+	if got := a.deviceSampleRate(); got != 0 {
+		t.Fatalf("deviceSampleRate not-negotiated = %d want 0", got)
+	}
+}
+
+// TestResampleNearest_NoOpPassthrough: when sourceRate == deviceRate
+// the helper MUST return the slice verbatim (no allocation, no copy).
+// Same property when sourceRate == 0 (upsampler disabled) or
+// deviceRate == 0 (device not negotiated; caller guards separately).
+func TestResampleNearest_NoOpPassthrough(t *testing.T) {
+	in := []sound.StereoSample{{L: 1, R: 2}, {L: 3, R: 4}}
+	for _, tc := range []struct {
+		name             string
+		source, deviceHz int
+	}{
+		{"equal", 44100, 44100},
+		{"source-zero", 0, 48000},
+		{"device-zero", 11025, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resampleNearest(in, tc.source, tc.deviceHz)
+			if &got[0] != &in[0] {
+				t.Fatalf("%s expected verbatim slice (same backing array), got copy", tc.name)
+			}
+		})
+	}
+}
+
+// TestResampleNearest_Upsample: 11025 -> 44100 quadruples every frame.
+// Validates the integer-arithmetic srcIdx math + the output length.
+func TestResampleNearest_Upsample(t *testing.T) {
+	in := []sound.StereoSample{
+		{L: 100, R: 200},
+		{L: 300, R: 400},
+	}
+	got := resampleNearest(in, 11025, 44100)
+	if len(got) != 8 {
+		t.Fatalf("upsample len = %d want 8", len(got))
+	}
+	for i := 0; i < 4; i++ {
+		if got[i] != in[0] {
+			t.Fatalf("got[%d] = %+v want %+v", i, got[i], in[0])
+		}
+	}
+	for i := 4; i < 8; i++ {
+		if got[i] != in[1] {
+			t.Fatalf("got[%d] = %+v want %+v", i, got[i], in[1])
+		}
+	}
+}
+
+// TestResampleNearest_Downsample: 44100 -> 22050 keeps every other
+// frame. Kept symmetric even though the Quake mixer is always up.
+func TestResampleNearest_Downsample(t *testing.T) {
+	in := make([]sound.StereoSample, 4)
+	for i := range in {
+		in[i] = sound.StereoSample{L: int16(i + 1), R: int16(-(i + 1))}
+	}
+	got := resampleNearest(in, 44100, 22050)
+	if len(got) != 2 {
+		t.Fatalf("downsample len = %d want 2", len(got))
+	}
+	if got[0] != in[0] || got[1] != in[2] {
+		t.Fatalf("downsample got = %+v want [in[0], in[2]]", got)
+	}
+}
+
+// TestResampleNearest_OutLenZero: ratio so steep the output rounds to
+// zero (1 sample at 11025 -> 5512) returns in[:0] (empty, shares
+// backing array) without panicking.
+func TestResampleNearest_OutLenZero(t *testing.T) {
+	in := []sound.StereoSample{{L: 7, R: 8}}
+	got := resampleNearest(in, 11025, 5512)
+	if len(got) != 0 {
+		t.Fatalf("len = %d want 0", len(got))
+	}
+}
+
+// TestAudioAdapter_WritePCM_DropsOnXferTimeout: when go-virtio/sound's
+// busy-poll runs out (ErrXferTimeout, queue still busy with a previous
+// batch) the wrapper increments droppedFrames + returns nil so the
+// runloop carries on. Any OTHER write error MUST still propagate.
+func TestAudioAdapter_WritePCM_DropsOnXferTimeout(t *testing.T) {
+	a := &audioAdapter{
+		write: func(uint32, []byte) (int, error) {
+			return 0, gvsound.ErrXferTimeout
+		},
+		rateLookup: stubRateLookup(gvsound.PCMRate44100, true),
+	}
+	if err := a.WritePCM([]sound.StereoSample{{L: 1, R: 2}}); err != nil {
+		t.Fatalf("WritePCM err = %v want nil (timeout should drop silently)", err)
+	}
+	if got := a.DroppedFrames(); got != 1 {
+		t.Fatalf("DroppedFrames = %d want 1", got)
+	}
+	// A non-timeout error MUST surface.
+	want := errors.New("real boom")
+	b := &audioAdapter{
+		write:      func(uint32, []byte) (int, error) { return 0, want },
+		rateLookup: stubRateLookup(gvsound.PCMRate44100, true),
+	}
+	if err := b.WritePCM([]sound.StereoSample{{L: 1, R: 2}}); !errors.Is(err, want) {
+		t.Fatalf("WritePCM non-timeout err = %v want %v", err, want)
+	}
+	if got := b.DroppedFrames(); got != 0 {
+		t.Fatalf("DroppedFrames after real error = %d want 0", got)
+	}
+}
+
+// TestAudioAdapter_WritePCM_UpsamplesBeforeWrite: end-to-end of the
+// upsample path -- 2 frames at 11025 fed to a device at 44100 must
+// reach the underlying write fn as 32 bytes (8 stereo S16 frames).
+func TestAudioAdapter_WritePCM_UpsamplesBeforeWrite(t *testing.T) {
+	var capturedBuf []byte
+	a := &audioAdapter{
+		streamID:   3,
+		sourceRate: 11025,
+		write: func(streamID uint32, frames []byte) (int, error) {
+			capturedBuf = append(capturedBuf, frames...)
+			return len(frames), nil
+		},
+		rateLookup: stubRateLookup(gvsound.PCMRate44100, true),
+	}
+	in := []sound.StereoSample{{L: 0x0102, R: 0x0304}, {L: 0x0506, R: 0x0708}}
+	if err := a.WritePCM(in); err != nil {
+		t.Fatalf("WritePCM err = %v", err)
+	}
+	if len(capturedBuf) != 32 {
+		t.Fatalf("captured %d bytes want 32 (8 upsampled stereo S16 frames)", len(capturedBuf))
+	}
+	// First 16 bytes = 4x frame[0] (L=0x0102, R=0x0304).
+	for i := 0; i < 4; i++ {
+		off := i * 4
+		if binary.LittleEndian.Uint16(capturedBuf[off:off+2]) != 0x0102 ||
+			binary.LittleEndian.Uint16(capturedBuf[off+2:off+4]) != 0x0304 {
+			t.Fatalf("frame[%d] not replicated frame[0]", i)
+		}
 	}
 }
 
