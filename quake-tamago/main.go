@@ -107,6 +107,44 @@ const (
 	fbHeight = 1024
 )
 
+// demoOrbit toggles the programmatic camera walk that the headless
+// QEMU validation harness needs. With virtio-input absent (the
+// `-display none` boot path the screendump task uses) client.Tick
+// never refreshes ViewAngles -- so without the override every
+// captured frame would be the same fixed-yaw shot from the player
+// spawn. demoOrbit=true makes Pre2DDraw rewrite (viewAngles, viewOrigin)
+// each tic:
+//
+//   - viewAngles.Yaw = frame % 360 (full panoramic every 360 frames,
+//     ~6 s at 60 Hz). Pitch + roll forced to 0.
+//   - viewOrigin steps through demoWaypoints every 600 frames
+//     (~10 s) so multi-shot screendump runs land in geometrically
+//     distinct parts of the map -- exposing different miptex sets,
+//     different alias entities, different leaves.
+//
+// The waypoint set is seeded from pickInMapCamera at runtime (so the
+// anchor is always inside a valid leaf) + the BSP bbox corners
+// snapped back into a valid leaf via the same lattice walk.
+const demoOrbit = true
+
+// demoYawPeriodFrames is the frame count over which Yaw winds from
+// 0 to 360. One degree per frame at 60 Hz gives a 6-second panorama,
+// which is fast enough that a 30 s headless capture hits ~5 full
+// orbits + slow enough that any single screendump catches a clean
+// instantaneous angle (no motion-blur to worry about: the renderer
+// is a one-shot per-frame rasterize, not a temporal sampler).
+const demoYawPeriodFrames = 360
+
+// demoWaypointPeriodFrames is how many frames each waypoint holds
+// before the next one takes over. The Pre2DDraw cadence on QEMU TCG
+// headless lands around 1 frame/s (the BSP walk + alias pass + miptex
+// rasterize is the slow path on TCG without KVM); 8 frames per waypoint
+// is ~8 s of wall-clock per waypoint there, which fits a 30 s
+// multi-shot capture comfortably. On a hardware build the same setting
+// gives sub-second dwells, which is fine -- each screendump is still
+// guaranteed to land cleanly inside one waypoint window.
+const demoWaypointPeriodFrames = 8
+
 // stubHost satisfies runloop.HostFramer for first bring-up. The real
 // id-Software game-server tick wires in a follow-up batch; for now
 // the loop just renders frames + processes input.
@@ -620,6 +658,22 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	}
 	runner.ViewOrigin = camOrigin
 
+	// 5b. Demo-orbit waypoints. The headless QEMU validation harness
+	//     boots with virtio-input absent so client.Tick can't refresh
+	//     viewAngles or move the player edict -- without this lattice
+	//     every screendump would be the same shot. Each waypoint is
+	//     guaranteed-in-a-leaf via PointInLeaf; demoOrbit=false (the
+	//     interactive path) skips the build + the per-tic override.
+	var demoWaypoints [][3]float32
+	if demoOrbit && !isSynth {
+		demoWaypoints = buildDemoWaypoints(bm, file, camOrigin)
+		fmt.Printf("QUAKE: demoOrbit ON -- %d waypoints + 1-degree-per-frame yaw spin\n",
+			len(demoWaypoints))
+		for i, wp := range demoWaypoints {
+			fmt.Printf("QUAKE:   waypoint[%d] = %v\n", i, wp)
+		}
+	}
+
 	markCtx := bsprender.NewMarkContext(bm)
 	var surfaces bsprender.SurfaceList
 	frameCount := 0
@@ -720,6 +774,35 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	runner.Pre2DDraw = func(fb *render.FrameBuffer, viewOrigin, viewAngles [3]float32) error {
 		frame := frameCount
 		frameCount++
+
+		// Demo-orbit override: with no input device the wire-mirrored
+		// viewAngles never moves, so the headless QEMU run would
+		// capture the same frame forever. The override winds Yaw at
+		// one degree per frame + (optionally) steps viewOrigin
+		// through demoWaypoints every demoWaypointPeriodFrames so
+		// multi-shot screendump runs expose geometrically distinct
+		// parts of the map (different miptex sets, different alias
+		// entities visible per shot).
+		waypointIdx := -1
+		if demoOrbit && len(demoWaypoints) > 0 {
+			waypointIdx = (frame / demoWaypointPeriodFrames) % len(demoWaypoints)
+			viewOrigin = demoWaypoints[waypointIdx]
+			viewAngles = [3]float32{
+				0, // pitch
+				float32(frame % demoYawPeriodFrames),
+				0, // roll
+			}
+			// Per 60-frame cadence matches the existing audio/
+			// surface-count log just below; demo-orbit progression
+			// joins the same line set so the serial timeline stays
+			// scannable. On QEMU TCG (≈1 frame/s without KVM) the
+			// log fires roughly once per minute; on hardware (~60+
+			// frames/s) it's once per second.
+			if frame%60 == 0 {
+				fmt.Printf("QUAKE: demo-orbit tic %d -- waypoint[%d]=%v yaw=%v\n",
+					frame, waypointIdx, viewOrigin, viewAngles[1])
+			}
+		}
 
 		// Clear to sky background (palette idx 0x10). Compose2D is
 		// told to SkipBackgroundFill (via the Runner.Pre2DDraw != nil
@@ -2000,6 +2083,58 @@ func pickInMapCamera(bm *model.BrushModel, file *bspfile.File) [3]float32 {
 		}
 	}
 	return centre
+}
+
+// buildDemoWaypoints returns a small set of in-map (PointInLeaf >= 1)
+// view origins the demo-orbit override cycles through every
+// demoWaypointPeriodFrames frames. The set is seeded with anchor
+// (the pickInMapCamera result, guaranteed in a leaf) + a handful of
+// lattice probes biased toward the bbox extents at the same z so
+// different captures expose different miptex sets / alias entities.
+//
+// Each candidate that fails PointInLeaf is silently skipped; the
+// returned slice always contains anchor as its first entry so the
+// per-tic override has something to fall back on even if every
+// lattice probe lands in a solid leaf.
+func buildDemoWaypoints(bm *model.BrushModel, file *bspfile.File, anchor [3]float32) [][3]float32 {
+	out := [][3]float32{anchor}
+	models, err := file.Models()
+	if err != nil || len(models) == 0 {
+		return out
+	}
+	m := &models[0]
+	// Candidates: each lattice corner of the bbox at the anchor's z,
+	// nudged inward by 1/8 of the extent so we stay clear of the
+	// outer brushes. Z stays at the anchor's height (160 for the
+	// start.bsp info_player_start) so we always look at things
+	// roughly from the player's eye-line.
+	const (
+		nx = 4
+		ny = 4
+	)
+	for ix := 0; ix < nx; ix++ {
+		for iy := 0; iy < ny; iy++ {
+			fx := float32(ix+1) / float32(nx+1)
+			fy := float32(iy+1) / float32(ny+1)
+			p := [3]float32{
+				m.Mins[0] + (m.Maxs[0]-m.Mins[0])*fx,
+				m.Mins[1] + (m.Maxs[1]-m.Mins[1])*fy,
+				anchor[2],
+			}
+			if leaf := bm.PointInLeaf(p); leaf > 0 {
+				out = append(out, p)
+			}
+		}
+	}
+	// Cap the set so the cycle stays short enough that a 30 s
+	// headless capture visits each waypoint at least once. Four
+	// distinct waypoints at 600 frames each = 2400 frames per cycle
+	// which is well inside a 30 s @ ~60 Hz Pre2DDraw cadence.
+	const maxWaypoints = 4
+	if len(out) > maxWaypoints {
+		out = out[:maxWaypoints]
+	}
+	return out
 }
 
 // writePlayerOrigin overwrites the QC "origin" vector on the player
