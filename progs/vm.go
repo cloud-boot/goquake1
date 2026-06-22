@@ -186,6 +186,28 @@ func NewVM(p *Progs) *VM {
 // returned slice IS the live storage; mutations persist.
 func (vm *VM) Globals() []byte { return vm.globals }
 
+// Progs returns the immutable [Progs] backing this VM. Builtins that
+// need to resolve string offsets (PF_precache_model / PF_setmodel
+// read OFS_PARM* int32 string_t values out of the QC string table)
+// reach for this rather than carrying a separate handle. tyrquake:
+// the implicit `progs` global the C upstream accesses via
+// pr_strings + pr_functions etc.
+func (vm *VM) Progs() *Progs { return vm.progs }
+
+// String resolves the NUL-terminated string at the given offset in
+// the QC string table. Convenience wrapper around vm.Progs().String
+// for builtins reading OFS_PARM* string_t values without holding a
+// separate Progs handle. tyrquake: PR_GetString.
+func (vm *VM) String(off int32) string { return vm.progs.String(off) }
+
+// Arena returns the EdictArena attached via SetArena (or nil when
+// none is wired). Builtins that take an `entity` argument (setmodel,
+// setorigin, setsize) read the OFS_PARM0 int32 as a QC entity-
+// pointer + need the arena to resolve it back to an *Edict.
+// tyrquake: the implicit sv.edicts pool the entity-pointer macros
+// (EDICT_NUM / NUM_FOR_EDICT) walk.
+func (vm *VM) Arena() *EdictArena { return vm.arena }
+
 // GlobalFloat reads the float at slot ofs (ofs is a 32-bit-slot
 // index, not a byte offset). Returns ErrGlobalOffset if ofs falls
 // outside the pool. tyrquake: G_FLOAT macro.

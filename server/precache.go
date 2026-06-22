@@ -16,6 +16,62 @@ import (
 // an error so callers pick the policy.
 var ErrNotPrecached = errors.New("server: asset not in precache")
 
+// ErrPrecacheFull is returned by [PrecacheModel] / [PrecacheSound]
+// when the precache table has no empty slot left (every entry filled
+// with a non-empty name). The C upstream calls Host_Error which
+// long-jumps back to the main loop; the Go port surfaces the
+// condition as an error so callers pick the policy.
+var ErrPrecacheFull = errors.New("server: precache table full")
+
+// PrecacheModel returns the slot index of name within precache,
+// adding name to the first empty slot when it is not already present.
+// Empty name resolves to slot 0 (the world-model sentinel) without
+// mutating the table. Returns ErrPrecacheFull when every slot is
+// filled with a non-empty name. tyrquake: SV_ModelIndex's
+// "add-if-missing" branch (NQ/sv_main.c).
+//
+// The precache slice is sentinel-terminated: the walk stops at the
+// first empty entry, and "first empty entry" is where new names land.
+// The slice itself is fixed-size ([MaxModels]); this helper mutates
+// the entry in place, it never re-slices, so the caller's reference
+// stays valid.
+func PrecacheModel(precache []string, name string) (int, error) {
+	if name == "" {
+		return 0, nil
+	}
+	for i, entry := range precache {
+		if entry == name {
+			return i, nil
+		}
+		if entry == "" {
+			precache[i] = name
+			return i, nil
+		}
+	}
+	return 0, fmt.Errorf("%w: model %q", ErrPrecacheFull, name)
+}
+
+// PrecacheSound mirrors [PrecacheModel] for the sound table. Slot 0
+// is reserved (matching [SoundIndex]'s `for i := 1` walk), so the
+// add-if-missing search starts at index 1. Empty name returns 0
+// without mutating the table. tyrquake: SV_SoundIndex's
+// "add-if-missing" branch (NQ/sv_main.c).
+func PrecacheSound(precache []string, name string) (int, error) {
+	if name == "" {
+		return 0, nil
+	}
+	for i := 1; i < len(precache); i++ {
+		if precache[i] == name {
+			return i, nil
+		}
+		if precache[i] == "" {
+			precache[i] = name
+			return i, nil
+		}
+	}
+	return 0, fmt.Errorf("%w: sound %q", ErrPrecacheFull, name)
+}
+
 // ModelIndex returns the slot index of name within precache, or 0
 // if name is empty. tyrquake: SV_ModelIndex.
 //

@@ -242,6 +242,26 @@ func run() error {
 			// numEdicts well past 2.
 			fmt.Printf("QUAKE: spawn census -- %d edicts populated past the world+client reserve (MaxClients=%d)\n",
 				h.Server.NumEdicts-h.Static.MaxClients-1, h.Static.MaxClients)
+			// ModelPrecache census. Proves [builtinPrecacheModel] +
+			// [builtinSetModel] actually populated the slice past the
+			// world+submodel slots SpawnServer seeded. Counts every
+			// non-empty entry + how many of those end in ".mdl" (the
+			// alias-model extension; .bsp = brush submodels seeded by
+			// SpawnServer, .spr = sprites). A zero .mdl count means the
+			// real builtins aren't firing + the alias-render pass
+			// downstream will draw nothing.
+			total, mdlCount := 0, 0
+			for _, n := range h.Server.ModelPrecache {
+				if n == "" {
+					break
+				}
+				total++
+				if len(n) >= 4 && n[len(n)-4:] == ".mdl" {
+					mdlCount++
+				}
+			}
+			fmt.Printf("QUAKE: ModelPrecache populated -- %d entries (%d .mdl alias models)\n",
+				total, mdlCount)
 		}
 	}
 
@@ -1046,7 +1066,7 @@ func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
 	//    health = 60) live in the bytecode AFTER the builtin call,
 	//    so the per-entity field assignment still lands on the edict.
 	vm.RegisterMathBuiltins()
-	if err := registerSpawnTimeBuiltins(vm); err != nil {
+	if err := registerSpawnTimeBuiltins(vm, h); err != nil {
 		return nil, fmt.Errorf("buildHost: registerSpawnTimeBuiltins: %w", err)
 	}
 	// random() seed. The math builtin BuiltinFnRandom returns
@@ -1340,19 +1360,28 @@ func edictSlot(h *enginehost.Host, ent *progs.Edict) int32 {
 // changelevel, setspawnparms, makevectors, spawn, remove, ftos,
 // vtos, localcmd, changeyaw, cvar_set.
 //
+// EXCEPTION: precache_model + setmodel ship REAL implementations
+// (see [builtinPrecacheModel] / [builtinSetModel]). Without those
+// two the Server.ModelPrecache slice stays empty + every entity's
+// .modelindex stays zero, which means the post-spawn alias-render
+// pass [setupRenderer]'s Pre2DDraw closure sees ModelIdx == 0 for
+// every entity + draws nothing. The two real impls give the
+// renderer real .mdl names to walk + real per-edict indices to
+// dispatch by.
+//
 // Functional builtins (the math 9 from RegisterMathBuiltins) stay
-// real; only the spawn-time side-effect builtins are stubbed here.
-// A real implementation would precache assets, link entities into
-// the world tree, etc.; for "prove the SpawnFn dispatch works" the
-// no-op shape is sufficient + safer than a half-port that crashes.
-func registerSpawnTimeBuiltins(vm *progs.VM) error {
+// real; the rest of the spawn-time side-effect builtins are stubbed
+// here. A real implementation would precache sounds, link entities
+// into the world tree, etc.; for "prove the SpawnFn dispatch works"
+// the no-op shape is sufficient + safer than a half-port that crashes.
+func registerSpawnTimeBuiltins(vm *progs.VM, h *enginehost.Host) error {
 	noop := func(_ *progs.VM) error { return nil }
 	// makevectors writes v_forward/right/up; spawn-time entities
 	// rarely consult those, so the stub leaves them untouched. A
 	// future batch wires the real math.
 	vm.RegisterBuiltin(progs.BuiltinMakeVectors, noop)
 	vm.RegisterBuiltin(progs.BuiltinSetOrigin, noop)
-	vm.RegisterBuiltin(progs.BuiltinSetModel, noop)
+	vm.RegisterBuiltin(progs.BuiltinSetModel, builtinSetModel(h))
 	vm.RegisterBuiltin(progs.BuiltinSetSize, noop)
 	vm.RegisterBuiltin(progs.BuiltinBreak, noop)
 	vm.RegisterBuiltin(progs.BuiltinSound, noop)
@@ -1364,7 +1393,7 @@ func registerSpawnTimeBuiltins(vm *progs.VM) error {
 	vm.RegisterBuiltin(progs.BuiltinCheckClient, noop)
 	vm.RegisterBuiltin(progs.BuiltinFind, noop)
 	vm.RegisterBuiltin(progs.BuiltinPrecacheSound, noop)
-	vm.RegisterBuiltin(progs.BuiltinPrecacheModel, noop)
+	vm.RegisterBuiltin(progs.BuiltinPrecacheModel, builtinPrecacheModel(h))
 	vm.RegisterBuiltin(progs.BuiltinStuffCmd, noop)
 	vm.RegisterBuiltin(progs.BuiltinFindRadius, noop)
 	vm.RegisterBuiltin(progs.BuiltinBPrint, noop)
@@ -1412,6 +1441,93 @@ func registerSpawnTimeBuiltins(vm *progs.VM) error {
 		vm.RegisterBuiltin(idx, noop)
 	}
 	return nil
+}
+
+// builtinPrecacheModel returns a Builtin closure that implements
+// the QuakeC precache_model(name) built-in (tyrquake's PF_precache_model
+// at builtin slot 20). Reads the string_t name from OFS_PARM0, appends
+// it to h.Server.ModelPrecache via server.PrecacheModel (first-empty-
+// slot policy), and writes the SAME string_t offset to OFS_RETURN so
+// the caller's `self.model = precache_model("progs/foo.mdl")` lands
+// the real string offset on the edict's .model field (the QC compiler
+// emits OP_CALL1 then OP_STOREP_S using OFS_RETURN as the source).
+//
+// nil host or nil Server is a tolerated no-op (matches the stub
+// shape: spawn QC still proceeds to its field-assignment half). A
+// precache-full server logs a one-line warning + returns nil; the
+// upstream Host_Errors but the Go port's contract is "diagnose loudly,
+// don't crash the bring-up".
+func builtinPrecacheModel(h *enginehost.Host) progs.Builtin {
+	return func(vm *progs.VM) error {
+		if h == nil || h.Server == nil {
+			return nil
+		}
+		off, _ := vm.GlobalInt(progs.OfsParm0)
+		name := vm.String(off)
+		if name == "" {
+			return vm.SetGlobalInt(progs.OfsReturn, off)
+		}
+		if _, err := engineserver.PrecacheModel(h.Server.ModelPrecache, name); err != nil {
+			fmt.Printf("QUAKE: precache_model(%q): %v\n", name, err)
+		}
+		return vm.SetGlobalInt(progs.OfsReturn, off)
+	}
+}
+
+// builtinSetModel returns a Builtin closure that implements the
+// QuakeC setmodel(entity, name) built-in (tyrquake's PF_setmodel at
+// builtin slot 3). Reads the entity-pointer from OFS_PARM0 + the
+// string_t name from OFS_PARM1, resolves the model index by walking
+// Server.ModelPrecache (NOT add-if-missing -- upstream PF_setmodel
+// errors when the model isn't already precached, so a precache pass
+// must have run first), then writes:
+//
+//   - ent.model = name (string_t offset, stored as int32 in the field)
+//   - ent.modelindex = idx (stored as float per QC convention)
+//
+// The bbox-setup half of PF_setmodel (SetMinMaxSize from the loaded
+// model + SV_LinkEdict re-linking the entity into the area tree) is
+// DEFERRED to a follow-up batch: the alias-render bring-up only needs
+// .model + .modelindex to be non-zero so the renderer's per-entity
+// dispatch sees a valid index.
+//
+// Tolerated no-ops (no host / no server / no arena / unresolvable
+// edict-pointer / field-not-in-progs) all log a one-line warning +
+// return nil; same crash-safety contract as builtinPrecacheModel.
+func builtinSetModel(h *enginehost.Host) progs.Builtin {
+	return func(vm *progs.VM) error {
+		if h == nil || h.Server == nil {
+			return nil
+		}
+		entPtr, _ := vm.GlobalInt(progs.OfsParm0)
+		nameOff, _ := vm.GlobalInt(progs.OfsParm1)
+		name := vm.String(nameOff)
+		arena := vm.Arena()
+		if arena == nil {
+			return nil
+		}
+		ent, _, err := arena.ResolvePointer(entPtr)
+		if err != nil {
+			fmt.Printf("QUAKE: setmodel(ptr=%d, %q): ResolvePointer: %v\n", entPtr, name, err)
+			return nil
+		}
+		idx, err := engineserver.ModelIndex(h.Server.ModelPrecache, name)
+		if err != nil {
+			fmt.Printf("QUAKE: setmodel(%q): %v\n", name, err)
+			// Continue: still write .model so .model isn't half-set.
+		}
+		p := vm.Progs()
+		if p == nil {
+			return nil
+		}
+		if def := p.FindField("model"); def != nil {
+			_ = ent.FieldSetInt(int(def.Ofs), nameOff)
+		}
+		if def := p.FindField("modelindex"); def != nil {
+			_ = ent.FieldSetFloat(int(def.Ofs), float32(idx))
+		}
+		return nil
+	}
 }
 
 // newLCGRandom returns a float-in-[0,1) callback suitable for

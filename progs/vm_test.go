@@ -1172,3 +1172,48 @@ func TestVM_Accessors(t *testing.T) {
 		t.Errorf("Globals len: %d", len(vm.Globals()))
 	}
 }
+
+// VM.Progs returns the same *Progs the VM was constructed with;
+// builtins reach for it to walk the function/string/field tables
+// without carrying a separate handle.
+func TestVM_Progs(t *testing.T) {
+	p := progsForVM(nil)
+	vm := NewVM(p)
+	if vm.Progs() != p {
+		t.Error("VM.Progs returned a different *Progs than NewVM was given")
+	}
+}
+
+// VM.String resolves a QC string_t offset to the NUL-terminated
+// string in the QC string table. Mirrors Progs.String semantics:
+// in-range returns the string, out-of-range returns the empty
+// string.
+func TestVM_String(t *testing.T) {
+	p := progsForVM(nil)
+	p.Strings = append([]byte{0}, []byte("progs/zombie.mdl\x00")...)
+	vm := NewVM(p)
+	if got := vm.String(1); got != "progs/zombie.mdl" {
+		t.Errorf("String: got %q want progs/zombie.mdl", got)
+	}
+	// Out-of-range -> empty string (Progs.String contract).
+	if got := vm.String(9999); got != "" {
+		t.Errorf("out-of-range String: got %q want empty", got)
+	}
+}
+
+// VM.Arena returns nil until SetArena wires one, then the same
+// pointer SetArena stored. Builtins that take an `entity` arg
+// (setmodel, setorigin) reach for this to resolve the OFS_PARM0
+// entity-pointer.
+func TestVM_Arena(t *testing.T) {
+	p := progsForVM(nil)
+	vm := NewVM(p)
+	if vm.Arena() != nil {
+		t.Error("Arena pre-SetArena: want nil")
+	}
+	a := NewEdictArena(p, 4)
+	vm.SetArena(a)
+	if vm.Arena() != a {
+		t.Error("Arena post-SetArena: did not return the wired arena")
+	}
+}
