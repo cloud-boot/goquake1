@@ -600,9 +600,53 @@ func TestApply_Update_FullMask_CachesIntoEntities(t *testing.T) {
 		Effects:  0x10,
 		Origin:   [3]float32{1, 2, 3},
 		Angles:   [3]float32{45, 90, 180},
+		// First sight: prior Frame was 0 (zero seed), now 5 -- the
+		// transition stamps PrevFrame=0 (the prior live value) +
+		// LerpStartTime=nowSec=1.5 so the renderer can lerp 0 -> 5.
+		PrevFrame:     0,
+		LerpStartTime: 1.5,
 	}
 	if got != want {
 		t.Errorf("Entities[42]: got %+v want %+v", got, want)
+	}
+}
+
+// applyUpdate frame transition: when U_FRAME flips the entity's Frame
+// to a NEW value, the prior live Frame is copied into PrevFrame and
+// LerpStartTime is stamped with nowSec. Re-sending the SAME Frame in a
+// follow-up update must NOT re-stamp -- otherwise the renderer would
+// see a perpetual lerp == 0 freeze on every tic.
+func TestApply_Update_FrameTransition_StampsLerpWindow(t *testing.T) {
+	s := NewState()
+	// Seed Frame=3 at t=1.0.
+	first := DecodedUpdate{EntityNum: 1, Bits: protocol.UFrame, Frame: 3}
+	if err := Apply(s, first, 1.0); err != nil {
+		t.Fatalf("Apply[1]: %v", err)
+	}
+	got1 := s.Entities[1]
+	if got1.Frame != 3 || got1.PrevFrame != 0 || got1.LerpStartTime != 1.0 {
+		t.Errorf("first: got Frame=%d PrevFrame=%d LerpStartTime=%v want 3/0/1.0",
+			got1.Frame, got1.PrevFrame, got1.LerpStartTime)
+	}
+	// Same Frame again at t=1.05 -- must NOT re-stamp.
+	if err := Apply(s, first, 1.05); err != nil {
+		t.Fatalf("Apply[2]: %v", err)
+	}
+	got2 := s.Entities[1]
+	if got2.LerpStartTime != 1.0 || got2.PrevFrame != 0 {
+		t.Errorf("re-send same Frame: got PrevFrame=%d LerpStartTime=%v want 0/1.0 (no re-stamp)",
+			got2.PrevFrame, got2.LerpStartTime)
+	}
+	// Transition to Frame=7 at t=1.1 -- PrevFrame inherits the prior
+	// live value (3), LerpStartTime updates to 1.1.
+	third := DecodedUpdate{EntityNum: 1, Bits: protocol.UFrame, Frame: 7}
+	if err := Apply(s, third, 1.1); err != nil {
+		t.Fatalf("Apply[3]: %v", err)
+	}
+	got3 := s.Entities[1]
+	if got3.Frame != 7 || got3.PrevFrame != 3 || got3.LerpStartTime != 1.1 {
+		t.Errorf("transition 3->7: got Frame=%d PrevFrame=%d LerpStartTime=%v want 7/3/1.1",
+			got3.Frame, got3.PrevFrame, got3.LerpStartTime)
 	}
 }
 

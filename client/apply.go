@@ -125,7 +125,7 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 		applyBaseline(state, m)
 		return nil
 	case DecodedUpdate:
-		applyUpdate(state, m)
+		applyUpdate(state, m, nowSec)
 		return nil
 	case DecodedNop,
 		DecodedPrint,
@@ -273,7 +273,15 @@ func applyBaseline(state *State, m DecodedBaseline) {
 //
 // tyrquake: CL_ParseUpdate -- the "entity_state_t state = ent->baseline;
 // <decode delta bits onto state>; ent->state = state;" body.
-func applyUpdate(state *State, m DecodedUpdate) {
+//
+// Animation-interpolation bookkeeping (PrevFrame + LerpStartTime): when
+// the message's UFrame bit overlays a NEW Frame value (different from
+// the live cache's prior Frame) the arm copies the prior Frame into
+// PrevFrame and stamps LerpStartTime = nowSec. The renderer reads
+// these to lerp between adjacent poses over the 10 Hz alias-animation
+// window. tyrquake: entity_t.previousframe + entity_t.frame_start_time
+// in CL_LerpEntities.
+func applyUpdate(state *State, m DecodedUpdate, nowSec float32) {
 	if state.Entities == nil {
 		state.Entities = make(map[int]EntityState)
 	}
@@ -325,6 +333,14 @@ func applyUpdate(state *State, m DecodedUpdate) {
 		es.ModelIdx = m.Model
 	}
 	if m.Bits&protocol.UFrame != 0 {
+		// Animation-interp bookkeeping: only stamp when the frame
+		// actually changes. Repeated updates with the same Frame
+		// preserve the existing lerp window (otherwise the renderer
+		// would see a perpetual lerp == 0 freeze on every tic).
+		if m.Frame != es.Frame {
+			es.PrevFrame = es.Frame
+			es.LerpStartTime = nowSec
+		}
 		es.Frame = m.Frame
 	}
 	if m.Bits&protocol.UColorMap != 0 {

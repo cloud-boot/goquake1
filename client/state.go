@@ -87,6 +87,24 @@ type EntityState struct {
 	Effects  int
 	Origin   [3]float32
 	Angles   [3]float32
+
+	// PrevFrame + LerpStartTime drive client-side animation
+	// interpolation between adjacent frames. The wire protocol only
+	// transmits the CURRENT frame index; the previous one is
+	// remembered here. Apply's [DecodedUpdate] arm copies the prior
+	// Frame into PrevFrame + stamps LerpStartTime = nowSec whenever
+	// the message's U_FRAME bit changes the entity's Frame. The
+	// renderer's per-tic alias-draw pass then computes
+	//
+	//	lerp = clamp((now - LerpStartTime) / animPeriod, 0, 1)
+	//
+	// and hands (PrevFrame, Frame, lerp) to [render.DrawAliasInterp]
+	// for byte-space pose blending. Period == 0.1 s (10 Hz alias
+	// animation cadence) matches the upstream R_SetupAliasFrame
+	// interpolation window. tyrquake: entity_t.previousframe +
+	// entity_t.frame_start_time inside CL_LerpEntities / R_AliasSetupFrame.
+	PrevFrame     int
+	LerpStartTime float32
 }
 
 // LightStyle is one of the 64 named light animation strings.
