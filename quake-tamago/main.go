@@ -2894,24 +2894,33 @@ func loadSBarAssets(pakFS fs.FS) (*render.SBarAssets, int, int, []string) {
 	load("gfx/sb_armor3.lmp", &a.Armor[2])
 
 	// Weapon icons (single-player set, 7 slots). Names per tyrquake's
-	// sb_weapons[] in NQ/sbar.c: axe / shotgun / super-shotgun / nail
-	// gun / super-nail / rocket / lightning. Each row in the upstream
-	// table also has a "glow" variant for the just-picked-up flash;
-	// the static-layout port only consumes the base icon, but the
-	// glows are still probed so the log shows the pak shipped them.
+	// sb_weapons[0][0..6] in NQ/sbar.c (Sbar_Init): shotgun, super-
+	// shotgun, nailgun, super-nailgun, rocket-launcher, super-rocket-
+	// launcher, lightning. There is NO axe slot -- the axe is rendered
+	// via the player model, not the inventory strip -- so the table
+	// has exactly 7 entries, matching SBarAssets.Weapons[7].
+	//
+	// The lumps live inside the WAD2 archive gfx.wad under the
+	// upstream "inv_*" names (the overlay strips the gfx/ prefix +
+	// .lmp suffix). The "selected" variant inv2_lightng is probed as
+	// scratch so the log records the pak shipped the full active /
+	// owned pair the upstream port toggles between -- consuming it
+	// here would require expanding SBarAssets.Weapons to [7][8] to
+	// match tyrquake's sb_weapons table, which the static-layout port
+	// deliberately does not do.
 	weaponBase := []string{
-		"gfx/sb_axe.lmp",
-		"gfx/sb_sg.lmp",
-		"gfx/sb_ssg.lmp",
-		"gfx/sb_ng.lmp",
-		"gfx/sb_sng.lmp",
-		"gfx/sb_rl.lmp",
-		"gfx/sb_lg.lmp",
+		"gfx/inv_shotgun.lmp",
+		"gfx/inv_sshotgun.lmp",
+		"gfx/inv_nailgun.lmp",
+		"gfx/inv_snailgun.lmp",
+		"gfx/inv_rlaunch.lmp",
+		"gfx/inv_srlaunch.lmp",
+		"gfx/inv_lightng.lmp",
 	}
 	for i, name := range weaponBase {
 		load(name, &a.Weapons[i])
 	}
-	for _, name := range []string{"gfx/sb_axeg.lmp"} {
+	for _, name := range []string{"gfx/inv2_lightng.lmp"} {
 		load(name, &scratch)
 		scratch = nil
 	}
