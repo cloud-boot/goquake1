@@ -101,12 +101,25 @@ import (
 )
 
 // fbWidth / fbHeight are the framebuffer dimensions handed to
-// virtio-gpu's SetupFramebuffer. 1280x1024 is the boot resolution;
-// QEMU GTK/Cocoa display is resizable so the host window scales the
-// scanout buffer up or down freely.
+// virtio-gpu's SetupFramebuffer. 320x240 matches vanilla DOS Quake
+// (320x200/320x240) so the software span rasterizer's per-pixel
+// perspective-correct texture mapping stays affordable in QEMU TCG.
+//
+// History: this used to be 1280x1024 = 1.3 megapixels per frame,
+// which in pure-Go on QEMU TCG (no KVM) clocked ~0.85 tics per
+// wall-clock second -- effectively a slideshow, AND the engine's
+// renderer only paints the central viewport so the outer pixels
+// stayed at their (palette idx 0x02 / 0x20) clear colour. From a
+// distance that read as "colours wrong" + "doesn't look like
+// 1280x1024" because the rendered scene was a small inset in a
+// mostly-grey field. 320x240 is 76800 pixels (16.8x less work) so
+// the same TCG host now targets 30+ fps, the renderer fills the
+// whole surface, and QEMU's cocoa / gtk display layer (zoom-to-fit
+// = on, set in Taskfile.yml) upscales the 320x240 scanout to
+// whatever size the user drags the host window to.
 const (
-	fbWidth  = 1280
-	fbHeight = 1024
+	fbWidth  = 320
+	fbHeight = 240
 )
 
 // demoOrbit toggles the programmatic camera walk that the headless

@@ -37,20 +37,26 @@ tasks:
           -o "{{.ELF}}" .
 
   qemu-visible:
-    desc: Run Quake in QEMU with a native window (cocoa on darwin, gtk on linux), resizable + zoom-to-fit.
+    desc: Run Quake in QEMU with a native window (cocoa on darwin, gtk on linux), resizable + zoom-to-fit. The framebuffer is 320x240 (vanilla DOS Quake); the display layer rescales to the user-resized window dimensions so the window can be dragged to any size + the upscaled scene fills it.
     deps: [build]
     vars:
-      # Darwin: cocoa supports `zoom-to-fit=on` and is resizable by default.
-      # Linux: gtk supports both. Both wrap the framebuffer (default 1280x1024)
-      # and rescale to the user-resized window dimensions.
+      # Darwin: cocoa supports `zoom-to-fit=on` + `show-cursor=on`; the cocoa
+      # NSWindow is user-resizable by default (the macOS app convention -- the
+      # green resize handle in the title bar). Linux: gtk supports the same.
+      # Both wrap the 320x240 framebuffer and rescale to the user-resized
+      # window dimensions. virtio-gpu's xres/yres MUST match the engine's
+      # fbWidth/fbHeight (set in quake-tamago/main.go to 320x240) so the
+      # scanout surface dims line up with the SetupFramebuffer call;
+      # mismatched dims = host pixman crop or pad to the surface, never
+      # what the engine drew.
       DISPLAY:
-        sh: 'case "$(uname -s)" in Darwin) echo "cocoa,zoom-to-fit=on" ;; *) echo "gtk,zoom-to-fit=on" ;; esac'
+        sh: 'case "$(uname -s)" in Darwin) echo "cocoa,zoom-to-fit=on,show-cursor=on" ;; *) echo "gtk,zoom-to-fit=on" ;; esac'
     cmds:
       - |
         qemu-system-x86_64 -M q35 -accel tcg -cpu {{.CPU}} -m {{.MEM}} \
           -display {{.DISPLAY}} \
           -no-reboot -vga none \
-          -device virtio-gpu-pci,id=vgpu,xres=1280,yres=1024 \
+          -device virtio-gpu-pci,id=vgpu,xres=320,yres=240 \
           -device virtio-keyboard-pci,id=vkbd \
           -device virtio-mouse-pci,id=vmouse \
           -device virtio-sound-pci,id=vsnd,audiodev=audio0 \
@@ -63,13 +69,13 @@ tasks:
     deps: [build]
     vars:
       DISPLAY:
-        sh: 'case "$(uname -s)" in Darwin) echo "cocoa,zoom-to-fit=on" ;; *) echo "gtk,zoom-to-fit=on" ;; esac'
+        sh: 'case "$(uname -s)" in Darwin) echo "cocoa,zoom-to-fit=on,show-cursor=on" ;; *) echo "gtk,zoom-to-fit=on" ;; esac'
     cmds:
       - |
         qemu-system-x86_64 -M q35 -accel tcg -cpu {{.CPU}} -m {{.MEM}} \
           -display {{.DISPLAY}} \
           -no-reboot -vga none \
-          -device virtio-gpu-pci,id=vgpu,xres=1280,yres=1024 \
+          -device virtio-gpu-pci,id=vgpu,xres=320,yres=240 \
           -device virtio-keyboard-pci,id=vkbd \
           -device virtio-mouse-pci,id=vmouse \
           -device virtio-sound-pci,id=vsnd,audiodev=audio0 \
@@ -78,7 +84,7 @@ tasks:
           -kernel "{{.ELF}}"
 
   qemu-vnc:
-    desc: Run Quake in QEMU with a VNC server on :5900 (connect via any VNC viewer).
+    desc: Run Quake in QEMU with a VNC server on :5900 (connect via any VNC viewer). VNC clients (e.g. macOS Screen Sharing) honour QEMU's resize-on-connect so the client window scales the 320x240 scanout up freely.
     deps: [build]
     cmds:
       - echo "VNC listening on localhost:5900 (display :0)"
@@ -86,7 +92,7 @@ tasks:
         qemu-system-x86_64 -M q35 -accel tcg -cpu {{.CPU}} -m {{.MEM}} \
           -display vnc=:0 \
           -no-reboot -vga none \
-          -device virtio-gpu-pci,id=vgpu \
+          -device virtio-gpu-pci,id=vgpu,xres=320,yres=240 \
           -device virtio-keyboard-pci,id=vkbd \
           -device virtio-mouse-pci,id=vmouse \
           -serial stdio \
@@ -107,7 +113,7 @@ tasks:
         # actually emitted PCM, not just that the mixer ticked.
         qemu-system-x86_64 -M q35 -accel tcg -cpu {{.CPU}} -m {{.MEM}} \
           -display none -no-reboot -vga none \
-          -device virtio-gpu-pci,id=vgpu \
+          -device virtio-gpu-pci,id=vgpu,xres=320,yres=240 \
           -device virtio-keyboard-pci,id=vkbd \
           -device virtio-mouse-pci,id=vmouse \
           -device virtio-sound-pci,id=vsnd,audiodev=audio0 \

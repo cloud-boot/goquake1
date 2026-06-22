@@ -69,7 +69,7 @@ done
 # the unix socket; we drive screendump commands over it.
 "$QEMU" -M q35 -accel tcg -cpu "$CPU" -m "$MEM" \
     -display none -no-reboot -vga none \
-    -device virtio-gpu-pci,id=vgpu,xres=1280,yres=1024 \
+    -device virtio-gpu-pci,id=vgpu,xres=320,yres=240 \
     -device virtio-keyboard-pci,id=vkbd \
     -device virtio-mouse-pci,id=vmouse \
     -serial "file:${SERIAL}" \
