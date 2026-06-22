@@ -95,6 +95,7 @@ import (
 	engineserver "github.com/go-quake1/engine/server"
 	enginesound "github.com/go-quake1/engine/sound"
 	"github.com/go-quake1/engine/vfs"
+	"github.com/go-quake1/engine/world"
 )
 
 // fbWidth / fbHeight are the framebuffer dimensions handed to
@@ -1516,6 +1517,24 @@ func builtinPrecacheModel(h *enginehost.Host) progs.Builtin {
 	}
 }
 
+// setModelCache caches the per-builtinSetModel state that needs to
+// survive across calls: a memo of decoded *mdl.Model bbox pairs
+// keyed by precache slot (avoids re-parsing the same .mdl byte blob
+// every time setmodel hits a recurring monster classname), plus a
+// counter that gates the per-call before/after trace to the first
+// N invocations so the serial log surfaces a sample without
+// drowning the channel under the ~80-entity start.bsp spawn pass.
+type setModelCache struct {
+	mdlBBox map[int][2][3]float32 // idx -> {mins, maxs} for already-loaded alias mdls
+	traced  int                   // count of calls already logged (cap = setModelTraceCalls)
+}
+
+// setModelTraceCalls caps the per-call before/after trace emitted by
+// builtinSetModel so the serial log gets a sample of real spawn-time
+// invocations without the whole ~80-entity start.bsp spawn pass
+// turning into a 80-line wall of mins/maxs/size dumps.
+const setModelTraceCalls = 8
+
 // builtinSetModel returns a Builtin closure that implements the
 // QuakeC setmodel(entity, name) built-in (tyrquake's PF_setmodel at
 // builtin slot 3). Reads the entity-pointer from OFS_PARM0 + the
@@ -1524,19 +1543,45 @@ func builtinPrecacheModel(h *enginehost.Host) progs.Builtin {
 // errors when the model isn't already precached, so a precache pass
 // must have run first), then writes:
 //
-//   - ent.model = name (string_t offset, stored as int32 in the field)
-//   - ent.modelindex = idx (stored as float per QC convention)
+//   - ent.model      = name (string_t offset, stored as int32 in field)
+//   - ent.modelindex = idx  (stored as float per QC convention)
+//   - ent.mins / ent.maxs / ent.size = the model's bbox + extent
+//     (SetMinMaxSize equivalent -- without these the world-trace
+//     collapses to a ray, monsters / triggers / movers don't clip)
+//   - h.World.LinkBounds(edictIdx, absmin, absmax, kind) registers
+//     the edict in the area tree (SV_LinkEdict equivalent), so
+//     AreaQuery + the trigger/solid trace broadphase see the
+//     entity. The world-space bounds are origin + mins/maxs;
+//     kind is derived from the edict's `solid` entvars field:
+//     SOLID_NOT  -> SolidKindSkip (no-link), SOLID_TRIGGER ->
+//     SolidKindTrigger, anything else -> SolidKindSolid.
 //
-// The bbox-setup half of PF_setmodel (SetMinMaxSize from the loaded
-// model + SV_LinkEdict re-linking the entity into the area tree) is
-// DEFERRED to a follow-up batch: the alias-render bring-up only needs
-// .model + .modelindex to be non-zero so the renderer's per-entity
-// dispatch sees a valid index.
+// Bbox source per name:
+//
+//   - name == ""              -> zero bbox, kind = SolidKindSkip
+//   - "maps/<x>.bsp" (idx 1)  -> worldmodel bspfile.Models[0] bbox
+//   - "*N" submodels (idx >1) -> worldmodel bspfile.Models[N] bbox
+//   - "*.mdl" alias models    -> load via mdl.Load (resolver), take
+//     frame 0's BBoxMin/Max + scale by
+//     Header.Scale + ScaleOrigin to
+//     decode the byte-packed TriVertx
+//     into world coordinates. Cached on
+//     first hit so the second setmodel
+//     call for the same model is O(1).
 //
 // Tolerated no-ops (no host / no server / no arena / unresolvable
-// edict-pointer / field-not-in-progs) all log a one-line warning +
-// return nil; same crash-safety contract as builtinPrecacheModel.
+// edict-pointer / field-not-in-progs / no worldmodel yet / mdl
+// resolver error) all log a one-line warning + return nil; same
+// crash-safety contract as builtinPrecacheModel.
+//
+// SCOPE: alias-mdl resolution uses Frame 0's bbox (the rest pose).
+// Upstream Mod_LoadAliasModel walks every frame + tracks the max
+// extent across the whole animation; the rest-pose bbox is a tight
+// underestimate that's good enough for the spawn-time collision
+// broadphase (a few units off the per-frame max won't move the
+// AreaQuery answer for typical Q1 monsters).
 func builtinSetModel(h *enginehost.Host) progs.Builtin {
+	cache := &setModelCache{mdlBBox: map[int][2][3]float32{}}
 	return func(vm *progs.VM) error {
 		if h == nil || h.Server == nil {
 			return nil
@@ -1548,14 +1593,14 @@ func builtinSetModel(h *enginehost.Host) progs.Builtin {
 		if arena == nil {
 			return nil
 		}
-		ent, _, err := arena.ResolvePointer(entPtr)
+		ent, edictIdx, err := arena.ResolvePointer(entPtr)
 		if err != nil {
 			fmt.Printf("QUAKE: setmodel(ptr=%d, %q): ResolvePointer: %v\n", entPtr, name, err)
 			return nil
 		}
-		idx, err := engineserver.ModelIndex(h.Server.ModelPrecache, name)
-		if err != nil {
-			fmt.Printf("QUAKE: setmodel(%q): %v\n", name, err)
+		idx, idxErr := engineserver.ModelIndex(h.Server.ModelPrecache, name)
+		if idxErr != nil {
+			fmt.Printf("QUAKE: setmodel(%q): %v\n", name, idxErr)
 			// Continue: still write .model so .model isn't half-set.
 		}
 		p := vm.Progs()
@@ -1568,7 +1613,178 @@ func builtinSetModel(h *enginehost.Host) progs.Builtin {
 		if def := p.FindField("modelindex"); def != nil {
 			_ = ent.FieldSetFloat(int(def.Ofs), float32(idx))
 		}
+
+		// Bbox half. Skip when the precache lookup failed OR the
+		// name resolves to slot 0 (the empty-model sentinel) -- the
+		// upstream PF_setmodel calls SetMinMaxSize unconditionally,
+		// but with a zero-bbox model the absmin/absmax both
+		// collapse to ent.origin so the area-tree link adds a
+		// degenerate point. The Go port treats both as "no link";
+		// the entity still has a model name + index for the
+		// renderer's per-entity dispatch.
+		ev, _ := progs.NewEntVars(p, ent)
+		var beforeMins, beforeMaxs, beforeSize [3]float32
+		traceThis := cache.traced < setModelTraceCalls
+		if traceThis {
+			beforeMins, _ = ev.ReadVec3("mins")
+			beforeMaxs, _ = ev.ReadVec3("maxs")
+			beforeSize, _ = ev.ReadVec3("size")
+		}
+
+		mins, maxs, bboxOK := resolveModelBBox(h, cache, name, idx)
+		if bboxOK {
+			size := [3]float32{
+				maxs[0] - mins[0],
+				maxs[1] - mins[1],
+				maxs[2] - mins[2],
+			}
+			_ = ev.WriteVec3("mins", mins)
+			_ = ev.WriteVec3("maxs", maxs)
+			_ = ev.WriteVec3("size", size)
+
+			// Area-tree link half (SV_LinkEdict equivalent). Read
+			// the edict's solid field to pick the SolidKind, the
+			// origin to build the world-space absmin/absmax, then
+			// LinkBounds. World.Clear (already called by SpawnServer)
+			// built the area tree; LinkBounds is a no-op without
+			// a root, which keeps the call safe pre-SpawnServer.
+			if h.World != nil {
+				origin, _ := ev.ReadVec3("origin")
+				absmin := [3]float32{
+					origin[0] + mins[0],
+					origin[1] + mins[1],
+					origin[2] + mins[2],
+				}
+				absmax := [3]float32{
+					origin[0] + maxs[0],
+					origin[1] + maxs[1],
+					origin[2] + maxs[2],
+				}
+				kind := solidKindFromEntvars(ev)
+				h.World.LinkBounds(world.Key(edictIdx), absmin, absmax, kind)
+			}
+
+			if traceThis {
+				cache.traced++
+				fmt.Printf("QUAKE: setmodel(slot=%d, %q, idx=%d) -- mins/maxs/size BEFORE=%v/%v/%v AFTER=%v/%v/%v\n",
+					edictIdx, name, idx,
+					beforeMins, beforeMaxs, beforeSize,
+					mins, maxs, size)
+			}
+		} else if traceThis {
+			cache.traced++
+			fmt.Printf("QUAKE: setmodel(slot=%d, %q, idx=%d) -- bbox unresolved (kept mins/maxs %v/%v)\n",
+				edictIdx, name, idx, beforeMins, beforeMaxs)
+		}
 		return nil
+	}
+}
+
+// resolveModelBBox returns the world-space (mins, maxs) bounding box
+// for the model named `name` at precache slot `idx`. The "ok" return
+// is false when the bbox can't be determined (empty name, slot 0,
+// missing worldmodel for BSP submodels, mdl load failure) -- in
+// those cases the caller skips both the SetMinMaxSize writes AND
+// the LinkBounds call, matching upstream's "PF_setmodel does
+// nothing without a real model" early-out.
+//
+// The cache memoizes alias .mdl bboxes by precache slot so a second
+// setmodel for the same model is O(1) instead of re-parsing the
+// blob through the resolver.
+func resolveModelBBox(h *enginehost.Host, cache *setModelCache, name string, idx int) (mins, maxs [3]float32, ok bool) {
+	if name == "" || idx == 0 {
+		return mins, maxs, false
+	}
+	// BSP world or submodel. The precache layout (set up by
+	// SpawnServer) puts the worldmodel at slot 1 under its
+	// "maps/<n>.bsp" full path; slots 2..N hold submodels under
+	// "*1", "*2", ... aliases. Both kinds read from the same
+	// underlying bspfile.File via Server.WorldModel.File, so the
+	// submodel index = idx - 1 mapping holds for both.
+	if name[0] == '*' || (idx == 1 && len(name) >= 4 && name[:4] == "maps") {
+		if h.Server.WorldModel == nil || h.Server.WorldModel.File == nil {
+			return mins, maxs, false
+		}
+		models, err := h.Server.WorldModel.File.Models()
+		if err != nil {
+			return mins, maxs, false
+		}
+		// submodel index = idx - 1 (slot 1 -> bspfile.Models[0] =
+		// the world; slot 2 -> bspfile.Models[1] = first *N
+		// submodel; etc.)
+		smIdx := idx - 1
+		if smIdx < 0 || smIdx >= len(models) {
+			return mins, maxs, false
+		}
+		return models[smIdx].Mins, models[smIdx].Maxs, true
+	}
+	// Alias .mdl path. Check the per-slot memo first; on a miss
+	// the resolver pulls the file via the host's FileResolver
+	// (the same chain SpawnServer used for the worldmodel + the
+	// alias-render preload uses for per-entity .mdl loads), and
+	// mdl.Load decodes it. Frame 0's BBoxMin/Max are TriVertx
+	// (byte-packed) values; scale-decode them with Header.Scale +
+	// Header.ScaleOrigin to recover world coords. Group frames
+	// (animated frame 0) collapse to the group's first sub-frame.
+	if bb, hit := cache.mdlBBox[idx]; hit {
+		return bb[0], bb[1], true
+	}
+	if h.Resolver == nil {
+		return mins, maxs, false
+	}
+	size, ra, err := h.Resolver(name)
+	if err != nil {
+		return mins, maxs, false
+	}
+	m, err := mdl.Load(ra, size)
+	if err != nil {
+		return mins, maxs, false
+	}
+	if len(m.Frames) == 0 {
+		return mins, maxs, false
+	}
+	f := &m.Frames[0]
+	var bbMin, bbMax mdl.TriVertx
+	switch f.Type {
+	case mdl.FrameSingle:
+		bbMin, bbMax = f.Single.BBoxMin, f.Single.BBoxMax
+	case mdl.FrameGroup:
+		if f.Group == nil || len(f.Group.Frames) == 0 {
+			return mins, maxs, false
+		}
+		bbMin, bbMax = f.Group.Frames[0].BBoxMin, f.Group.Frames[0].BBoxMax
+	default:
+		return mins, maxs, false
+	}
+	for i := 0; i < 3; i++ {
+		mins[i] = m.Header.Scale[i]*float32(bbMin.V[i]) + m.Header.ScaleOrigin[i]
+		maxs[i] = m.Header.Scale[i]*float32(bbMax.V[i]) + m.Header.ScaleOrigin[i]
+	}
+	cache.mdlBBox[idx] = [2][3]float32{mins, maxs}
+	return mins, maxs, true
+}
+
+// solidKindFromEntvars reads the QC `solid` field off ev + maps it
+// to the world.SolidKind enum the area-tree link uses. SOLID_NOT
+// (= 0) collapses to SolidKindSkip (no link); SOLID_TRIGGER to
+// SolidKindTrigger; everything else (BBOX / SLIDEBOX / BSP) to
+// SolidKindSolid. Mirrors the C SV_LinkEdict per-SOLID_* dispatch.
+//
+// A missing `solid` field (test stubs that strip it) is treated as
+// SOLID_NOT -- the entity won't be linked, which is the safe
+// default (the entity still gets its bbox + can be moved by hand).
+func solidKindFromEntvars(ev *progs.EntVars) world.SolidKind {
+	solid, err := ev.ReadFloat("solid")
+	if err != nil {
+		return world.SolidKindSkip
+	}
+	switch engineserver.Solid(int32(solid)) {
+	case engineserver.SolidNot:
+		return world.SolidKindSkip
+	case engineserver.SolidTrigger:
+		return world.SolidKindTrigger
+	default:
+		return world.SolidKindSolid
 	}
 }
 
