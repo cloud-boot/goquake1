@@ -265,20 +265,17 @@ func run() error {
 
 	// 11b. Seed the sound pool with a few WAV samples from the pak so
 	//     the runloop's existing Paint + QueueAudio path has something
-	//     to mix every tic. Stock id1 ambient/weapon/items WAVs are
-	//     16-bit mono PCM, which sound.Paint currently rejects (the
-	//     16-bit mix path is the next sound batch -- see mix.go's
-	//     ErrMixBadFormat docstring). For this batch we use the only
-	//     8-bit samples present in the shareware archive
-	//     (sound/nav_editor/*.wav, 11025 Hz / 8-bit mono one-shots)
-	//     so the mixer accepts them + the QueueAudio path actually
-	//     reaches the virtio-sound device with non-empty PCM. The
-	//     16-bit ambient track gets wired once sound/mix.go gains
-	//     SND_PaintChannelFrom16.
+	//     to mix every tic. With sound.Paint's 16-bit path now wired
+	//     (SND_PaintChannelFrom16 equivalent), the mixer accepts the
+	//     stock id1 16-bit ambient/weapon/items WAVs alongside the
+	//     8-bit nav_editor one-shots; the seed set below mixes a
+	//     16-bit ambient track + an 8-bit one-shot to exercise BOTH
+	//     paint paths in the same Paint call (Pool dispatches on
+	//     ch.Sfx.BitsPerSam per channel).
 	if pakFS != nil && runner.SoundPool != nil {
 		seeded := seedSoundPool(runner.SoundPool, pakFS, []string{
-			"sound/nav_editor/changed_edict.wav",
-			"sound/nav_editor/edit_edict.wav",
+			"sound/ambience/water1.wav",          // 16-bit (proves 16-bit playback)
+			"sound/nav_editor/changed_edict.wav", // 8-bit (regression guard)
 		})
 		fmt.Printf("QUAKE: sound pool seeded -- %d sample(s) playing on reserved-static slots\n", seeded)
 	}

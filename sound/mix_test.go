@@ -5,6 +5,7 @@
 package sound
 
 import (
+	"encoding/binary"
 	"errors"
 	"testing"
 )
@@ -22,6 +23,24 @@ func makeSample8(name string, samples []int8) *Sample {
 		Name:       name,
 		SampleRate: DefaultSampleRate,
 		BitsPerSam: 8,
+		LoopStart:  -1,
+		NumSamples: len(samples),
+		Data:       data,
+	}
+}
+
+// makeSample16 builds a 16-bit PCM sample whose Data bytes are the
+// caller-supplied int16s encoded little-endian (the in-memory shape
+// LoadWav preserves verbatim from the WAV body for 16-bit assets).
+func makeSample16(name string, samples []int16) *Sample {
+	data := make([]byte, 2*len(samples))
+	for i, s := range samples {
+		binary.LittleEndian.PutUint16(data[2*i:2*i+2], uint16(s))
+	}
+	return &Sample{
+		Name:       name,
+		SampleRate: DefaultSampleRate,
+		BitsPerSam: 16,
 		LoopStart:  -1,
 		NumSamples: len(samples),
 		Data:       data,
@@ -190,15 +209,19 @@ func TestPaint_StaticReservedSlotMixesToo(t *testing.T) {
 	}
 }
 
-func TestPaint_BadFormat16BitChannelRejected(t *testing.T) {
+func TestPaint_BadFormatUnknownBitsRejected(t *testing.T) {
+	// LoadWav refuses anything but 8/16 (ErrWavBadBits), but a
+	// hand-rolled Sample with e.g. 24-bit must still be rejected by
+	// the mixer's pre-flight check rather than slipping through and
+	// reading uninitialised paint paths.
 	p, _ := NewPool(0)
 	p.Channels[5] = Channel{
 		Sfx: &Sample{
 			Name:       "bad",
-			BitsPerSam: 16,
+			BitsPerSam: 24,
 			LoopStart:  -1,
 			NumSamples: 2,
-			Data:       []byte{0, 0, 0, 0},
+			Data:       []byte{0, 0, 0, 0, 0, 0},
 		},
 		EndPos:   2,
 		LeftVol:  128,
@@ -206,7 +229,7 @@ func TestPaint_BadFormat16BitChannelRejected(t *testing.T) {
 	}
 	out := make([]StereoSample, 4)
 	if err := Paint(p, out, 4); !errors.Is(err, ErrMixBadFormat) {
-		t.Fatalf("Paint(16-bit) err = %v want ErrMixBadFormat", err)
+		t.Fatalf("Paint(24-bit) err = %v want ErrMixBadFormat", err)
 	}
 	// Bad-format check must run before any state mutation: position
 	// + sfx must be intact for the caller to handle/retry.
@@ -215,6 +238,128 @@ func TestPaint_BadFormat16BitChannelRejected(t *testing.T) {
 	}
 	if p.Channels[5].Position != 0 {
 		t.Fatalf("bad-format channel Position mutated: %d", p.Channels[5].Position)
+	}
+}
+
+// ----- Paint: 16-bit mix path -------------------------------------
+
+func TestPaint_16BitSampleFullDuration(t *testing.T) {
+	p, _ := NewPool(8)
+	// 4 16-bit samples. The 16-bit formula is:
+	//   left[i]  = int16(int32(s) * int32(LeftVol)  >> 8)
+	// With LeftVol=256 the result is s (since >>8 of s*256 == s);
+	// with RightVol=128 the result is s/2 (arithmetic shift).
+	samples := []int16{1000, -1000, 5000, -5000}
+	p.Channels[10] = Channel{
+		Sfx:      makeSample16("x16", samples),
+		Position: 0,
+		EndPos:   4,
+		LeftVol:  256,
+		RightVol: 128,
+	}
+	out := make([]StereoSample, 4)
+	if err := Paint(p, out, 4); err != nil {
+		t.Fatalf("Paint: %v", err)
+	}
+	want := []StereoSample{
+		{int16(int32(1000) * 256 >> 8), int16(int32(1000) * 128 >> 8)},
+		{int16(int32(-1000) * 256 >> 8), int16(int32(-1000) * 128 >> 8)},
+		{int16(int32(5000) * 256 >> 8), int16(int32(5000) * 128 >> 8)},
+		{int16(int32(-5000) * 256 >> 8), int16(int32(-5000) * 128 >> 8)},
+	}
+	for i, s := range out {
+		if s != want[i] {
+			t.Fatalf("frame %d = %+v want %+v", i, s, want[i])
+		}
+	}
+	if !p.Channels[10].Free() {
+		t.Fatalf("16-bit channel not auto-stopped after EndPos reached")
+	}
+}
+
+// Exercises the int32-widen-on-multiply guard: at max int16 (32767)
+// and max vol (255) the int16*int16 product (~8.36M) overflows
+// int16; the int32 intermediate + arithmetic shift keep the sign.
+func TestPaint_16BitOverflowGuard(t *testing.T) {
+	p, _ := NewPool(0)
+	// One sample at max positive int16.
+	p.Channels[0] = Channel{
+		Sfx:      makeSample16("max", []int16{32767}),
+		Position: 0,
+		EndPos:   1,
+		LeftVol:  255,
+		RightVol: 255,
+	}
+	out := make([]StereoSample, 1)
+	if err := Paint(p, out, 1); err != nil {
+		t.Fatalf("Paint: %v", err)
+	}
+	// int32(32767) * int32(255) = 8355585; >> 8 = 32639; narrow to int16 = 32639.
+	want := int16(int32(32767) * 255 >> 8)
+	if out[0].L != want || out[0].R != want {
+		t.Fatalf("16-bit overflow guard: out[0] = %+v want {%d,%d}", out[0], want, want)
+	}
+}
+
+// Exercises the 16-bit per-frame Position advance: with Position
+// starting non-zero the byte index into Data must use (Position+j)*2,
+// not Position+j*2.
+func TestPaint_16BitMidStream(t *testing.T) {
+	p, _ := NewPool(0)
+	samples := []int16{100, 200, 300, 400, 500}
+	p.Channels[0] = Channel{
+		Sfx:      makeSample16("mid", samples),
+		Position: 2, // skip first two samples
+		EndPos:   5,
+		LeftVol:  256,
+		RightVol: 256,
+	}
+	out := make([]StereoSample, 3)
+	if err := Paint(p, out, 3); err != nil {
+		t.Fatalf("Paint: %v", err)
+	}
+	want := []StereoSample{
+		{int16(int32(300) * 256 >> 8), int16(int32(300) * 256 >> 8)},
+		{int16(int32(400) * 256 >> 8), int16(int32(400) * 256 >> 8)},
+		{int16(int32(500) * 256 >> 8), int16(int32(500) * 256 >> 8)},
+	}
+	for i, s := range out {
+		if s != want[i] {
+			t.Fatalf("frame %d = %+v want %+v", i, s, want[i])
+		}
+	}
+}
+
+// Mixed-bit-depth Pool: 8-bit + 16-bit channels active in the same
+// Paint call must both contribute. Guards against a switch-default
+// regression that would silently drop one path.
+func TestPaint_8BitAnd16BitAccumulate(t *testing.T) {
+	p, _ := NewPool(8)
+	p.Channels[0] = Channel{
+		Sfx:      makeSample8("a8", []int8{50, 50}),
+		Position: 0,
+		EndPos:   2,
+		LeftVol:  256,
+		RightVol: 256,
+	}
+	p.Channels[1] = Channel{
+		Sfx:      makeSample16("b16", []int16{1000, 1000}),
+		Position: 0,
+		EndPos:   2,
+		LeftVol:  256,
+		RightVol: 256,
+	}
+	out := make([]StereoSample, 2)
+	if err := Paint(p, out, 2); err != nil {
+		t.Fatalf("Paint: %v", err)
+	}
+	want8 := int16(50)                      // 50 * 256 / 256
+	want16 := int16(int32(1000) * 256 >> 8) // 1000
+	wantSum := want8 + want16
+	for i, s := range out {
+		if s.L != wantSum || s.R != wantSum {
+			t.Fatalf("frame %d = %+v want {%d,%d}", i, s, wantSum, wantSum)
+		}
 	}
 }
 
