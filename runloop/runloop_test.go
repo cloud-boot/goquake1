@@ -717,3 +717,168 @@ func TestUpdateButtonsFromSnapshot_UnmappedKeysIgnored(t *testing.T) {
 		t.Fatalf("movement state mutated by non-movement keys: %+v", b)
 	}
 }
+
+// ----- TriggerButtons + UpdateTriggersFromSnapshot ------------------
+
+// TestTriggerButtons_ActionButtonsBitmask exercises every reachable
+// combination of Attack + Jump to prove the bitmask matches the Q1
+// upstream values (BUTTON_ATTACK=1, BUTTON_JUMP=2; OR-ed when both
+// are held).
+func TestTriggerButtons_ActionButtonsBitmask(t *testing.T) {
+	cases := []struct {
+		name string
+		in   TriggerButtons
+		want uint8
+	}{
+		{"none", TriggerButtons{}, 0},
+		{"attack only", TriggerButtons{Attack: true}, 1},
+		{"jump only", TriggerButtons{Jump: true}, 2},
+		{"both", TriggerButtons{Attack: true, Jump: true}, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.in.ActionButtons(); got != tc.want {
+				t.Fatalf("ActionButtons = %d want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUpdateTriggersFromSnapshot_DownSetsBothFlags proves a single
+// KeysDown carrying both mouse-1 + Enter latches both held flags.
+func TestUpdateTriggersFromSnapshot_DownSetsBothFlags(t *testing.T) {
+	var tr TriggerButtons
+	snap := backend.InputSnapshot{
+		KeysDown: []backend.KeyCode{backend.KeyMouse1, backend.KeyEnter},
+	}
+	UpdateTriggersFromSnapshot(&tr, snap)
+	if !tr.Attack {
+		t.Fatalf("Attack not set after KeyMouse1 down")
+	}
+	if !tr.Jump {
+		t.Fatalf("Jump not set after KeyEnter down")
+	}
+	if got := tr.ActionButtons(); got != 3 {
+		t.Fatalf("ActionButtons after both down = %d want 3", got)
+	}
+}
+
+// TestUpdateTriggersFromSnapshot_UpClearsHeldFlag proves a KeysUp
+// for either trigger clears just that flag (the other stays held).
+func TestUpdateTriggersFromSnapshot_UpClearsHeldFlag(t *testing.T) {
+	tr := TriggerButtons{Attack: true, Jump: true}
+	UpdateTriggersFromSnapshot(&tr, backend.InputSnapshot{
+		KeysUp: []backend.KeyCode{backend.KeyMouse1},
+	})
+	if tr.Attack {
+		t.Fatalf("Attack still held after KeyMouse1 up")
+	}
+	if !tr.Jump {
+		t.Fatalf("Jump dropped by KeyMouse1 up (should be unrelated)")
+	}
+	UpdateTriggersFromSnapshot(&tr, backend.InputSnapshot{
+		KeysUp: []backend.KeyCode{backend.KeyEnter},
+	})
+	if tr.Jump {
+		t.Fatalf("Jump still held after KeyEnter up")
+	}
+}
+
+// TestUpdateTriggersFromSnapshot_UnmappedKeysIgnored exercises the
+// switch's default arm: keys that aren't KeyMouse1 / KeyEnter pass
+// through both KeysDown and KeysUp without touching the trigger flags.
+func TestUpdateTriggersFromSnapshot_UnmappedKeysIgnored(t *testing.T) {
+	var tr TriggerButtons
+	snap := backend.InputSnapshot{
+		KeysDown: []backend.KeyCode{
+			backend.KeyW, backend.KeyS, backend.KeyShift,
+			backend.KeyMouse2, backend.KeyEscape, backend.KeyTab,
+		},
+		KeysUp: []backend.KeyCode{
+			backend.KeyW, backend.KeyS, backend.KeyShift,
+			backend.KeyMouse2, backend.KeyEscape, backend.KeyTab,
+		},
+	}
+	UpdateTriggersFromSnapshot(&tr, snap)
+	if tr != (TriggerButtons{}) {
+		t.Fatalf("trigger state mutated by non-trigger keys: %+v", tr)
+	}
+}
+
+// TestRunFrame_TriggersFeedActionButtons is the end-to-end proof: a
+// PollInput snapshot bearing KeyMouse1 down + a connected client state
+// produces a clc_move whose `buttons` byte carries the BUTTON_ATTACK
+// bit. Mirrors the existing TestRunFrame_ConnectedSendsClcMove shape;
+// the assertion fires on the byte at offset 14 (1 opcode + 4 sendTime
+// + 3 angles + 3 short moves = 14, then buttons).
+func TestRunFrame_TriggersFeedActionButtons(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	rec.Input = backend.InputSnapshot{
+		KeysDown: []backend.KeyCode{backend.KeyMouse1},
+	}
+	r, _ := newRunner(t, rec)
+	clientSide, serverSide := server.NewLoopbackConn()
+	r.Conn = clientSide
+	r.Client.Connection = client.StateConnected
+
+	if err := r.RunFrame(1.0/60.0, 1.0); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	if !r.Triggers.Attack {
+		t.Fatalf("Triggers.Attack not latched by KeyMouse1 down")
+	}
+	kind, data, err := serverSide.ReadMessage()
+	if err != nil {
+		t.Fatalf("serverSide.ReadMessage: %v", err)
+	}
+	if kind == server.MessageNone {
+		t.Fatalf("serverSide got no message; expected clc_move with BUTTON_ATTACK")
+	}
+	const buttonsOffset = 14
+	if len(data) <= buttonsOffset {
+		t.Fatalf("clc_move payload too short: %d bytes", len(data))
+	}
+	if data[buttonsOffset]&1 == 0 {
+		t.Fatalf("clc_move buttons byte = 0x%02x; BUTTON_ATTACK bit missing", data[buttonsOffset])
+	}
+}
+
+// TestRunFrame_MovementButtonsFeedClcMove is the end-to-end proof
+// matching the bug-report shape: a snapshot bearing KeyW down +
+// StateConnected produces a clc_move whose `forwardmove` short
+// (offset 8: 1 opcode + 4 sendTime + 3 angles) is positive, NOT zero.
+// Originally the report was "cmd.fwd=0 cmd.side=0 even during physics
+// tics"; this test guards against a regression of the full chain
+// (Backend → MovementButtons → BaseMove → clc_move bytes on the wire).
+func TestRunFrame_MovementButtonsFeedClcMove(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	rec.Input = backend.InputSnapshot{
+		KeysDown: []backend.KeyCode{backend.KeyW},
+	}
+	r, _ := newRunner(t, rec)
+	clientSide, serverSide := server.NewLoopbackConn()
+	r.Conn = clientSide
+	r.Client.Connection = client.StateConnected
+
+	if err := r.RunFrame(1.0/60.0, 1.0); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	kind, data, err := serverSide.ReadMessage()
+	if err != nil {
+		t.Fatalf("serverSide.ReadMessage: %v", err)
+	}
+	if kind == server.MessageNone {
+		t.Fatalf("serverSide got no message; expected clc_move with forwardmove > 0")
+	}
+	// forwardmove sits at offset 8 (1 opcode + 4 sendTime + 3 angles).
+	// LittleEndian int16; positive means forward.
+	const forwardOffset = 8
+	if len(data) < forwardOffset+2 {
+		t.Fatalf("clc_move payload too short: %d bytes", len(data))
+	}
+	lo, hi := int16(data[forwardOffset]), int16(data[forwardOffset+1])
+	forwardMove := lo | hi<<8
+	if forwardMove <= 0 {
+		t.Fatalf("clc_move forwardmove = %d; want > 0 (KeyW should produce forward motion)", forwardMove)
+	}
+}

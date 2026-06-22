@@ -61,6 +61,15 @@ type Runner struct {
 	Speeds     client.InputSpeeds
 	ViewAngles [3]float32
 
+	// Triggers tracks the held state of the on-wire trigger keys
+	// (mouse-fire = +attack, Enter = +jump). Translated to the
+	// [server.UserCmd.Buttons] bitmask in RunFrame and handed to
+	// [client.Tick] as TickInput.ActionButtons. Movement keys
+	// (W/A/S/D + arrows + shift) live in Buttons above and do NOT
+	// feed this field -- the on-wire `buttons` byte only carries the
+	// trigger bits the QC progs read via self.button*.
+	Triggers TriggerButtons
+
 	// ViewOrigin is a legacy caller-owned anchor retained for
 	// backwards compatibility. RunFrame no longer sources the
 	// per-tic camera position from this field -- the viewOrigin
@@ -180,6 +189,7 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 
 	// 2) Translate the raw key events into the persistent button state.
 	UpdateButtonsFromSnapshot(&r.Buttons, snap)
+	UpdateTriggersFromSnapshot(&r.Triggers, snap)
 
 	// 3) Advance server simulation.
 	if err := r.Host.Frame(dt); err != nil {
@@ -196,13 +206,14 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 	//    so a pre-signon Tick is a pure inbound-drain (no spurious
 	//    clc_move on the wire before the handshake completes).
 	in := client.TickInput{
-		Buttons:     r.Buttons,
-		MouseDX:     snap.MouseDX,
-		MouseDY:     snap.MouseDY,
-		Sensitivity: 1,
-		Speeds:      r.Speeds,
-		Dt:          dt,
-		NowSec:      nowSec,
+		Buttons:       r.Buttons,
+		MouseDX:       snap.MouseDX,
+		MouseDY:       snap.MouseDY,
+		Sensitivity:   1,
+		Speeds:        r.Speeds,
+		Dt:            dt,
+		NowSec:        nowSec,
+		ActionButtons: r.Triggers.ActionButtons(),
 	}
 	out, err := client.Tick(r.Client, r.Conn, in, r.ViewAngles)
 	if err != nil {
@@ -397,4 +408,75 @@ func pressButton(b *client.ButtonState) {
 func releaseButton(b *client.ButtonState) {
 	b.Pressed &^= 1
 	b.Pressed |= 4
+}
+
+// TriggerButtons tracks the persistent held state of the on-wire
+// trigger keys -- the bits the QC progs read via self.button*. The
+// movement keys (W/A/S/D, arrows, shift) live in the separate
+// [client.MovementButtons] structure and feed [client.BaseMove] /
+// [client.AdjustAngles]; they do NOT show up in the on-wire `buttons`
+// byte.
+//
+// Mappings (driven by [UpdateTriggersFromSnapshot]):
+//
+//	KeyMouse1 -> Attack ([client.ButtonAttack] = 1)
+//	KeyEnter  -> Jump   ([client.ButtonJump]   = 2)
+//
+// The mouse-2 / Escape / Tab keys are intentionally NOT mapped: Q1's
+// per-tic clc_move only carries +attack and +jump in vanilla NQ; the
+// QC progs do not read additional bits. Engines that need a "use"
+// trigger (BUTTON_USE = 4) layer it on via an impulse byte instead.
+type TriggerButtons struct {
+	Attack bool // KeyMouse1 currently held
+	Jump   bool // KeyEnter currently held
+}
+
+// ActionButtons returns the [server.UserCmd.Buttons] bitmask the
+// runloop hands to [client.Tick] each tic. The caller OR-s this
+// straight onto the per-tic [client.TickInput.ActionButtons] field,
+// which [client.Tick] then writes onto the outbound clc_move
+// payload's `buttons` byte. Mapping mirrors tyrquake's
+// CL_BaseButtons:
+//
+//	Attack -> [client.ButtonAttack] (1)
+//	Jump   -> [client.ButtonJump]   (2)
+func (t TriggerButtons) ActionButtons() uint8 {
+	var b uint8
+	if t.Attack {
+		b |= client.ButtonAttack
+	}
+	if t.Jump {
+		b |= client.ButtonJump
+	}
+	return b
+}
+
+// UpdateTriggersFromSnapshot edge-applies snap.KeysDown / snap.KeysUp
+// onto triggers. Down events set the held flag; up events clear it.
+// Keys not in the trigger set (everything but [backend.KeyMouse1] and
+// [backend.KeyEnter]) are ignored here -- the movement set is owned
+// by [UpdateButtonsFromSnapshot].
+//
+// IDEMPOTENCE: applying the same KeysDown sequence twice leaves the
+// triggers at the same true value; ditto KeysUp. The held bits are
+// stateful (NOT auto-cleared each tic) so a held mouse-fire keeps
+// firing every clc_move until the up event arrives, matching how
+// upstream's +attack works.
+func UpdateTriggersFromSnapshot(triggers *TriggerButtons, snap backend.InputSnapshot) {
+	for _, k := range snap.KeysDown {
+		switch k {
+		case backend.KeyMouse1:
+			triggers.Attack = true
+		case backend.KeyEnter:
+			triggers.Jump = true
+		}
+	}
+	for _, k := range snap.KeysUp {
+		switch k {
+		case backend.KeyMouse1:
+			triggers.Attack = false
+		case backend.KeyEnter:
+			triggers.Jump = false
+		}
+	}
 }

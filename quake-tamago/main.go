@@ -129,7 +129,26 @@ const (
 // The waypoint set is seeded from pickInMapCamera at runtime (so the
 // anchor is always inside a valid leaf) + the BSP bbox corners
 // snapped back into a valid leaf via the same lattice walk.
-const demoOrbit = true
+//
+// PLAYABLE-MODE OVERRIDE: this is a runtime [var] (not a const) so
+// the playable QEMU launchers (task qemu-playable / qemu-visible with
+// virtio-keyboard) can flip it off without a rebuild. The runtime
+// Pre2DDraw closure ALSO auto-disables it on the first observed
+// virtio-input key event -- so a user pressing W on a session that
+// booted with demoOrbit=true (the default) immediately gets the real
+// player-driven camera. This keeps the default safe for headless
+// screendump captures (no input device -> demoOrbit stays on -> the
+// captured frame is the panorama waypoint) while still enabling
+// interactive play the moment a key fires.
+var demoOrbit = true
+
+// demoOrbitAutoDisableOnInput, when true, makes the runtime Pre2DDraw
+// closure flip demoOrbit to false on the first observed key event.
+// Default true: keeps headless screendumps producing the panorama
+// AND lets a human pressing W on a virtio-keyboard session take over
+// without restarting. Flip to false to keep the demo orbit running
+// even when the user is playing (handy for promo-shot capture).
+var demoOrbitAutoDisableOnInput = true
 
 // demoYawPeriodFrames is the frame count over which Yaw winds from
 // 0 to 360. One degree per frame at 60 Hz gives a 6-second panorama,
@@ -798,6 +817,19 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	runner.Pre2DDraw = func(fb *render.FrameBuffer, viewOrigin, viewAngles [3]float32) error {
 		frame := frameCount
 		frameCount++
+
+		// Auto-disable demo-orbit on first observed input. When the
+		// virtio-keyboard is wired the runloop fills runner.Buttons +
+		// runner.Triggers BEFORE Pre2DDraw runs; the first non-zero
+		// state (any movement key held or pressed this frame, or any
+		// trigger-button held) means a human is driving and the
+		// demo-orbit override should yield to the real player camera.
+		// The flag latches once and stays off for the rest of the
+		// process lifetime.
+		if demoOrbit && demoOrbitAutoDisableOnInput && observedAnyInput(runner) {
+			demoOrbit = false
+			fmt.Printf("QUAKE: demo-orbit auto-disabled at tic %d (input observed -- player takes over)\n", frame)
+		}
 
 		// Demo-orbit override: with no input device the wire-mirrored
 		// viewAngles never moves, so the headless QEMU run would
@@ -3058,4 +3090,35 @@ func loadSBarAssets(pakFS fs.FS) (*render.SBarAssets, int, int, []string) {
 func halt() {
 	for {
 	}
+}
+
+// observedAnyInput returns true iff the runloop has seen any movement
+// key held / pressed this frame OR any trigger key (mouse-fire, jump)
+// held. The Pre2DDraw closure uses it to auto-disable the demo-orbit
+// override on the first observed user input (so a human pressing W on
+// a virtio-keyboard session takes over from the headless panorama
+// without restarting).
+//
+// "Held" is the bit-0 sample on each [client.ButtonState]; this is
+// the bit [client.KeyState] preserves across frames (impulse bits
+// 1+2 get cleared every sample). We test it directly so the helper
+// is non-destructive: probing input state shouldn't consume the
+// per-frame impulse the next BaseMove call needs to see.
+func observedAnyInput(r *runloop.Runner) bool {
+	if r == nil {
+		return false
+	}
+	b := r.Buttons
+	if b.Forward.Pressed != 0 || b.Back.Pressed != 0 ||
+		b.MoveLeft.Pressed != 0 || b.MoveRight.Pressed != 0 ||
+		b.Left.Pressed != 0 || b.Right.Pressed != 0 ||
+		b.Up.Pressed != 0 || b.Down.Pressed != 0 ||
+		b.Lookup.Pressed != 0 || b.Lookdown.Pressed != 0 ||
+		b.SpeedHeld {
+		return true
+	}
+	if r.Triggers.Attack || r.Triggers.Jump {
+		return true
+	}
+	return false
 }

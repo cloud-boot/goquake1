@@ -57,6 +57,25 @@ tasks:
           -serial stdio \
           -kernel "{{.ELF}}"
 
+  qemu-playable:
+    desc: Run Quake in QEMU interactively (window + virtio-keyboard + virtio-mouse). Identical wiring to qemu-visible; named to make the "I want to play it" intent explicit. The engine auto-disables the demo-orbit override on the first observed key event so W/A/S/D + mouse-look take over from the panorama immediately, no flag needed.
+    deps: [build]
+    vars:
+      DISPLAY:
+        sh: 'case "$(uname -s)" in Darwin) echo "cocoa,zoom-to-fit=on" ;; *) echo "gtk,zoom-to-fit=on" ;; esac'
+    cmds:
+      - |
+        qemu-system-x86_64 -M q35 -accel tcg -cpu {{.CPU}} -m {{.MEM}} \
+          -display {{.DISPLAY}} \
+          -no-reboot -vga none \
+          -device virtio-gpu-pci,id=vgpu,xres=1280,yres=1024 \
+          -device virtio-keyboard-pci,id=vkbd \
+          -device virtio-mouse-pci,id=vmouse \
+          -device virtio-sound-pci,id=vsnd,audiodev=audio0 \
+          -audiodev none,id=audio0 \
+          -serial stdio \
+          -kernel "{{.ELF}}"
+
   qemu-vnc:
     desc: Run Quake in QEMU with a VNC server on :5900 (connect via any VNC viewer).
     deps: [build]

@@ -9,6 +9,23 @@ import (
 	"github.com/go-quake1/engine/server"
 )
 
+// Quake 1 trigger-button bitmask values that ride on
+// [server.UserCmd.Buttons] (the `byte buttons` field of the on-wire
+// clc_move payload). The bitmask is what the QC progs read via
+// self.button0 / self.button2 (BUTTON_ATTACK = 0x01, BUTTON_JUMP =
+// 0x02). tyrquake: BUTTON_ATTACK / BUTTON_JUMP in NQ/quakedef.h.
+//
+// Movement keys (W/A/S/D, arrows, shift) live in the SEPARATE
+// per-axis [MovementButtons] structure and are consumed by [BaseMove]
+// + [AdjustAngles] -- they do NOT show up in the on-wire `buttons`
+// byte. Only the trigger bits (mouse-fire, jump) do.
+const (
+	// ButtonAttack is the +attack bit. tyrquake: BUTTON_ATTACK = 1.
+	ButtonAttack uint8 = 1
+	// ButtonJump is the +jump bit. tyrquake: BUTTON_JUMP = 2.
+	ButtonJump uint8 = 2
+)
+
 // ButtonState tracks the current state of one gameplay button across
 // frames. tyrquake: kbutton_t in NQ/keys.h.
 //
