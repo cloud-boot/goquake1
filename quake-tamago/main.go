@@ -298,7 +298,16 @@ func run() error {
 		// once; server.ReadClientMoves -> ParseClcStringCmd flips
 		// hc.Spawned + queues svc_signonnum(4) onto hc.Message; the next
 		// per-tic flush delivers stage 4 to the client + Apply transitions
-		// to StateConnected. End-to-end wire-driven, no manual poke.
+		// to StateConnected.
+		//
+		// Stage-4 emission stays wire-driven; the only manual poke is
+		// the pre-flip of hc.Spawned below (matches the parallel
+		// player-edict Free=false poke). See the inline comment at the
+		// poke site for the rationale -- short version: tic 0's
+		// host.Frame runs BEFORE client.Tick gets to flush the inbound
+		// "spawn" stringcmd, so without the pre-flip the per-tic
+		// SendEntityUpdates filter (`if !client.Spawned ... return`)
+		// skips every emission on the first tic.
 		hc := realHost.Static.Clients[slotIdx]
 		info := engineserver.ServerInfo{
 			Protocol:      protocol.VersionNQ,
@@ -338,7 +347,32 @@ func run() error {
 		fmt.Printf("QUAKE: svc_spawnbaseline broadcast -- emitted=%d skipped_free=%d skipped_nomodel=%d (out of %d edicts; total queued bytes=%d)\n",
 			blStat.Emitted, blStat.SkippedFree, blStat.SkippedNoModel,
 			realHost.Server.NumEdicts, hc.Message.Len())
-		fmt.Printf("QUAKE: loopback bound -- client slot %d -> edict %d (active, awaiting wire 'spawn'); wire signon prefix queued (%d bytes)\n",
+		// Pre-flip hc.Spawned = true so the FIRST per-tic Host.Frame
+		// call already passes the SendEntityUpdates gate (`if !client.
+		// Spawned ... return`). The wire-driven "spawn" clc_stringcmd
+		// still flips the SAME field a tic or two later when the client
+		// emits it -- the operation is idempotent (already-true stays
+		// true), so the wire flow is preserved end-to-end; this poke
+		// just plugs the one-frame gap where tic 0's host.Frame runs
+		// BEFORE client.Tick gets a chance to flush the inbound
+		// "spawn" stringcmd back to the server.
+		//
+		// Mirrors the parallel `pe.Free = false` poke below at the
+		// player-edict slot (without which the same SendEntityUpdates
+		// filter -- `e == nil || e.Free` -- skipped the player every
+		// tic). The two poke-shapes share rationale: "the per-tic
+		// broadcast filter needs both client.Spawned + edict.Free
+		// flipped before the first emission, and the wire-driven
+		// flow can't deliver either flip in time for tic 0".
+		//
+		// Before this poke, the regression manifested as:
+		//   QUAKE: updates tic 0 -- 0 entities sent / 0 entities ...
+		//   QUAKE: tic 0 rendered 0 alias entities
+		// After: 538 entities sent + 538 received at tic 0 (matching
+		// the batch-71 baseline before the wire-signon-handshake
+		// refactor removed the explicit hc.Spawned = true pre-poke).
+		hc.Spawned = true
+		fmt.Printf("QUAKE: loopback bound -- client slot %d -> edict %d (active+Spawned, wire 'spawn' will re-flip idempotently); wire signon prefix queued (%d bytes)\n",
 			slotIdx, playerSlot, hc.Message.Len())
 	} else {
 		cli, _ = engineserver.NewLoopbackConn()
@@ -588,11 +622,16 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	markCtx := bsprender.NewMarkContext(bm)
 	var surfaces bsprender.SurfaceList
 	frameCount := 0
-	// loggedWireSpawn latches the one-shot "server flipped Spawned via
-	// wire 'spawn' clc_stringcmd" trace so the line appears at most
-	// once per process lifetime. Pre-batch-73 the flip happened via a
-	// manual hc.Spawned = true poke in run(); the closure now watches
-	// the server-side client struct each tic + logs the transition.
+	// loggedWireSpawn latches the one-shot "server-side Spawned
+	// observed true" trace so the line appears at most once per
+	// process lifetime. Since the per-tic SendEntityUpdates broadcast
+	// regression fix, hc.Spawned is pre-poked true in run() right
+	// after the signon prefix queueing (see the inline rationale at
+	// the poke site); the wire "spawn" clc_stringcmd still flips the
+	// SAME field a tic or two later (idempotent re-flip). So this
+	// closure observes Spawned=true at tic 0 -- the trace continues
+	// to serve as a single-line "the server-side client struct is
+	// alive + ready for per-tic broadcast" smoke signal.
 	loggedWireSpawn := false
 
 	// Seed the player edict so the host's per-tic RunPhysics actually
@@ -765,14 +804,17 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				len(runner.Client.Baselines))
 		}
 
-		// One-shot wire-driven Spawned trace. The server-side flip
-		// happens inside server.ParseClcStringCmd when the client's
-		// "spawn" stringcmd hits ReadClientMoves; logging it here
-		// proves the wire path drove the transition (vs the legacy
-		// manual hc.Spawned = true poke that lived in run()).
+		// One-shot Spawned trace. With the per-tic broadcast fix in
+		// place hc.Spawned is pre-poked true before the loop starts
+		// (so SendEntityUpdates emits on tic 0 -- see the run() poke
+		// site for the rationale); the wire "spawn" clc_stringcmd
+		// still re-flips the same field idempotently a tic later.
+		// The log fires the first tic the closure observes the flag
+		// as a single-line "server-side client struct ready for per-
+		// tic broadcast" smoke signal.
 		if !loggedWireSpawn && realHost != nil && playerSlot > 0 {
 			if c := realHost.Static.Clients[playerSlot-1]; c != nil && c.Spawned {
-				fmt.Printf("QUAKE: server flipped Spawned via 'spawn' clc_stringcmd (tic %d, slot %d)\n",
+				fmt.Printf("QUAKE: server-side Spawned observed true (tic %d, slot %d) -- per-tic svc_update broadcast enabled\n",
 					frame, playerSlot-1)
 				loggedWireSpawn = true
 			}
