@@ -179,23 +179,80 @@ func BuildWithFacesCustomTextures(makeTextures func() []byte) ([]byte, int64, er
 
 // defaultTextures returns the textures-lump bytes [BuildWithFaces]
 // uses by default: 2 miptex entries, slot 1 is missing (offset = -1).
+// Slot 0 ("trim", 64x32) carries a real mip0 pixel buffer + the three
+// progressively-halved mip1/mip2/mip3 levels so the upstream miptex
+// pixel-aliasing path (MipTex.Pixels) returns a valid byte slice for
+// every mip level. The pixel pattern is a diagonal sweep over palette
+// indices [32, 159] -- a wide colour swath that hits multiple bands of
+// the id1 palette (browns + greys + greens + blues) so a renderer
+// that wires the miptex pixels into FillTexturedPolygon produces an
+// obviously-textured face instead of the 4-colour synthetic checker.
+//
+// Layout (sizes match the upstream miptex_t convention: level i's
+// pixel count is (W>>i) * (H>>i)):
+//
+//	dir(12) | header(40) | mip0(2048) | mip1(512) | mip2(128) | mip3(32)
+//
+// MipTex.Offsets are RELATIVE to the miptex_t record start, which sits
+// at directory offset dirSize.
 func defaultTextures() []byte {
 	// MipTex record is 40 bytes (name[16] + W + H + 4*offset).
 	const miptexRecordSize = 16 + 4 + 4 + 4*4
 	// Directory: int32 numMipTex + numMipTex * int32 offset.
 	const dirSize = 4 + 2*4
+	const (
+		w0 = 64
+		h0 = 32
+	)
+
+	// Per-mip pixel buffers. Each level halves both dimensions.
+	mip := [4][]byte{
+		makeMipPixels(w0>>0, h0>>0), // 64x32 = 2048
+		makeMipPixels(w0>>1, h0>>1), // 32x16 = 512
+		makeMipPixels(w0>>2, h0>>2), // 16x8  = 128
+		makeMipPixels(w0>>3, h0>>3), // 8x4   = 32
+	}
+
+	// Mip offsets relative to the miptex_t record start. mip[0] starts
+	// immediately after the 40-byte header; each subsequent mip follows
+	// the previous one.
+	var mipOff [4]uint32
+	mipOff[0] = uint32(miptexRecordSize)
+	mipOff[1] = mipOff[0] + uint32(len(mip[0]))
+	mipOff[2] = mipOff[1] + uint32(len(mip[1]))
+	mipOff[3] = mipOff[2] + uint32(len(mip[2]))
+
 	miptex0 := make([]byte, miptexRecordSize)
 	copy(miptex0[0:16], []byte("trim"))
-	binary.LittleEndian.PutUint32(miptex0[16:20], 64) // width
-	binary.LittleEndian.PutUint32(miptex0[20:24], 32) // height
-	// mip offsets all zero (we don't decode the pixels).
+	binary.LittleEndian.PutUint32(miptex0[16:20], w0)
+	binary.LittleEndian.PutUint32(miptex0[20:24], h0)
+	for i := 0; i < 4; i++ {
+		binary.LittleEndian.PutUint32(miptex0[24+i*4:28+i*4], mipOff[i])
+	}
 
 	buf := &bytes.Buffer{}
 	_ = binary.Write(buf, binary.LittleEndian, int32(2))       // numMipTex
 	_ = binary.Write(buf, binary.LittleEndian, int32(dirSize)) // slot 0 offset
 	_ = binary.Write(buf, binary.LittleEndian, int32(-1))      // slot 1 missing
 	buf.Write(miptex0)
+	for i := 0; i < 4; i++ {
+		buf.Write(mip[i])
+	}
 	return buf.Bytes()
+}
+
+// makeMipPixels emits a W*H palette-indexed byte buffer. The pattern
+// is a diagonal sweep over indices [32, 159] (mod 128) so the result
+// covers a wide swath of the id1 palette (browns + greys + greens +
+// blues) regardless of mip level. Deterministic + fixture-stable.
+func makeMipPixels(w, h int) []byte {
+	out := make([]byte, w*h)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			out[y*w+x] = byte(32 + (x+y*3)%128)
+		}
+	}
+	return out
 }
 
 // --- header + lump assembly -------------------------------------------------

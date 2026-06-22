@@ -121,6 +121,28 @@ func TestBuildWithFaces(t *testing.T) {
 	if mt0.Name != "trim" || mt0.Width != 64 || mt0.Height != 32 {
 		t.Errorf("MipTex(0) = (%q,%d,%d), want (\"trim\",64,32)", mt0.Name, mt0.Width, mt0.Height)
 	}
+	// Slot 0 carries a real pixel buffer for every mip level. The
+	// quake-tamago renderer's loadMiptexPics path consumes mip0; the
+	// per-level sanity check below proves the byte layout the encoder
+	// promised round-trips through bspfile.MipTex.Pixels.
+	wantLens := [bspfile.MipLevels]int{64 * 32, 32 * 16, 16 * 8, 8 * 4}
+	for level := 0; level < bspfile.MipLevels; level++ {
+		px, err := mt0.Pixels(level)
+		if err != nil {
+			t.Fatalf("MipTex(0).Pixels(%d): %v", level, err)
+		}
+		if got := len(px); got != wantLens[level] {
+			t.Errorf("MipTex(0).Pixels(%d) len=%d, want %d", level, got, wantLens[level])
+		}
+	}
+	// Spot-check the (0,0) byte of mip0 -- makeMipPixels sets out[0]
+	// = byte(32) so a future regression in the encoder (wrong offset,
+	// misaligned write) surfaces here instead of silently shifting the
+	// pixel buffer.
+	px0, _ := mt0.Pixels(0)
+	if px0[0] != 32 {
+		t.Errorf("MipTex(0).Pixels(0)[0]=%d, want 32 (diagonal sweep start)", px0[0])
+	}
 	_, ok, err = tex.MipTex(1)
 	if err != nil {
 		t.Fatalf("MipTex(1): %v", err)
