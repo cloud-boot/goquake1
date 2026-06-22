@@ -295,3 +295,255 @@ func TestLerpAliasPose_LengthMinOfInputs(t *testing.T) {
 		t.Fatalf("len = %d want 1 (min of inputs)", len(got))
 	}
 }
+
+// --- DrawAliasInterpLit -------------------------------------------------
+//
+// Nil-arg + range guards. Mirrors the DrawAliasInterp guard suite --
+// the new entry point has the same six error preconditions.
+
+func TestDrawAliasInterpLit_NilFB(t *testing.T) {
+	_, rd, skin := newAliasCtx(t)
+	m := twoFrameModel()
+	err := DrawAliasInterpLit(nil, rd, nil, DefaultAliasShade(), m, skin,
+		AliasEntityInterp{AliasEntity: AliasEntity{Origin: [3]float32{100, 0, 0}}})
+	if !errors.Is(err, ErrAliasNilFB) {
+		t.Fatalf("err = %v want ErrAliasNilFB", err)
+	}
+}
+
+func TestDrawAliasInterpLit_NilModel(t *testing.T) {
+	fb, rd, skin := newAliasCtx(t)
+	err := DrawAliasInterpLit(fb, rd, nil, DefaultAliasShade(), nil, skin, AliasEntityInterp{})
+	if !errors.Is(err, ErrAliasNilModel) {
+		t.Fatalf("err = %v want ErrAliasNilModel", err)
+	}
+}
+
+func TestDrawAliasInterpLit_NilRefDef(t *testing.T) {
+	fb, _, skin := newAliasCtx(t)
+	m := twoFrameModel()
+	err := DrawAliasInterpLit(fb, nil, nil, DefaultAliasShade(), m, skin, AliasEntityInterp{})
+	if !errors.Is(err, ErrAliasNilRefDef) {
+		t.Fatalf("err = %v want ErrAliasNilRefDef", err)
+	}
+}
+
+func TestDrawAliasInterpLit_NilSkin(t *testing.T) {
+	fb, rd, _ := newAliasCtx(t)
+	m := twoFrameModel()
+	err := DrawAliasInterpLit(fb, rd, nil, DefaultAliasShade(), m, nil, AliasEntityInterp{})
+	if !errors.Is(err, ErrAliasNilSkin) {
+		t.Fatalf("err = %v want ErrAliasNilSkin", err)
+	}
+}
+
+func TestDrawAliasInterpLit_LerpBelowZero(t *testing.T) {
+	fb, rd, skin := newAliasCtx(t)
+	m := twoFrameModel()
+	err := DrawAliasInterpLit(fb, rd, nil, DefaultAliasShade(), m, skin,
+		AliasEntityInterp{Lerp: -0.5})
+	if !errors.Is(err, ErrAliasInterpRange) {
+		t.Fatalf("err = %v want ErrAliasInterpRange", err)
+	}
+}
+
+func TestDrawAliasInterpLit_LerpAboveOne(t *testing.T) {
+	fb, rd, skin := newAliasCtx(t)
+	m := twoFrameModel()
+	err := DrawAliasInterpLit(fb, rd, nil, DefaultAliasShade(), m, skin,
+		AliasEntityInterp{Lerp: 1.5})
+	if !errors.Is(err, ErrAliasInterpRange) {
+		t.Fatalf("err = %v want ErrAliasInterpRange", err)
+	}
+}
+
+func TestDrawAliasInterpLit_BadFrameIdx(t *testing.T) {
+	fb, rd, skin := newAliasCtx(t)
+	m := twoFrameModel()
+	err := DrawAliasInterpLit(fb, rd, nil, DefaultAliasShade(), m, skin,
+		AliasEntityInterp{
+			AliasEntity:  AliasEntity{FrameIdx: -1},
+			FrameIdxNext: 0,
+		})
+	if !errors.Is(err, ErrAliasBadFrame) {
+		t.Fatalf("err = %v want ErrAliasBadFrame", err)
+	}
+}
+
+func TestDrawAliasInterpLit_BadFrameIdxNext(t *testing.T) {
+	fb, rd, skin := newAliasCtx(t)
+	m := twoFrameModel()
+	err := DrawAliasInterpLit(fb, rd, nil, DefaultAliasShade(), m, skin,
+		AliasEntityInterp{
+			AliasEntity:  AliasEntity{FrameIdx: 0},
+			FrameIdxNext: len(m.Frames),
+		})
+	if !errors.Is(err, ErrAliasBadFrame) {
+		t.Fatalf("err = %v want ErrAliasBadFrame", err)
+	}
+}
+
+// --- reduction invariants ----------------------------------------------
+//
+// The whole point of DrawAliasInterpLit is to be "DrawAliasInterp + lit"
+// without sacrificing the DrawAliasLit shading model. The lerp-endpoint
+// cases (0, 1, same-frame) MUST be byte-identical to DrawAliasLit on
+// the corresponding pose -- if they aren't, the combined path is
+// computing lights from a different vertex array.
+
+func TestDrawAliasInterpLit_LerpZeroMatchesDrawAliasLit(t *testing.T) {
+	m := twoFrameModel()
+	ent := AliasEntity{Origin: [3]float32{100, 0, 0}, FrameIdx: 0}
+	cm := litColormap()
+	shade := DefaultAliasShade()
+
+	fbRef, rd, skin := newAliasCtx(t)
+	if err := DrawAliasLit(fbRef, rd, cm, shade, m, skin, ent); err != nil {
+		t.Fatalf("DrawAliasLit: %v", err)
+	}
+
+	fbGot, _, _ := newAliasCtx(t)
+	entInt := AliasEntityInterp{
+		AliasEntity:  ent,
+		FrameIdxNext: 1, // different "to" frame, but Lerp=0 -> ignored
+		Lerp:         0,
+	}
+	if err := DrawAliasInterpLit(fbGot, rd, cm, shade, m, skin, entInt); err != nil {
+		t.Fatalf("DrawAliasInterpLit: %v", err)
+	}
+	if !bytes.Equal(fbRef.Pixels, fbGot.Pixels) {
+		t.Fatalf("Lerp=0 framebuffer mismatch with DrawAliasLit(FrameIdx)")
+	}
+}
+
+func TestDrawAliasInterpLit_LerpOneMatchesDrawAliasLitNext(t *testing.T) {
+	m := twoFrameModel()
+	originEnt := AliasEntity{Origin: [3]float32{100, 0, 0}}
+	cm := litColormap()
+	shade := DefaultAliasShade()
+
+	fbRef, rd, skin := newAliasCtx(t)
+	refEnt := originEnt
+	refEnt.FrameIdx = 1
+	if err := DrawAliasLit(fbRef, rd, cm, shade, m, skin, refEnt); err != nil {
+		t.Fatalf("DrawAliasLit: %v", err)
+	}
+
+	fbGot, _, _ := newAliasCtx(t)
+	entInt := AliasEntityInterp{
+		AliasEntity:  originEnt, // FrameIdx = 0
+		FrameIdxNext: 1,
+		Lerp:         1,
+	}
+	if err := DrawAliasInterpLit(fbGot, rd, cm, shade, m, skin, entInt); err != nil {
+		t.Fatalf("DrawAliasInterpLit: %v", err)
+	}
+	if !bytes.Equal(fbRef.Pixels, fbGot.Pixels) {
+		t.Fatalf("Lerp=1 framebuffer mismatch with DrawAliasLit(FrameIdxNext)")
+	}
+}
+
+func TestDrawAliasInterpLit_SameFrameMatchesDrawAliasLit(t *testing.T) {
+	m := twoFrameModel()
+	originEnt := AliasEntity{Origin: [3]float32{100, 0, 0}, FrameIdx: 0}
+	cm := litColormap()
+	shade := DefaultAliasShade()
+
+	fbRef, rd, skin := newAliasCtx(t)
+	if err := DrawAliasLit(fbRef, rd, cm, shade, m, skin, originEnt); err != nil {
+		t.Fatalf("DrawAliasLit: %v", err)
+	}
+
+	fbGot, _, _ := newAliasCtx(t)
+	entInt := AliasEntityInterp{
+		AliasEntity:  originEnt,
+		FrameIdxNext: 0,    // same as FrameIdx
+		Lerp:         0.37, // arbitrary; FrameIdxNext==FrameIdx -> ignored
+	}
+	if err := DrawAliasInterpLit(fbGot, rd, cm, shade, m, skin, entInt); err != nil {
+		t.Fatalf("DrawAliasInterpLit: %v", err)
+	}
+	if !bytes.Equal(fbRef.Pixels, fbGot.Pixels) {
+		t.Fatalf("same-frame Lerp framebuffer mismatch with DrawAliasLit")
+	}
+}
+
+// --- mid-frame interpolation: byte-space mid of A/B == frontFacingTri --
+
+func TestDrawAliasInterpLit_LerpHalfMatchesMidModel(t *testing.T) {
+	// Lerp=0.5 between Frame0 + Frame1 of twoFrameModel reconstructs
+	// the frontFacingTri byte pose -- so the lit raster should match
+	// a DrawAliasLit on the equivalent single-frame mid model.
+	m := twoFrameModel()
+	mMid := frontFacingTri()
+	cm := litColormap()
+	shade := DefaultAliasShade()
+
+	fbRef, rd, skin := newAliasCtx(t)
+	if err := DrawAliasLit(fbRef, rd, cm, shade, mMid, skin,
+		AliasEntity{Origin: [3]float32{100, 0, 0}}); err != nil {
+		t.Fatalf("DrawAliasLit(mid): %v", err)
+	}
+
+	fbGot, _, _ := newAliasCtx(t)
+	entInt := AliasEntityInterp{
+		AliasEntity:  AliasEntity{Origin: [3]float32{100, 0, 0}, FrameIdx: 0},
+		FrameIdxNext: 1,
+		Lerp:         0.5,
+	}
+	if err := DrawAliasInterpLit(fbGot, rd, cm, shade, m, skin, entInt); err != nil {
+		t.Fatalf("DrawAliasInterpLit: %v", err)
+	}
+	if !bytes.Equal(fbRef.Pixels, fbGot.Pixels) {
+		t.Fatalf("Lerp=0.5 framebuffer mismatch with DrawAliasLit(midPose)")
+	}
+}
+
+// --- propagates FillTexturedPolygon error -----------------------------
+
+func TestDrawAliasInterpLit_PropagatesFillError(t *testing.T) {
+	fb, rd, _ := newAliasCtx(t)
+	m := twoFrameModel()
+	entInt := AliasEntityInterp{
+		AliasEntity:  AliasEntity{Origin: [3]float32{100, 0, 0}},
+		FrameIdxNext: 1,
+		Lerp:         0.5,
+	}
+	err := DrawAliasInterpLit(fb, rd, nil, DefaultAliasShade(), m, makeBadSkin(), entInt)
+	if !errors.Is(err, ErrPicShape) {
+		t.Fatalf("err = %v want ErrPicShape", err)
+	}
+}
+
+// --- empty FrameGroup -> no-op at every Lerp branch -------------------
+
+func TestDrawAliasInterpLit_EmptyGroupNoOp(t *testing.T) {
+	// Two-frame model where BOTH frames are empty FrameGroups. Each
+	// of the three branches (Lerp==0, Lerp==1, mid-lerp) must
+	// short-circuit before ComputeAliasVertexLights (which errors on
+	// a nil slice) and return nil.
+	m := &mdl.Model{
+		Header: mdl.Header{Scale: [3]float32{1, 1, 1}, NumFrames: 2},
+		Frames: []mdl.Frame{
+			{Type: mdl.FrameGroup, Group: &mdl.GroupFrame{}},
+			{Type: mdl.FrameGroup, Group: &mdl.GroupFrame{}},
+		},
+	}
+	fb, rd, skin := newAliasCtx(t)
+	// Lerp=0 -> vertsA empty branch.
+	if err := DrawAliasInterpLit(fb, rd, nil, DefaultAliasShade(), m, skin,
+		AliasEntityInterp{AliasEntity: AliasEntity{FrameIdx: 0}, FrameIdxNext: 1, Lerp: 0}); err != nil {
+		t.Fatalf("lerp=0 empty-group err = %v", err)
+	}
+	// Lerp=1 -> vertsB empty branch.
+	if err := DrawAliasInterpLit(fb, rd, nil, DefaultAliasShade(), m, skin,
+		AliasEntityInterp{AliasEntity: AliasEntity{FrameIdx: 0}, FrameIdxNext: 1, Lerp: 1}); err != nil {
+		t.Fatalf("lerp=1 empty-group err = %v", err)
+	}
+	// Lerp=0.5 -> lerpAliasPose(empty,empty) -> empty slice; compute
+	// returns empty; rasterizer iterates zero triangles. No error.
+	if err := DrawAliasInterpLit(fb, rd, nil, DefaultAliasShade(), m, skin,
+		AliasEntityInterp{AliasEntity: AliasEntity{FrameIdx: 0}, FrameIdxNext: 1, Lerp: 0.5}); err != nil {
+		t.Fatalf("lerp=0.5 empty-group err = %v", err)
+	}
+}

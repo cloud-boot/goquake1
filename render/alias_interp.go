@@ -79,6 +79,86 @@ func DrawAliasInterp(fb *FrameBuffer, rd *RefDef, cm *ColorMap, lightLevel int,
 	return drawAliasFromPose(fb, rd, cm, lightLevel, model, skin, ent.AliasEntity, verts)
 }
 
+// DrawAliasInterpLit is DrawAliasInterp + DrawAliasLit fused: per-vertex
+// linear interpolation between two frames AND per-triangle scalar light
+// derived from the lerped pose's LightNormalIndex via AliasShadeRange.
+//
+// Algorithm:
+//  1. Build the same blended pose DrawAliasInterp does (FramePose A/B
+//     + lerpAliasPose). The blended pose carries the lerped V[]
+//     bytes AND the lightnormalindex of whichever input weighed more,
+//     matching tyrquake R_AliasBlendPoseVerts.
+//  2. Run ComputeAliasVertexLights over the blended pose -- same
+//     formula DrawAliasLit uses on its single-frame pose, so the
+//     resulting per-vertex [0..255] lights are byte-identical to a
+//     DrawAliasLit call on the same pose.
+//  3. Hand the lights + the blended verts to drawAliasFromPoseLit --
+//     the same per-triangle averaging + colormap-row mapping +
+//     FillTexturedPolygon rasterization DrawAliasLit performs.
+//
+// Reduction invariants (mirrored in alias_interp_test.go):
+//
+//   - Lerp == 0                       -> identical to DrawAliasLit(FrameIdx)
+//   - Lerp == 1                       -> identical to DrawAliasLit(FrameIdxNext)
+//   - FrameIdxNext == FrameIdx        -> identical to DrawAliasLit(FrameIdx)
+//
+// (Byte-identical to DrawAliasLit on the corresponding pose; not just
+// "same pixel sums" -- bytes.Equal in the tests.)
+//
+// Returns ErrAliasInterpRange when Lerp falls outside [0, 1]; the
+// usual nil/frame sentinels (ErrAliasNilFB / NilModel / NilRefDef /
+// NilSkin / BadFrame for either FrameIdx OR FrameIdxNext) otherwise;
+// or any FillTexturedPolygon error.
+func DrawAliasInterpLit(fb *FrameBuffer, rd *RefDef, cm *ColorMap, shade AliasShadeRange,
+	model *mdl.Model, skin *Pic, ent AliasEntityInterp) error {
+	if fb == nil {
+		return ErrAliasNilFB
+	}
+	if model == nil {
+		return ErrAliasNilModel
+	}
+	if rd == nil {
+		return ErrAliasNilRefDef
+	}
+	if skin == nil {
+		return ErrAliasNilSkin
+	}
+	if ent.Lerp < 0 || ent.Lerp > 1 {
+		return ErrAliasInterpRange
+	}
+	if ent.FrameIdx < 0 || ent.FrameIdx >= len(model.Frames) {
+		return ErrAliasBadFrame
+	}
+	if ent.FrameIdxNext < 0 || ent.FrameIdxNext >= len(model.Frames) {
+		return ErrAliasBadFrame
+	}
+
+	vertsA := FramePose(model.Frames[ent.FrameIdx])
+	// Mirror DrawAliasLit's empty-pose short-circuit: ComputeAliasVertexLights
+	// errors on a nil slice, but an empty FrameGroup is a no-op draw.
+	if ent.Lerp == 0 || ent.FrameIdxNext == ent.FrameIdx {
+		if vertsA == nil {
+			return nil
+		}
+		lights, _ := ComputeAliasVertexLights(vertsA, shade)
+		return drawAliasFromPoseLit(fb, rd, cm, lights, model, skin, ent.AliasEntity, vertsA)
+	}
+	vertsB := FramePose(model.Frames[ent.FrameIdxNext])
+	if ent.Lerp == 1 {
+		if vertsB == nil {
+			return nil
+		}
+		lights, _ := ComputeAliasVertexLights(vertsB, shade)
+		return drawAliasFromPoseLit(fb, rd, cm, lights, model, skin, ent.AliasEntity, vertsB)
+	}
+
+	verts := lerpAliasPose(vertsA, vertsB, ent.Lerp)
+	// lerpAliasPose returns a non-nil (possibly empty) slice; the
+	// compute helper handles empty slices, so no extra guard needed.
+	lights, _ := ComputeAliasVertexLights(verts, shade)
+	return drawAliasFromPoseLit(fb, rd, cm, lights, model, skin, ent.AliasEntity, verts)
+}
+
 // lerpAliasPose builds the byte-space linear interpolation of two
 // per-frame vertex arrays. Mirrors R_AliasBlendPoseVerts: blend in
 // byte space with float weights, round to nearest. The shorter input

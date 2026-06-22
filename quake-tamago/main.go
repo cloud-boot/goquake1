@@ -933,39 +933,46 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 
 		// Alias-model pass. Iterate the wire-mirrored State.Entities
 		// (the client's per-tic snapshot the server broadcast over
-		// svc_update) and rasterize one DrawAliasInterp per entity whose
-		// ModelIdx resolves to a loaded .mdl. Entries with ModelIdx
-		// == 0 (no model) or aliasModels[ModelIdx] == nil (BSP
-		// submodel like "*1", or a missing/un-loadable .mdl) are
+		// svc_update) and rasterize one DrawAliasInterpLit per entity
+		// whose ModelIdx resolves to a loaded .mdl. Entries with
+		// ModelIdx == 0 (no model) or aliasModels[ModelIdx] == nil
+		// (BSP submodel like "*1", or a missing/un-loadable .mdl) are
 		// silently skipped -- BSP submodels are already drawn by the
 		// world walk above, alien-format / missing entries have
 		// nothing to render here.
 		//
-		// SCOPE: smooth-animation draw via [render.DrawAliasInterp].
-		// The client cache carries the entity's prior Frame (PrevFrame)
-		// + the wall-clock stamp at which Frame last changed
-		// (LerpStartTime). The per-tic lerp fraction is
+		// SCOPE: smooth-animation draw + per-vertex gouraud shading
+		// fused via [render.DrawAliasInterpLit]. The client cache
+		// carries the entity's prior Frame (PrevFrame) + the wall-
+		// clock stamp at which Frame last changed (LerpStartTime).
+		// The per-tic lerp fraction is
 		//
 		//	lerp = clamp((now - LerpStartTime) / aliasFramePeriod, 0, 1)
 		//
 		// with aliasFramePeriod = 0.1 s (10 Hz upstream cadence). The
-		// interp variant takes a uniform lightLevel rather than the
-		// per-vertex gouraud shade range DrawAliasLit consumes -- the
-		// trade-off chosen here is "smooth animation, uniform shading"
-		// over "single-frame snapshot, gouraud shading". The uniform
-		// lightLevel matches the pre-gouraud DrawAlias default (10);
-		// re-introducing per-vertex shading on top of pose interp lives
-		// in a future DrawAliasInterpLit batch. Skin texture: the
-		// per-entity SkinNum field is clamped to the model's available
-		// skins via the parallel aliasSkins slice (one *render.Pic per
-		// precache slot -- a single-skin model exposes its sole skin,
-		// multi-skin variants land in a future batch). On a render
-		// error we log + continue with the next entity so one bad
-		// entity doesn't sink the rest of the frame.
+		// combined variant takes the AliasShadeRange that DrawAliasLit
+		// consumes -- the gourand shading from batch 79 is restored on
+		// top of the frame interpolation from batch 80, so monsters now
+		// animate smoothly AND shade per-face. Shade envelope: Ambient
+		// 0.3 (unlit side stays visible) + DirectMax 0.7 (lit side
+		// adds up to +0.7) + LightDir (0,0,-1) (light from above) --
+		// same parameters as the pre-interp DrawAliasLit path.
+		// Skin texture: the per-entity SkinNum field is clamped to
+		// the model's available skins via the parallel aliasSkins
+		// slice (one *render.Pic per precache slot -- a single-skin
+		// model exposes its sole skin, multi-skin variants land in a
+		// future batch). On a render error we log + continue with the
+		// next entity so one bad entity doesn't sink the rest of the
+		// frame.
 		const (
 			aliasFramePeriod = float32(0.1) // 10 Hz upstream cadence
-			aliasLightLevel  = 10           // uniform fallback (matches DrawAlias default)
 		)
+		aliasShade := render.AliasShadeRange{
+			Ambient:   0.3,
+			DirectMin: 0.0,
+			DirectMax: 0.7,
+			LightDir:  [3]float32{0, 0, -1},
+		}
 		now := runner.Client.MsgTime
 		aliasRendered := 0
 		var (
@@ -1018,11 +1025,11 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				FrameIdxNext: frameIdx,
 				Lerp:         lerp,
 			}
-			if err := render.DrawAliasInterp(fb, rd, &cm, aliasLightLevel, am, skin, ent); err != nil {
+			if err := render.DrawAliasInterpLit(fb, rd, &cm, aliasShade, am, skin, ent); err != nil {
 				// Per-entity errors are non-fatal; log sparsely so
 				// one bad entity per tic doesn't drown the channel.
 				if frame%60 == 0 {
-					fmt.Printf("QUAKE: DrawAliasInterp modelIdx=%d from=%d to=%d lerp=%v err: %v\n",
+					fmt.Printf("QUAKE: DrawAliasInterpLit modelIdx=%d from=%d to=%d lerp=%v err: %v\n",
 						es.ModelIdx, prevIdx, frameIdx, lerp, err)
 				}
 				continue
@@ -1035,15 +1042,15 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			aliasRendered++
 		}
 		if frame%60 == 0 {
-			fmt.Printf("QUAKE: tic %d rendered %d alias entities (interp)\n",
+			fmt.Printf("QUAKE: tic %d rendered %d alias entities (interp+lit)\n",
 				frame, aliasRendered)
-			// Spot-check the interp lerp window for a representative
-			// entity: log PrevFrame/Frame + the computed lerp
-			// fraction so the serial log surfaces whether animation
-			// transitions are actually being detected (PrevFrame
-			// stuck at 0 + lerp == 0 on every tic = the server isn't
-			// advancing entity.Frame yet; PrevFrame != Frame +
-			// lerp > 0 = the pose blend is firing).
+			// Spot-check BOTH the interp lerp window AND the per-vertex
+			// shade variance for a representative entity, so the serial
+			// log surfaces whether the combined DrawAliasInterpLit
+			// path is actually firing:
+			//   - lerp > 0 + prev != cur = pose blend is active
+			//   - distinct > 1 + min != max = gouraud shading varies
+			// (Both flat = collapse to single-frame + uniform light.)
 			if haveSample {
 				var sampleLerp float32
 				if sampleES.LerpStartTime > 0 && now > sampleES.LerpStartTime {
@@ -1056,6 +1063,29 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 					sampleES.ModelIdx, len(sampleAM.Frames),
 					sampleES.PrevFrame, sampleES.Frame,
 					sampleES.LerpStartTime, now, sampleLerp)
+				// Shade variance summary across all vertices of the
+				// sample entity's current frame pose (mirrors batch
+				// 79's QUAKE: alias shade sample log).
+				fIdx := sampleES.Frame
+				if fIdx < 0 || fIdx >= len(sampleAM.Frames) {
+					fIdx = 0
+				}
+				verts := render.FramePose(sampleAM.Frames[fIdx])
+				if lights, err := render.ComputeAliasVertexLights(verts, aliasShade); err == nil && len(lights) > 0 {
+					lmin, lmax := lights[0], lights[0]
+					seen := make(map[int]struct{}, len(lights))
+					for _, v := range lights {
+						if v < lmin {
+							lmin = v
+						}
+						if v > lmax {
+							lmax = v
+						}
+						seen[v] = struct{}{}
+					}
+					fmt.Printf("QUAKE: alias shade sample modelIdx=%d verts=%d distinct=%d min=%d max=%d\n",
+						sampleES.ModelIdx, len(lights), len(seen), lmin, lmax)
+				}
 			}
 		}
 		return nil
