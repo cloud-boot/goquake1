@@ -38,16 +38,21 @@
 //     absent from the QEMU command line the engine falls back to a
 //     no-input / silent backend rather than panicking.
 //
-//   - Camera position follows the player edict at server slot 1 when
-//     the real host is wired: each tic the Pre2DDraw closure calls
-//     host.EdictOrigin(1), and uses the returned origin (plus the
-//     client's ViewHeightOffset eye-height nudge) as the ViewOrigin.
-//     When that origin is the zero vector -- the bytecode default
-//     before QC SpawnFn populates an info_player_start spawn point --
-//     the camera falls back to pickInMapCamera's lattice probe, which
-//     is guaranteed to land inside a valid leaf. Camera angles are
-//     driven by virtio-input via client.Tick (the WASD + mouse +
-//     jump bindings already in UpdateButtonsFromSnapshot).
+//   - Camera position follows the local player entity slot via the
+//     wire-mirrored client.State.Entities map (proper client/server
+//     split: the renderer reads what the server told the client over
+//     svc_update, NOT the server edict pool directly). The runloop
+//     looks up State.Entities[Client.PlayerNum].Origin per-tic and
+//     hands the result to Pre2DDraw as viewOrigin; the Pre2DDraw
+//     closure layers the client's ViewHeightOffset eye-height nudge
+//     on top. When the player entity has not yet been received
+//     (pre-signon, or the wire drain has not delivered the first
+//     svc_update for the local slot) the runloop's fallback is the
+//     zero vector; the closure detects that case + substitutes
+//     pickInMapCamera's lattice anchor so the renderer always has a
+//     valid leaf to walk against. Camera angles are driven by
+//     virtio-input via client.Tick (the WASD + mouse + jump bindings
+//     already in UpdateButtonsFromSnapshot).
 //
 // Rationale (project-driver quote): "on a fait les pilote virtio pour
 // eprouver tamago" — the go-virtio drivers exist so this binary can
@@ -285,6 +290,20 @@ func run() error {
 		if err := engineserver.SendServerInfo(hc, info); err != nil {
 			return fmt.Errorf("SendServerInfo: %w", err)
 		}
+		// Queue svc_setview to tell the client which entity slot to
+		// follow as the local view. The C upstream emits this from
+		// SV_SendServerinfo right after the precache lists; the Go
+		// SendServerInfo deliberately omits it (per its docstring) so
+		// the per-client lifecycle code can pick the slot. Without
+		// this byte the client's applyServerInfo zeroes PlayerNum (so
+		// the wire-mirrored runloop's viewOrigin lookup at
+		// State.Entities[PlayerNum] would miss every tic + fall back
+		// to the zero vector). svc_setview restores PlayerNum to the
+		// player edict slot the loopback bound us to, completing the
+		// proper client/server split for the camera-anchor path.
+		if err := engineserver.EncodeSetView(hc.Message, playerSlot); err != nil {
+			return fmt.Errorf("EncodeSetView: %w", err)
+		}
 		// Append per-entity baselines (svc_spawnbaseline) onto the same
 		// client.Message buffer. Baselines are queued up front (no
 		// per-tic gating); the client's applyBaseline arm caches them
@@ -398,12 +417,16 @@ func run() error {
 // host.Frame + client.Tick + Compose2D + PresentFrame are all wired
 // into the same per-tic schedule.
 //
-// CAMERA: when realHost is non-nil the per-frame Pre2DDraw closure
-// asks realHost.EdictOrigin(playerSlot) (the local player edict, slot
-// 1 in the standard single-player loop) and uses the returned origin
-// + a ViewHeightOffset eye-height nudge as the ViewOrigin. A zero
-// origin (the bytecode default until SpawnFn is wired) or an error
-// falls back to camOrigin -- the static pickInMapCamera anchor.
+// CAMERA: the per-frame Pre2DDraw closure receives viewOrigin already
+// sourced by the runloop from the wire-mirrored client state at
+// runner.Client.Entities[Client.PlayerNum].Origin (the proper client/
+// server split: the renderer reads what the server told the client
+// via svc_update, NOT the server edict pool directly). The closure
+// layers a ViewHeightOffset eye-height nudge on top. When the runloop
+// hands a zero vector (no State.Entities entry yet -- pre-signon or
+// pre-first-svc_update) the closure falls back to camOrigin -- the
+// static pickInMapCamera anchor that's guaranteed to land inside a
+// valid leaf.
 //
 // PLAYER MOVEMENT: each tic the closure first drains the loopback
 // server-side queue via server.ReadClientMoves -- consuming whatever
@@ -563,22 +586,51 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			fmt.Printf("QUAKE: player edict %d primed for PhysicsWalk (movetype=Walk solid=SlideBox hull1 mins/maxs)\n",
 				playerSlot)
 		}
+		// Flip Free=false on the player edict. SpawnServer's
+		// arena.Reset starts every slot with Free=true; the entity-
+		// spawn pass flips Free for parsed entities, but the reserved
+		// client slots (1..MaxClients) are skipped by that loop. The
+		// per-tic SendEntityUpdates filter (`if e == nil || e.Free`)
+		// would then skip the player slot every tic, leaving
+		// State.Entities[PlayerNum] unpopulated -- exactly the gap
+		// the wire-mirrored viewOrigin lookup needs filled. The flip
+		// here aligns the client slot with the same "claimed" semantics
+		// the upstream SV_ConnectClient applies via ED_Alloc.
+		if playerSlot < len(realHost.Server.Edicts) {
+			if pe := realHost.Server.Edicts[playerSlot]; pe != nil && pe.Free {
+				pe.Free = false
+				fmt.Printf("QUAKE: claimed player edict %d (Free=true -> false) so per-tic svc_update emits it\n",
+					playerSlot)
+			}
+		}
 	}
 
 	// 6. Pre2DDraw closure. Runs per-tic from RunFrame BEFORE the 2D
 	//    Compose; viewAngles is the (pitch, yaw, roll) the client tick
 	//    has just refreshed from mouse + arrow keys. viewOrigin is the
-	//    runner's anchor; we offset it by client.State.ViewHeightOffset
-	//    so jumping/crouching still nudges the camera.
+	//    runloop's wire-mirrored player anchor sourced from
+	//    runner.Client.Entities[Client.PlayerNum].Origin -- the
+	//    snapshot the server broadcast via svc_update + the client
+	//    cached into State.Entities. The closure offsets it by
+	//    client.State.ViewHeightOffset so jumping/crouching still
+	//    nudges the camera.
 	//
-	//    Player physics is now owned by host.Frame (called BEFORE
+	//    Player physics is owned by host.Frame (called BEFORE
 	//    Pre2DDraw by the runloop): host.runClientCmds drains each
 	//    loopback inbox + mirrors cmd.ViewAngles into edict.v_angle,
 	//    then RunPhysics dispatches PhysicsWalk which integrates
 	//    gravity + accelerate + PushEntity-traces against the world.
-	//    Pre2DDraw is left to just read the post-physics origin via
-	//    EdictOrigin and render against it -- no more direction-only
-	//    integratePlayerCmd nudge.
+	//    The post-physics origin is then transmitted to the client
+	//    via svc_update + lands in State.Entities[PlayerNum].Origin,
+	//    which the runloop hands to Pre2DDraw as viewOrigin -- the
+	//    proper client/server split, no more EdictOrigin reach-around
+	//    into the server-side edict pool.
+	//
+	//    Fallback: when the runloop hands a zero vector (no
+	//    State.Entities[PlayerNum] entry yet -- pre-signon or pre-
+	//    first-svc_update) the closure substitutes camOrigin -- the
+	//    static pickInMapCamera anchor that always lands inside a
+	//    valid leaf -- so the BSP walk has something to walk against.
 	runner.Pre2DDraw = func(fb *render.FrameBuffer, viewOrigin, viewAngles [3]float32) error {
 		frame := frameCount
 		frameCount++
@@ -591,24 +643,25 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			fb.Pixels[i] = 0x10
 		}
 
-		// Pick the camera anchor for this frame. When the real host
-		// is wired we ask it for the local player edict's slot. Until
-		// SpawnFn (or the seed above) populates a non-zero origin we
-		// fall back to camOrigin -- the static pickInMapCamera anchor
-		// that always lands inside a leaf.
+		// Pick the camera anchor for this frame. The runloop has
+		// already sourced viewOrigin from the wire-mirrored
+		// runner.Client.Entities[Client.PlayerNum].Origin (proper
+		// client/server split). A zero vector means the wire has not
+		// yet delivered the player's svc_update; fall back to
+		// camOrigin -- the static pickInMapCamera anchor that always
+		// lands inside a leaf -- so the BSP walk doesn't run against
+		// the world origin (which sits in a solid leaf).
 		origin := viewOrigin
-		fromEdict := false
-		if realHost != nil && playerSlot > 0 {
-			if eo, err := realHost.EdictOrigin(playerSlot); err == nil && (eo[0] != 0 || eo[1] != 0 || eo[2] != 0) {
-				origin = eo
-				fromEdict = true
-			}
+		fromEntities := true
+		if origin[0] == 0 && origin[1] == 0 && origin[2] == 0 {
+			origin = camOrigin
+			fromEntities = false
 		}
 
 		// Bias the anchor by the client's view-height offset (the
 		// vertical bob/crouch nudge). When the origin comes from the
-		// player edict the offset is the eye-height delta above the
-		// edict's base origin.
+		// wire-mirrored entity state the offset is the eye-height
+		// delta above the entity's base origin.
 		origin[2] += runner.Client.ViewHeightOffset
 
 		rd := &render.RefDef{
@@ -699,12 +752,60 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 					cmdSide = c.Cmd.SideMove
 				}
 			}
-			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v fromEdict=%v viewAngles=%v cmd.fwd=%v cmd.side=%v clientConn=%d cl.vel=%v cl.viewh=%v cl.health=%d; %d surfaces; audio: %d active, %d mixed\n",
-				frame, origin, fromEdict, viewAngles, cmdFwd, cmdSide,
+			// viewOrigin source classification. fromEntities=true
+			// means the runloop pulled the origin out of the wire-
+			// mirrored runner.Client.Entities map; fromEntities=false
+			// means the wire has not yet delivered svc_update for the
+			// local player slot + the closure substituted the
+			// pickInMapCamera fallback. Cross-reference: the entity
+			// Origin BEFORE the ViewHeightOffset Z-nudge AND the
+			// Entities-map presence/origin even when the runloop's
+			// fast path took a zero vector (helps diagnose
+			// "wire delivered entities but the player slot is empty"
+			// vs "wire hasn't delivered anything yet" gaps).
+			viewSrc := "state.Entities"
+			if !fromEntities {
+				viewSrc = "fallback(pickInMapCamera)"
+			}
+			entOrigin := [3]float32{}
+			entPresent := false
+			if es, ok := runner.Client.Entities[runner.Client.PlayerNum]; ok {
+				entOrigin = es.Origin
+				entPresent = true
+			}
+			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v src=%s entOrigin=%v entPresent=%v (PlayerNum=%d, %d entities cached) viewAngles=%v cmd.fwd=%v cmd.side=%v clientConn=%d cl.vel=%v cl.viewh=%v cl.health=%d; %d surfaces; audio: %d active, %d mixed\n",
+				frame, origin, viewSrc, entOrigin, entPresent,
+				runner.Client.PlayerNum, len(runner.Client.Entities),
+				viewAngles, cmdFwd, cmdSide,
 				int(runner.Client.Connection),
 				runner.Client.Velocity, runner.Client.ViewHeightOffset, runner.Client.Health,
 				surfaces.Len(),
 				active, enginesound.MixBufferStereoFrames)
+
+			// One-shot Entities-map census on the first per-60 log
+			// after the wire drain has populated svc_updates. Surfaces
+			// which entity slots actually land in State.Entities so
+			// the serial log makes off-by-one + slot-skip bugs
+			// (e.g. "player slot 1 was Free, SendEntityUpdates
+			// skipped it") immediately visible without re-derivation.
+			if frame == 60 && len(runner.Client.Entities) > 0 {
+				minK, maxK := -1, -1
+				hasPlayer := false
+				for k := range runner.Client.Entities {
+					if minK == -1 || k < minK {
+						minK = k
+					}
+					if k > maxK {
+						maxK = k
+					}
+					if k == runner.Client.PlayerNum {
+						hasPlayer = true
+					}
+				}
+				fmt.Printf("QUAKE: Entities-map census tic 60 -- count=%d minKey=%d maxKey=%d hasPlayerKey(PlayerNum=%d)=%v\n",
+					len(runner.Client.Entities), minK, maxK,
+					runner.Client.PlayerNum, hasPlayer)
+			}
 
 			// Per-tic svc_update flow. The server-side host.Frame stamps
 			// the cumulative emit count onto LastEntityUpdatesSent every

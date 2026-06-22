@@ -61,12 +61,16 @@ type Runner struct {
 	Speeds     client.InputSpeeds
 	ViewAngles [3]float32
 
-	// ViewOrigin is the camera position the Pre2DDraw hook reads
-	// when rasterizing the 3D scene. The runner does NOT update
-	// this itself (full server-edict-to-client-state wiring is a
-	// follow-up); callers set it once at startup (e.g. from a
-	// pickInMapCamera() lattice probe) and may adjust it per-tic
-	// if they wire up player-follow logic out-of-band.
+	// ViewOrigin is a legacy caller-owned anchor retained for
+	// backwards compatibility. RunFrame no longer sources the
+	// per-tic camera position from this field -- the viewOrigin
+	// handed to [Runner.Pre2DDraw] now comes from the wire-mirrored
+	// client.State.Entities[Client.PlayerNum].Origin (the proper
+	// client/server split: the renderer reads what the server told
+	// the client, not the server edicts directly). When the player
+	// entity has not yet been received the fallback is the zero
+	// vector. Callers may still set ViewOrigin for diagnostics /
+	// out-of-band camera overrides, but the runloop ignores it.
 	ViewOrigin [3]float32
 
 	// Working buffers (long-lived; reused per frame).
@@ -211,11 +215,21 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 	//    scene that Compose2D overlays its 2D layers on top of.
 	//    When nil the previous 2D-only behaviour is preserved.
 	//
-	//    ViewOrigin is the camera position the BSP path needs;
-	//    ViewAngles is the (pitch, yaw, roll) the client tick
-	//    has just refreshed from mouse + arrow-key input.
+	//    viewOrigin is sourced from the wire-mirrored client state:
+	//    r.Client.Entities[r.Client.PlayerNum].Origin -- the entity
+	//    snapshot the server broadcast via svc_update + the client
+	//    cached into State.Entities (proper client/server split, the
+	//    renderer reads what the server told the client rather than
+	//    reaching into the server edict pool directly). A missing
+	//    entry (player entity not yet received this signon) falls
+	//    back to the zero vector; the renderer's PointInLeaf guard
+	//    skips the BSP walk for out-of-map origins.
+	//
+	//    ViewAngles is the (pitch, yaw, roll) the client tick has
+	//    just refreshed from mouse + arrow-key input.
 	if r.Pre2DDraw != nil {
-		if err := r.Pre2DDraw(r.FrameBuffer, r.ViewOrigin, r.ViewAngles); err != nil {
+		viewOrigin := viewOriginFromState(r.Client)
+		if err := r.Pre2DDraw(r.FrameBuffer, viewOrigin, r.ViewAngles); err != nil {
 			return err
 		}
 	}
@@ -264,6 +278,35 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 	}
 
 	return nil
+}
+
+// viewOriginFromState returns the camera position the per-tic
+// Pre2DDraw hook should rasterize against, sourced from the wire-
+// mirrored client state at [client.State.Entities][PlayerNum].Origin.
+//
+// This is the proper client/server split: the renderer reads the
+// entity snapshot the server broadcast via svc_update + the client
+// cached into State.Entities, NOT the server edict pool directly.
+// On the single-process loopback path the two values are identical
+// per-tic (svc_update writes the edict origin onto the wire and
+// applyUpdate writes it back into State.Entities), but the indirection
+// keeps the data-flow honest for the eventual remote-server path.
+//
+// Fallback: if cs is nil OR State.Entities[PlayerNum] is absent (the
+// player entity has not been received yet -- pre-signon, or the wire
+// drain has not yet delivered the first svc_update for this slot), the
+// returned origin is the zero vector. The Pre2DDraw closure's
+// PointInLeaf guard will then skip the BSP walk for that tic, which
+// is the same behaviour as the legacy out-of-map anchor.
+func viewOriginFromState(cs *client.State) [3]float32 {
+	if cs == nil || cs.Entities == nil {
+		return [3]float32{}
+	}
+	es, ok := cs.Entities[cs.PlayerNum]
+	if !ok {
+		return [3]float32{}
+	}
+	return es.Origin
 }
 
 // UpdateButtonsFromSnapshot translates the per-frame raw key events in

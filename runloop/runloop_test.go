@@ -570,15 +570,26 @@ func TestUpdateButtonsFromSnapshot_UpReleasesAllMappedKeys(t *testing.T) {
 // ----- Pre2DDraw hook -----------------------------------------------
 
 // TestRunFrame_Pre2DDrawInvoked verifies the optional Pre2DDraw hook
-// is invoked between client.Tick and Compose2D, receives the
-// runner's ViewOrigin + ViewAngles, and the pre-drawn pixels survive
+// is invoked between client.Tick and Compose2D, receives the camera
+// origin sourced from the wire-mirrored client.State.Entities map
+// (NOT runner.ViewOrigin, which is now a legacy diagnostic field),
+// receives the runner's ViewAngles, and the pre-drawn pixels survive
 // the 2D Compose (SkipBackgroundFill is wired through). Also asserts
 // the runner's frame still presents successfully.
 func TestRunFrame_Pre2DDrawInvoked(t *testing.T) {
 	rec := backend.NewRecorder(0, 0)
 	r, _ := newRunner(t, rec)
-	r.ViewOrigin = [3]float32{1, 2, 3}
+	// Seed the wire-mirrored entity state for the local player so
+	// RunFrame's viewOriginFromState lookup returns a non-zero
+	// vector -- proves the runner sources the camera from
+	// State.Entities, not from r.ViewOrigin.
+	r.Client.PlayerNum = 1
+	r.Client.Entities[1] = client.EntityState{Origin: [3]float32{1, 2, 3}}
+	// r.ViewOrigin set to a sentinel that MUST NOT be the value the
+	// closure receives -- guards against the legacy code path.
+	r.ViewOrigin = [3]float32{99, 99, 99}
 	r.ViewAngles = [3]float32{10, 20, 30}
+	wantOrigin := [3]float32{1, 2, 3}
 
 	var gotFB *render.FrameBuffer
 	var gotOrigin, gotAngles [3]float32
@@ -603,8 +614,8 @@ func TestRunFrame_Pre2DDrawInvoked(t *testing.T) {
 	if gotFB != r.FrameBuffer {
 		t.Fatalf("Pre2DDraw fb = %p want %p", gotFB, r.FrameBuffer)
 	}
-	if gotOrigin != r.ViewOrigin {
-		t.Fatalf("Pre2DDraw origin = %v want %v", gotOrigin, r.ViewOrigin)
+	if gotOrigin != wantOrigin {
+		t.Fatalf("Pre2DDraw origin = %v want %v (wire-mirrored State.Entities)", gotOrigin, wantOrigin)
 	}
 	if gotAngles != r.ViewAngles {
 		t.Fatalf("Pre2DDraw angles = %v want %v", gotAngles, r.ViewAngles)
@@ -616,6 +627,55 @@ func TestRunFrame_Pre2DDrawInvoked(t *testing.T) {
 	}
 	if len(rec.Frames) != 1 {
 		t.Fatalf("rec.Frames len = %d want 1", len(rec.Frames))
+	}
+}
+
+// TestRunFrame_Pre2DDrawFallbackZeroOrigin verifies that when no
+// State.Entities[PlayerNum] entry is present (player entity not yet
+// received), the Pre2DDraw hook receives the zero-vector fallback
+// rather than r.ViewOrigin. This guards the wire-only data flow on
+// the pre-signon path.
+func TestRunFrame_Pre2DDrawFallbackZeroOrigin(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	r, _ := newRunner(t, rec)
+	// PlayerNum=1 but no Entities[1] entry -- the wire has not yet
+	// delivered the player's svc_update.
+	r.Client.PlayerNum = 1
+	// r.ViewOrigin set non-zero to prove the runloop ignores it.
+	r.ViewOrigin = [3]float32{1, 2, 3}
+
+	var gotOrigin [3]float32
+	r.Pre2DDraw = func(_ *render.FrameBuffer, origin [3]float32, _ [3]float32) error {
+		gotOrigin = origin
+		return nil
+	}
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	if gotOrigin != ([3]float32{}) {
+		t.Fatalf("Pre2DDraw origin = %v want zero (fallback path)", gotOrigin)
+	}
+}
+
+// TestViewOriginFromState_NilState exercises the nil-State branch in
+// viewOriginFromState. The runloop never reaches this branch in
+// production (RunFrame returns ErrRunnerNilClient before the lookup),
+// but the helper is callable independently + the nil guard makes the
+// public-package invariant explicit.
+func TestViewOriginFromState_NilState(t *testing.T) {
+	if got := viewOriginFromState(nil); got != ([3]float32{}) {
+		t.Fatalf("viewOriginFromState(nil) = %v want zero", got)
+	}
+}
+
+// TestViewOriginFromState_NilEntities exercises the nil-Entities-map
+// branch. NewState always allocates the map; a State with Entities==nil
+// can only arise from a manual zero-value construction, but the guard
+// keeps the helper crash-safe + the branch covered.
+func TestViewOriginFromState_NilEntities(t *testing.T) {
+	cs := &client.State{}
+	if got := viewOriginFromState(cs); got != ([3]float32{}) {
+		t.Fatalf("viewOriginFromState(empty State) = %v want zero", got)
 	}
 }
 
