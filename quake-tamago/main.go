@@ -92,12 +92,12 @@ import (
 )
 
 // fbWidth / fbHeight are the framebuffer dimensions handed to
-// virtio-gpu's SetupFramebuffer. 320x240 matches the go-virtio/validate
-// gpuvalidate harness baseline (the legacy 96x72 cap is gone now that
-// validate/board masks the 8259 PIC).
+// virtio-gpu's SetupFramebuffer. 1280x1024 is the boot resolution;
+// QEMU GTK/Cocoa display is resizable so the host window scales the
+// scanout buffer up or down freely.
 const (
-	fbWidth  = 320
-	fbHeight = 240
+	fbWidth  = 1280
+	fbHeight = 1024
 )
 
 // stubHost satisfies runloop.HostFramer for first bring-up. The real
