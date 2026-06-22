@@ -403,6 +403,34 @@ func TestFrame_PropagatesWriteClientDataError(t *testing.T) {
 	}
 }
 
+// Frame propagates a SendEntityUpdates write error. Isolate it from
+// WriteClientData overflow by clearing c.Edict (so WriteClientData
+// short-circuits), then cap c.Message to zero bytes so the per-entity
+// update walk fails on the first encoder byte. The BSP entity lump
+// declares a second entity past worldspawn so SpawnServer's
+// entity-spawn pass marks Edicts[2] (NumEdicts=3) non-free; the walk
+// then has at least one slot to emit + the zero-cap Message overflows.
+func TestFrame_PropagatesSendEntityUpdatesError(t *testing.T) {
+	bsp := buildHostBSP(t,
+		`{ "classname" "worldspawn" }
+		 { "classname" "info_player_start" "origin" "0 0 24" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	_, _, err := h.ConnectLoopback()
+	if err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	c := h.Static.Clients[0]
+	c.Spawned = true
+	c.Edict = nil                // bypass WriteClientData (compose helper short-circuits)
+	c.Message = sizebuf.New(nil) // zero cap -> SendEntityUpdates overflows on first byte
+	if err := h.Frame(0.05); !errors.Is(err, sizebuf.ErrSizeBufOverflow) {
+		t.Errorf("Frame: got %v; want sizebuf overflow from SendEntityUpdates", err)
+	}
+}
+
 // Frame propagates a SendClientFrames write error. We isolate the
 // SendClientFrames overflow from the now-eager WriteClientData
 // overflow by clearing the bound edict (so WriteClientData

@@ -65,6 +65,30 @@ type EntityBaseline struct {
 	Alpha    int
 }
 
+// EntityState is the live per-tic snapshot the client maintains for
+// every entity the server broadcast a svc_update for. The Apply arm
+// for [DecodedUpdate] writes into [State.Entities] keyed by EntityNum;
+// the renderer + animation systems read from there to draw the
+// current frame.
+//
+// Fields not present in the update message (the wire-format omits
+// fields whose U_* bit is unset) are seeded from the entity's
+// last-known [EntityBaseline] -- the upstream's
+// "entity_state_t state = ent->baseline; <decode deltas onto state>"
+// idiom inside CL_ParseUpdate. The Go port collapses the per-entity
+// "last-known state" into this single struct (rather than the
+// upstream's baseline+deltabits+lerp_origin/lerp_angles split) so
+// the per-tic mutation is a single map write.
+type EntityState struct {
+	ModelIdx int
+	Frame    int
+	ColorMap int
+	SkinNum  int
+	Effects  int
+	Origin   [3]float32
+	Angles   [3]float32
+}
+
 // LightStyle is one of the 64 named light animation strings.
 // Each byte is one frame; 'a' = dim, 'z' = bright. tyrquake:
 // lightstyle_t.map in NQ/client.h (the .length field is implicit
@@ -171,6 +195,19 @@ type State struct {
 	// the broadcast lands by counting Baselines after the handshake
 	// drain.
 	Baselines map[int]EntityBaseline
+
+	// Entities is the live per-tic state cache the [Apply] arm for
+	// [DecodedUpdate] mutates. Keyed by entity index (matches
+	// Baselines). On the first DecodedUpdate for an entity the arm
+	// seeds the entry from Baselines[entNum] (so omitted fields keep
+	// their last-known-good value), then overlays the U_*-bit-flagged
+	// fields from the update message. tyrquake: the cl_entities[]
+	// table's per-entity origin/angles/frame/skin slots mutated
+	// inside CL_ParseUpdate.
+	//
+	// Like Baselines, the map is allocated by [NewState] + reset by
+	// [State.Clear] so per-map state doesn't leak.
+	Entities map[int]EntityState
 }
 
 // ErrAlreadyConnected is returned by [State.SetConnecting] when
@@ -189,6 +226,7 @@ func NewState() *State {
 	return &State{
 		Message:   sizebuf.New(make([]byte, MaxClientMessage)),
 		Baselines: make(map[int]EntityBaseline),
+		Entities:  make(map[int]EntityState),
 	}
 }
 
@@ -209,6 +247,7 @@ func (s *State) Clear() {
 		Spawned:    s.Spawned,
 		Message:    buf,
 		Baselines:  make(map[int]EntityBaseline),
+		Entities:   make(map[int]EntityState),
 	}
 }
 

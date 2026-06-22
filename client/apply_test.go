@@ -7,6 +7,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/go-quake1/engine/protocol"
 )
 
 // unknownDecoded is a Decoded variant defined ONLY in this test file,
@@ -561,8 +563,163 @@ func TestApply_Baseline_MultipleEntities(t *testing.T) {
 	}
 }
 
+// --- DecodedUpdate ------------------------------------------------------
+
+// applyUpdate full-mask path: every U_* bit set, every field copied
+// from the message into State.Entities[EntityNum]. The bring-up
+// server-side helper (server.SendEntityUpdates) emits this shape so
+// this test is the matching client-side proof.
+func TestApply_Update_FullMask_CachesIntoEntities(t *testing.T) {
+	s := NewState()
+	upd := DecodedUpdate{
+		EntityNum: 42,
+		Bits: protocol.UOrigin1 | protocol.UOrigin2 | protocol.UOrigin3 |
+			protocol.UAngle1 | protocol.UAngle2 | protocol.UAngle3 |
+			protocol.UModel | protocol.UFrame | protocol.UColorMap |
+			protocol.USkin | protocol.UEffects,
+		Origin:   [3]float32{1, 2, 3},
+		Angles:   [3]float32{45, 90, 180},
+		Model:    7,
+		Frame:    5,
+		ColorMap: 2,
+		Skin:     1,
+		Effects:  0x10,
+	}
+	if err := Apply(s, upd, 1.5); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	got, ok := s.Entities[42]
+	if !ok {
+		t.Fatalf("Entities[42] missing; map = %v", s.Entities)
+	}
+	want := EntityState{
+		ModelIdx: 7,
+		Frame:    5,
+		ColorMap: 2,
+		SkinNum:  1,
+		Effects:  0x10,
+		Origin:   [3]float32{1, 2, 3},
+		Angles:   [3]float32{45, 90, 180},
+	}
+	if got != want {
+		t.Errorf("Entities[42]: got %+v want %+v", got, want)
+	}
+}
+
+// applyUpdate lazy-alloc path: caller built a State without NewState
+// (Entities is nil) -- the arm must allocate before writing.
+func TestApply_Update_LazilyAllocatesEntities(t *testing.T) {
+	s := &State{} // no NewState; Entities is nil
+	if err := Apply(s, DecodedUpdate{EntityNum: 1, Bits: protocol.UModel, Model: 9}, 0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.Entities == nil {
+		t.Fatal("Entities: got nil want allocated")
+	}
+	if s.Entities[1].ModelIdx != 9 {
+		t.Errorf("Entities[1].ModelIdx: got %d want 9", s.Entities[1].ModelIdx)
+	}
+}
+
+// applyUpdate seeds from Baselines on first sight of an entity (so a
+// partial update doesn't zero the unflagged fields). Successive
+// updates carry forward the previous live state instead of re-seeding.
+func TestApply_Update_SeedsFromBaseline_ThenCarriesForward(t *testing.T) {
+	s := NewState()
+	s.Baselines[7] = EntityBaseline{
+		ModelIdx: 4,
+		Frame:    2,
+		Origin:   [3]float32{10, 20, 30},
+		Angles:   [3]float32{0, 90, 0},
+	}
+
+	// First update: only U_ORIGIN1 -- the new x-coord overrides
+	// baseline's x, every other field inherits.
+	first := DecodedUpdate{EntityNum: 7, Bits: protocol.UOrigin1, Origin: [3]float32{99, 0, 0}}
+	if err := Apply(s, first, 0); err != nil {
+		t.Fatalf("Apply[1]: %v", err)
+	}
+	got1 := s.Entities[7]
+	if got1.Origin != ([3]float32{99, 20, 30}) {
+		t.Errorf("first Origin: got %v want [99 20 30] (x overridden; y/z from baseline)", got1.Origin)
+	}
+	if got1.ModelIdx != 4 || got1.Frame != 2 || got1.Angles != ([3]float32{0, 90, 0}) {
+		t.Errorf("first inherited fields: got %+v (lost baseline)", got1)
+	}
+
+	// Second update: only U_FRAME -- the new frame overrides the live
+	// (post-first-update) state, NOT the baseline. So Origin stays at
+	// {99, 20, 30}, NOT back to {10, 20, 30}.
+	second := DecodedUpdate{EntityNum: 7, Bits: protocol.UFrame, Frame: 8}
+	if err := Apply(s, second, 0); err != nil {
+		t.Fatalf("Apply[2]: %v", err)
+	}
+	got2 := s.Entities[7]
+	if got2.Frame != 8 {
+		t.Errorf("second Frame: got %d want 8", got2.Frame)
+	}
+	if got2.Origin != ([3]float32{99, 20, 30}) {
+		t.Errorf("second Origin: got %v want [99 20 30] (carried from previous live state)", got2.Origin)
+	}
+}
+
+// applyUpdate with no baseline + no prior entity entry: the seed
+// falls back to a zero EntityState, then the U_*-flagged fields
+// overlay. (Server might emit an update for an entity the baseline
+// broadcast missed -- the arm must not panic.)
+func TestApply_Update_NoBaseline_ZeroSeed(t *testing.T) {
+	s := NewState()
+	upd := DecodedUpdate{
+		EntityNum: 5,
+		Bits:      protocol.UOrigin1,
+		Origin:    [3]float32{7, 0, 0},
+	}
+	if err := Apply(s, upd, 0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	got := s.Entities[5]
+	if got.Origin != ([3]float32{7, 0, 0}) {
+		t.Errorf("Origin: got %v want [7 0 0]", got.Origin)
+	}
+	if got.ModelIdx != 0 || got.Frame != 0 {
+		t.Errorf("unflagged fields: got %+v want zero", got)
+	}
+}
+
+// Per-axis U_ORIGIN/U_ANGLE bit gating: emitting only U_ORIGIN2 +
+// U_ANGLE3 leaves the other axes at their baseline (or zero if
+// missing). Covers the per-axis branch coverage end of applyUpdate.
+func TestApply_Update_PerAxisGating(t *testing.T) {
+	s := NewState()
+	s.Baselines[3] = EntityBaseline{
+		Origin: [3]float32{1, 2, 3},
+		Angles: [3]float32{10, 20, 30},
+	}
+	upd := DecodedUpdate{
+		EntityNum: 3,
+		Bits:      protocol.UOrigin2 | protocol.UAngle3,
+		Origin:    [3]float32{0, 99, 0},
+		Angles:    [3]float32{0, 0, 77},
+	}
+	if err := Apply(s, upd, 0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	got := s.Entities[3]
+	if got.Origin != ([3]float32{1, 99, 3}) {
+		t.Errorf("Origin: got %v want [1 99 3]", got.Origin)
+	}
+	if got.Angles != ([3]float32{10, 20, 77}) {
+		t.Errorf("Angles: got %v want [10 20 77]", got.Angles)
+	}
+}
+
 // --- Documented no-op arms (Print/StuffText/Finale/Cutscene/SellScreen/
-// KilledMonster/FoundSecret/Particle/Sound/Update) -----------------------
+// KilledMonster/FoundSecret/Particle/Sound) -----------------------------
+//
+// DecodedUpdate USED to be on this list (the per-entity state cache
+// hadn't been wired yet); now applyUpdate mutates [State.Entities],
+// so it has its own happy-path test below + is excluded from the
+// no-op sweep.
 
 func TestApply_DocumentedNoOps_DoNotMutate(t *testing.T) {
 	cases := []struct {
@@ -578,7 +735,6 @@ func TestApply_DocumentedNoOps_DoNotMutate(t *testing.T) {
 		{"FoundSecret", DecodedFoundSecret{}},
 		{"Particle", DecodedParticle{Origin: [3]float32{1, 2, 3}, Count: 10}},
 		{"Sound", DecodedSound{EntityIdx: 5, SoundNum: 10, Volume: 200}},
-		{"Update", DecodedUpdate{EntityNum: 4, Bits: 0xf0}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

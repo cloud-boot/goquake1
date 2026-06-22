@@ -7,6 +7,8 @@ package client
 import (
 	"errors"
 	"fmt"
+
+	"github.com/go-quake1/engine/protocol"
 )
 
 // ErrApplyNilState is returned by [Apply] when state == nil.
@@ -122,6 +124,9 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 	case DecodedBaseline:
 		applyBaseline(state, m)
 		return nil
+	case DecodedUpdate:
+		applyUpdate(state, m)
+		return nil
 	case DecodedNop,
 		DecodedPrint,
 		DecodedStuffText,
@@ -131,15 +136,13 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 		DecodedKilledMonster,
 		DecodedFoundSecret,
 		DecodedParticle,
-		DecodedSound,
-		DecodedUpdate:
+		DecodedSound:
 		// Documented no-op arms:
 		//   - Nop:                       connection-alive heartbeat
 		//   - Print / StuffText:         renderer/UI + console concern
 		//   - Finale / Cutscene / SellScreen: UI-state transitions
 		//   - KilledMonster / FoundSecret:    gameplay sound triggers
 		//   - Particle / Sound:          particle pool + sound mixer (separate layers)
-		//   - Update:                    per-tic delta cache (separate layer)
 		return nil
 	}
 	return fmt.Errorf("%w: %T", ErrApplyUnknown, msg)
@@ -254,4 +257,85 @@ func applyBaseline(state *State, m DecodedBaseline) {
 		Angles:   m.Angles,
 		Alpha:    m.Alpha,
 	}
+}
+
+// applyUpdate handles svc_update: seed the entity's live state from
+// the cached [EntityBaseline] (so fields whose U_* bit is unset keep
+// their last-known-good value), then overlay the U_*-bit-flagged
+// fields from the message.
+//
+// Lazily allocates [State.Entities] so callers that constructed a
+// State without going through [NewState] don't crash on the first
+// arm. Missing baseline = zero EntityState seed (the upstream
+// allocates entities lazily on the first parse too; entities the
+// server emits an update for without a prior baseline appear as
+// "default state + the update's bits").
+//
+// tyrquake: CL_ParseUpdate -- the "entity_state_t state = ent->baseline;
+// <decode delta bits onto state>; ent->state = state;" body.
+func applyUpdate(state *State, m DecodedUpdate) {
+	if state.Entities == nil {
+		state.Entities = make(map[int]EntityState)
+	}
+
+	// Seed from the last-known live state if present (so successive
+	// updates carry forward unchanged fields); fall back to the
+	// baseline; finally to zero. The upstream's idiom is
+	// "state = ent->baseline" every time -- the Go port prefers the
+	// last live state because the bring-up always emits full origins
+	// + angles in the update (the delta-encoded fields haven't been
+	// implemented yet, so missing fields are genuinely "no change",
+	// not "back to baseline").
+	es, ok := state.Entities[m.EntityNum]
+	if !ok {
+		if bl, hadBaseline := state.Baselines[m.EntityNum]; hadBaseline {
+			es = EntityState{
+				ModelIdx: bl.ModelIdx,
+				Frame:    bl.Frame,
+				ColorMap: bl.ColorMap,
+				SkinNum:  bl.SkinNum,
+				Origin:   bl.Origin,
+				Angles:   bl.Angles,
+			}
+		}
+	}
+
+	// Overlay each U_*-bit-flagged field from the decoded message.
+	// Per-axis origin / angles are individually gated by the upstream
+	// wire format -- the encoder emits only the axes whose bit is set.
+	if m.Bits&protocol.UOrigin1 != 0 {
+		es.Origin[0] = m.Origin[0]
+	}
+	if m.Bits&protocol.UOrigin2 != 0 {
+		es.Origin[1] = m.Origin[1]
+	}
+	if m.Bits&protocol.UOrigin3 != 0 {
+		es.Origin[2] = m.Origin[2]
+	}
+	if m.Bits&protocol.UAngle1 != 0 {
+		es.Angles[0] = m.Angles[0]
+	}
+	if m.Bits&protocol.UAngle2 != 0 {
+		es.Angles[1] = m.Angles[1]
+	}
+	if m.Bits&protocol.UAngle3 != 0 {
+		es.Angles[2] = m.Angles[2]
+	}
+	if m.Bits&protocol.UModel != 0 {
+		es.ModelIdx = m.Model
+	}
+	if m.Bits&protocol.UFrame != 0 {
+		es.Frame = m.Frame
+	}
+	if m.Bits&protocol.UColorMap != 0 {
+		es.ColorMap = m.ColorMap
+	}
+	if m.Bits&protocol.USkin != 0 {
+		es.SkinNum = m.Skin
+	}
+	if m.Bits&protocol.UEffects != 0 {
+		es.Effects = m.Effects
+	}
+
+	state.Entities[m.EntityNum] = es
 }

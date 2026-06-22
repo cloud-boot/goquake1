@@ -77,6 +77,14 @@ type Host struct {
 	// entity-pointer opcodes. nil = arena is still published on
 	// Server.Arena but not handed to the VM mid-SpawnServer.
 	onArenaReady func(arena *progs.EdictArena)
+
+	// LastEntityUpdatesSent is the cumulative count of svc_update
+	// messages the most recent [Host.Frame] call appended to client
+	// Message buffers, summed across every active+spawned client.
+	// Exposed for bring-up instrumentation (the quake-tamago main
+	// reads it per 60 frames to log update flow); not used by the
+	// per-tic loop itself.
+	LastEntityUpdatesSent int
 }
 
 // ErrNilDep fires on a missing required NewHost dependency.
@@ -303,6 +311,32 @@ func (h *Host) Frame(dt float32) error {
 		if err := h.Server.WriteClientData(c, p); err != nil {
 			return err
 		}
+	}
+
+	// Per-client svc_update broadcast. Runs AFTER WriteClientData
+	// (so the player-snapshot bytes lead the message) but BEFORE
+	// SendClientFrames so the per-entity updates land BEFORE the
+	// generic Datagram/ReliableDatagram bytes -- matching the
+	// SV_WriteEntitiesToClient -> reliable_datagram/datagram append
+	// order inside SV_SendClientDatagram.
+	//
+	// Bring-up shape: emits a full origin+angles update for every
+	// non-free entity past slot 0 -- no PVS culling, no delta
+	// bit encoding. The client's apply arm caches the updates in
+	// State.Entities. Bandwidth optimization (PVS + delta bits) is
+	// a follow-up batch.
+	//
+	// A nil Progs short-circuits ComposeBaselineFromEdict internally;
+	// every read degrades to the QC zero default. The emit path still
+	// runs (the wire format doesn't care about which fields were
+	// "real" QC data vs zeroes).
+	h.LastEntityUpdatesSent = 0
+	for _, c := range h.Static.Clients {
+		stat, err := h.Server.SendEntityUpdates(c, p, h.Static.MaxClients)
+		if err != nil {
+			return err
+		}
+		h.LastEntityUpdatesSent += stat.Emitted
 	}
 
 	// SendClientFrames is best-effort per-client; its PerClientErrs

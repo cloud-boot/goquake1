@@ -695,6 +695,17 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				runner.Client.Velocity, runner.Client.ViewHeightOffset, runner.Client.Health,
 				surfaces.Len(),
 				active, enginesound.MixBufferStereoFrames)
+
+			// Per-tic svc_update flow. The server-side host.Frame stamps
+			// the cumulative emit count onto LastEntityUpdatesSent every
+			// tic; the client-side State.Entities map is the matching
+			// receive cache (applyUpdate writes into it). Comparing the
+			// two surfaces a "channel works" signal: M sent should equal
+			// (or eventually equal, after the first tic) K received.
+			if realHost != nil {
+				fmt.Printf("QUAKE: updates tic %d -- %d entities sent / %d entities received in state.Entities\n",
+					frame, realHost.LastEntityUpdatesSent, len(runner.Client.Entities))
+			}
 		}
 
 		// Rasterize each visible face via TransformFace + FillTexturedPolygon.
