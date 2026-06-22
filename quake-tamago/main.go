@@ -117,10 +117,13 @@ const (
 //
 //   - viewAngles.Yaw = frame % 360 (full panoramic every 360 frames,
 //     ~6 s at 60 Hz). Pitch + roll forced to 0.
-//   - viewOrigin steps through demoWaypoints every 600 frames
-//     (~10 s) so multi-shot screendump runs land in geometrically
-//     distinct parts of the map -- exposing different miptex sets,
-//     different alias entities, different leaves.
+//   - viewOrigin steps through demoWaypoints every
+//     demoWaypointPeriodSeconds seconds of sv.time so multi-shot
+//     screendump runs land in geometrically distinct parts of the
+//     map -- exposing different miptex sets, different alias
+//     entities, different leaves. Driving the cadence off sv.time
+//     (not the frame counter) keeps dwells consistent across TCG /
+//     hardware regardless of the Pre2DDraw frame rate.
 //
 // The waypoint set is seeded from pickInMapCamera at runtime (so the
 // anchor is always inside a valid leaf) + the BSP bbox corners
@@ -135,15 +138,20 @@ const demoOrbit = true
 // is a one-shot per-frame rasterize, not a temporal sampler).
 const demoYawPeriodFrames = 360
 
-// demoWaypointPeriodFrames is how many frames each waypoint holds
-// before the next one takes over. The Pre2DDraw cadence on QEMU TCG
-// headless lands around 1 frame/s (the BSP walk + alias pass + miptex
-// rasterize is the slow path on TCG without KVM); 8 frames per waypoint
-// is ~8 s of wall-clock per waypoint there, which fits a 30 s
-// multi-shot capture comfortably. On a hardware build the same setting
-// gives sub-second dwells, which is fine -- each screendump is still
-// guaranteed to land cleanly inside one waypoint window.
-const demoWaypointPeriodFrames = 8
+// demoWaypointPeriodSeconds is how long (in sv.time seconds) each
+// waypoint holds before the next one takes over. Driving the cadence
+// off sv.time instead of the frame counter decouples waypoint dwells
+// from the Pre2DDraw frame rate -- QEMU TCG headless lands around 1
+// frame/s (the BSP walk + alias pass + miptex rasterize is the slow
+// path on TCG without KVM) while hardware builds run 60+ frames/s,
+// and a fixed frame-count period would mean the cycle takes minutes
+// in one environment + sub-second in the other.
+//
+// 2 s/waypoint means the 4-waypoint set cycles once every 8 s of
+// game time regardless of whether the host is rendering 1 fps or
+// 60 fps, which matches the capture_waypoints.sh harness cadence
+// (one PPM per waypoint at t = 1 s, 3 s, 5 s, 7 s).
+const demoWaypointPeriodSeconds = 2.0
 
 // stubHost satisfies runloop.HostFramer for first bring-up. The real
 // id-Software game-server tick wires in a follow-up batch; for now
@@ -779,13 +787,24 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 		// viewAngles never moves, so the headless QEMU run would
 		// capture the same frame forever. The override winds Yaw at
 		// one degree per frame + (optionally) steps viewOrigin
-		// through demoWaypoints every demoWaypointPeriodFrames so
-		// multi-shot screendump runs expose geometrically distinct
-		// parts of the map (different miptex sets, different alias
-		// entities visible per shot).
+		// through demoWaypoints every demoWaypointPeriodSeconds of
+		// sv.time so multi-shot screendump runs expose geometrically
+		// distinct parts of the map (different miptex sets, different
+		// alias entities visible per shot). The waypoint selector is
+		// time-based (sv.time / period) rather than frame-based so
+		// the dwell stays consistent across TCG (~1 fps) + hardware
+		// (~60+ fps) -- the capture_waypoints.sh harness depends on
+		// this to land one PPM cleanly inside each waypoint window.
 		waypointIdx := -1
 		if demoOrbit && len(demoWaypoints) > 0 {
-			waypointIdx = (frame / demoWaypointPeriodFrames) % len(demoWaypoints)
+			svTime := float32(0)
+			if realHost != nil {
+				svTime = float32(realHost.Server.Time)
+			}
+			waypointIdx = int(svTime/demoWaypointPeriodSeconds) % len(demoWaypoints)
+			if waypointIdx < 0 {
+				waypointIdx = 0
+			}
 			viewOrigin = demoWaypoints[waypointIdx]
 			viewAngles = [3]float32{
 				0, // pitch
@@ -2087,7 +2106,7 @@ func pickInMapCamera(bm *model.BrushModel, file *bspfile.File) [3]float32 {
 
 // buildDemoWaypoints returns a small set of in-map (PointInLeaf >= 1)
 // view origins the demo-orbit override cycles through every
-// demoWaypointPeriodFrames frames. The set is seeded with anchor
+// demoWaypointPeriodSeconds seconds of sv.time. The set is seeded with anchor
 // (the pickInMapCamera result, guaranteed in a leaf) + a handful of
 // lattice probes biased toward the bbox extents at the same z so
 // different captures expose different miptex sets / alias entities.

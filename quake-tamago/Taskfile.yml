@@ -103,8 +103,15 @@ tasks:
         wait $QPID 2>/dev/null || true
       - test -s "{{.PPM}}" && echo "wrote {{.PPM}} ($(wc -c < {{.PPM}}) bytes)"
 
+  capture-waypoints:
+    desc: Boot QEMU headless + capture one PPM per demo-orbit waypoint (4 PPMs to /tmp/quake-orbit-NN.ppm).
+    deps: [build]
+    cmds:
+      - "{{.TASKFILE_DIR}}/capture_waypoints.sh"
+
   clean:
     desc: Remove build artifacts + any captured PPM/log files.
     cmds:
       - rm -rf {{.TASKFILE_DIR}}/build
       - rm -f {{.PPM}} {{.SERIAL}} {{.MON}}
+      - rm -f /tmp/quake-orbit-*.ppm /tmp/quake-orbit-serial.log /tmp/quake-orbit-mon.sock
