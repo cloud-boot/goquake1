@@ -209,6 +209,46 @@ func TestTick_SignonStage4TransitionsToConnected(t *testing.T) {
 	}
 }
 
+// TestTick_WireDrivenSignonHandshake exercises the full
+// Disconnected → Connecting → Connected walk that
+// server.SendSignonHandshake's byte stream produces. Starting from
+// StateDisconnected (no caller-side SetConnecting), push the same
+// stage-byte sequence the server emits over the loopback
+// (signonnum{1,2,3,4}); a single client Tick must drain all four
+// stages + Apply them, with stage 1 driving the Connecting
+// transition and stage 4 driving MarkSpawned. Proves the wire path
+// the quake-tamago binary now relies on: the manual SetConnecting +
+// MarkSpawned hack in main.go is removable because the wire bytes
+// drive the lifecycle end-to-end.
+func TestTick_WireDrivenSignonHandshake(t *testing.T) {
+	st := NewState() // StateDisconnected default
+	cli, srv := server.NewLoopbackConn()
+
+	// Push the stage-byte tail (the relevant subset of the bytes
+	// SendSignonHandshake queues; the serverinfo prefix is exercised
+	// separately in server/signon_test.go + by other Apply tests).
+	pushFromServer(t, srv, []byte{
+		protocol.SvcSignonNum, 1,
+		protocol.SvcSignonNum, 2,
+		protocol.SvcSignonNum, 3,
+		protocol.SvcSignonNum, 4,
+	})
+
+	out, err := Tick(st, cli, defaultTickInput(), [3]float32{})
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if out.MessagesApplied != 4 {
+		t.Errorf("MessagesApplied: got %d want 4 (one per stage byte-pair)", out.MessagesApplied)
+	}
+	if st.Connection != StateConnected {
+		t.Errorf("Connection: got %v want StateConnected (wire path failed)", st.Connection)
+	}
+	if !st.Spawned {
+		t.Error("Spawned: got false want true (stage 4 should MarkSpawned)")
+	}
+}
+
 // --- outbound: short-circuits ---------------------------------------
 
 func TestTick_OutboundShortCircuit_Disconnected(t *testing.T) {

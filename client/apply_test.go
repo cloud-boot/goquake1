@@ -191,8 +191,76 @@ func TestApply_SignonNum_Stage4_FromConnected_WrapsErr(t *testing.T) {
 	}
 }
 
-func TestApply_SignonNum_Stages123_NoTransition(t *testing.T) {
-	for _, stage := range []int{1, 2, 3} {
+// TestApply_SignonNum_Stage1_FromDisconnected_DrivesConnecting asserts
+// the wire-driven establish-connection rule applySignonNum implements:
+// the first svc_signonnum byte (stage 1) from a Disconnected client
+// transitions it into StateConnecting, matching the C upstream's
+// CL_EstablishConnection (cls.state = ca_connected) but driven by the
+// server's wire bytes instead of a caller-side pre-step. Spawned stays
+// false until stage 4 lands.
+func TestApply_SignonNum_Stage1_FromDisconnected_DrivesConnecting(t *testing.T) {
+	s := NewState()
+	if err := Apply(s, DecodedSignonNum{Stage: 1}, 0); err != nil {
+		t.Fatalf("stage 1: Apply: %v", err)
+	}
+	if s.Connection != StateConnecting {
+		t.Errorf("stage 1: Connection got %d want StateConnecting", s.Connection)
+	}
+	if s.Spawned {
+		t.Error("stage 1: Spawned flipped true")
+	}
+}
+
+// TestApply_SignonNum_Stage1_FromConnecting_NoChange covers the
+// idempotence guard: a stage-1 retransmit on an already-Connecting
+// state must not error (SetConnecting rejects StateConnecting), and
+// must leave Connection untouched.
+func TestApply_SignonNum_Stage1_FromConnecting_NoChange(t *testing.T) {
+	s := NewState()
+	if err := s.SetConnecting(); err != nil {
+		t.Fatalf("SetConnecting: %v", err)
+	}
+	if err := Apply(s, DecodedSignonNum{Stage: 1}, 0); err != nil {
+		t.Fatalf("stage 1: Apply: %v", err)
+	}
+	if s.Connection != StateConnecting {
+		t.Errorf("stage 1: Connection got %d want StateConnecting", s.Connection)
+	}
+	if s.Spawned {
+		t.Error("stage 1: Spawned flipped true")
+	}
+}
+
+// TestApply_SignonNum_Stage1_FromConnected_NoChange covers the
+// post-spawn retransmit case: a stale stage-1 byte arriving after the
+// client has already reached StateConnected must not regress the
+// state. SetConnecting would reject StateConnected; the
+// applySignonNum guard short-circuits before calling it.
+func TestApply_SignonNum_Stage1_FromConnected_NoChange(t *testing.T) {
+	s := NewState()
+	if err := s.SetConnecting(); err != nil {
+		t.Fatalf("SetConnecting: %v", err)
+	}
+	if err := s.MarkSpawned(); err != nil {
+		t.Fatalf("MarkSpawned: %v", err)
+	}
+	if err := Apply(s, DecodedSignonNum{Stage: 1}, 0); err != nil {
+		t.Fatalf("stage 1: Apply: %v", err)
+	}
+	if s.Connection != StateConnected {
+		t.Errorf("stage 1: Connection regressed (got %d want StateConnected)", s.Connection)
+	}
+	if !s.Spawned {
+		t.Error("stage 1: Spawned regressed to false")
+	}
+}
+
+// TestApply_SignonNum_Stages23_NoTransition asserts stages 2 + 3 are
+// pure no-ops on any starting state (the upstream uses them as
+// triggers for outbound clc_stringcmd commands the Go port doesn't
+// yet emit).
+func TestApply_SignonNum_Stages23_NoTransition(t *testing.T) {
+	for _, stage := range []int{2, 3} {
 		s := NewState()
 		if err := Apply(s, DecodedSignonNum{Stage: stage}, 0); err != nil {
 			t.Fatalf("stage %d: Apply: %v", stage, err)

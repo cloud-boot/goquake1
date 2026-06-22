@@ -156,17 +156,42 @@ func applyServerInfo(state *State, m DecodedServerInfo) error {
 	return nil
 }
 
-// applySignonNum handles the signon-handshake stage byte. Only
-// stage 4 (post-spawn signon) drives a state transition --
-// stages 1/2/3 are caller-side handshake markers Apply just
-// acknowledges. tyrquake: CL_SignonReply.
+// applySignonNum handles the signon-handshake stage byte. Stage 1
+// is the wire-driven equivalent of CL_EstablishConnection: when the
+// client sees the first signonnum byte from a server, it knows the
+// handshake has started and transitions itself into [StateConnecting]
+// (a no-op when already past Disconnected, e.g. when the caller pre-
+// drove the transition via [State.SetConnecting]). Stages 2 and 3
+// are caller-side handshake markers Apply just acknowledges. Stage 4
+// (post-spawn signon) drives the final transition to [StateConnected]
+// via [State.MarkSpawned]. tyrquake: CL_SignonReply -- the upstream
+// C engine sets cls.state = ca_connected in CL_EstablishConnection
+// BEFORE any wire bytes arrive; the Go port collapses that into the
+// stage-1 handler so a server emitting svc_signonnum(1) drives the
+// client's lifecycle directly, with no caller-side pre-step needed.
 func applySignonNum(state *State, m DecodedSignonNum) error {
-	if m.Stage != 4 {
+	switch m.Stage {
+	case 1:
+		// Wire-driven establish: bring an undriven (StateDisconnected)
+		// state into StateConnecting so the upcoming stage-4 byte can
+		// MarkSpawned cleanly. Already-connecting / already-connected
+		// states are left untouched -- this is idempotent on retransmit.
+		if state.Connection == StateDisconnected {
+			// SetConnecting's only failure path is "not in
+			// StateDisconnected"; the guard above rules it out, so the
+			// error return is structurally unreachable here.
+			_ = state.SetConnecting()
+		}
+		return nil
+	case 4:
+		if err := state.MarkSpawned(); err != nil {
+			return &applyBadStateErr{underlying: err}
+		}
 		return nil
 	}
-	if err := state.MarkSpawned(); err != nil {
-		return &applyBadStateErr{underlying: err}
-	}
+	// Stages 2 + 3 are no-op acknowledgements -- the C upstream uses
+	// them as triggers for outbound clc_stringcmd commands (prespawn /
+	// spawn), which the Go port doesn't yet emit.
 	return nil
 }
 
