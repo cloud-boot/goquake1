@@ -523,14 +523,12 @@ func run() error {
 		return fmt.Errorf("NewRunnerFromVFS: %w", err)
 	}
 
-	// 11. Print something visible into the console so the rendered
-	//     frame is not blank. Drop the console fully open so the lines
-	//     are visible from frame 0 (otherwise ConCurrent=0 keeps the
-	//     drop-down closed and the synthetic conchars sheet has nothing
-	//     to draw against).
+	// 11. Seed the console buffer with a couple of bring-up lines. The
+	//     console drop-down stays closed (ConCurrent=0) so it doesn't
+	//     overlay the 3D scene; the user can drop it open via the
+	//     in-game console binding when that lands.
 	runner.Console.Print("PURE-GO QUAKE 1 -- TamaGo + go-virtio bring-up\n")
 	runner.Console.Print("runloop wired: input -> client.Tick -> host.Frame -> Pre2DDraw\n")
-	runner.Screen.ConCurrent = runner.Screen.ConLines
 
 	// 11b. Seed the sound pool with a few WAV samples from the pak so
 	//     the runloop's existing Paint + QueueAudio path has something
