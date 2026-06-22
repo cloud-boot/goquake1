@@ -942,7 +942,161 @@ func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
 	if err := h.SpawnServer(mapSlug, protocol.VersionNQ); err != nil {
 		return nil, fmt.Errorf("buildHost: SpawnServer(%q): %w", mapSlug, err)
 	}
+
+	// 8. PutClientInServer dispatch. The QC "PutClientInServer" function
+	//    is the canonical NQ id1 entrypoint that initialises a fresh
+	//    player edict's stats (.health = 100, .items = IT_SHOTGUN|IT_AXE,
+	//    .weapon = IT_SHOTGUN, .view_ofs = '0 0 22', ammo counts, etc.)
+	//    via the QC "self" pointer. In the C upstream it runs from
+	//    SV_SendClientReconnect (NQ/sv_user.c:890) after ClientConnect,
+	//    once per client per signon stage 4 + on every respawn.
+	//
+	//    The Go port doesn't have the full signon-stage-4 + respawn
+	//    cycle wired yet (Server.Static.Clients are bound via
+	//    ConnectLoopback in the run() caller AFTER buildHost returns,
+	//    and the wire-driven "spawn" stringcmd isn't parsed yet). This
+	//    one-shot dispatch fires PutClientInServer ONCE post-SpawnServer
+	//    so the player edict carries non-zero health/items/weapon/view_ofs
+	//    by the time the first per-tic ComposeClientDataFromEdict reads
+	//    them off the edict for the svc_clientdata payload -- otherwise
+	//    every wire-borne ClientData frame would carry the bytecode
+	//    defaults (health = 0, items = 0, view_ofs = '0 0 0') and the
+	//    client-side State.Health / State.ViewHeightOffset stay zero.
+	//
+	//    Sequence:
+	//      a. Locate the player edict (Server.Edicts[1] -- slot 0 is
+	//         the world). Missing pool = silent skip (the test stub
+	//         path that never reaches here).
+	//      b. SetNewParms() (if the function exists). The upstream calls
+	//         this from SV_ConnectClient (NQ/sv_main.c:457) to seed the
+	//         per-client parm1..parm16 globals with the starting
+	//         spawn-state. PutClientInServer then reads those parms +
+	//         copies them into the per-edict fields. Skip silently when
+	//         the function isn't defined; the parms stay at their
+	//         bytecode defaults.
+	//      c. Set the QC "self" global to point at the player edict
+	//         (same encoding as the SpawnFn dispatch in step 6 -- the
+	//         arena-MakePointer byte-offset, fallback to slot index for
+	//         arena-less test stubs).
+	//      d. Set the QC "time" global to sv.time (matching the
+	//         thinkCaller pattern in host.go:497). PutClientInServer
+	//         reads it for time-stamping the spawn (e.g. .takedamage
+	//         deadline). Silently skip when the global isn't defined.
+	//      e. vm.Run("PutClientInServer"). VM errors are logged + the
+	//         buildHost continues; the field defaults left after a
+	//         partial dispatch are still better than the pure-zero
+	//         pre-dispatch state.
+	//      f. Log the post-dispatch field readout (health, view_ofs[2],
+	//         items, weapon) so the serial console proves the QC
+	//         actually populated the entvars.
+	//
+	//    Scope deliberately narrow: this does NOT wire the full
+	//    signon-4 + respawn cycle (SetNewParms-per-respawn,
+	//    ClientConnect-per-connect, PutClientInServer-per-respawn);
+	//    one initial pass is enough to prove the dispatch path + give
+	//    the per-tic svc_clientdata back-channel real values to
+	//    propagate.
+	dispatchPutClientInServer(h, vm, p)
+
 	return h, nil
+}
+
+// dispatchPutClientInServer runs the NQ id1 QC "PutClientInServer"
+// function (with a SetNewParms warm-up when defined) against the
+// player edict at Server.Edicts[1]. See the step-8 comment in
+// [buildHost] for the rationale + the full upstream-mapping. Logs
+// the post-dispatch entvars readout to the serial console.
+//
+// All lookups are tolerant: a progs.dat that strips any of these
+// symbols (test fixtures, custom QC) silently skips the affected
+// step + the rest of the dispatch continues. A vm.Run error is
+// logged + execution proceeds -- a partial dispatch still leaves
+// the player edict closer to the canonical spawn state than the
+// pure-zero pre-dispatch defaults.
+func dispatchPutClientInServer(h *enginehost.Host, vm *progs.VM, p *progs.Progs) {
+	if h == nil || vm == nil || p == nil {
+		return
+	}
+	// Player edict lives at slot 1 (slot 0 is the world, slots
+	// 1..MaxClients are clients). A short pool (the test stub path
+	// that never reaches here) is silently skipped.
+	if len(h.Server.Edicts) < 2 {
+		return
+	}
+	player := h.Server.Edicts[1]
+	if player == nil {
+		return
+	}
+
+	// Seed the "time" global so QC reads of "time" inside the dispatch
+	// see the current sv.time. Mirrors host.thinkCaller (host.go:497).
+	if timeDef := p.FindGlobal("time"); timeDef != nil {
+		_ = vm.SetGlobalFloat(int(timeDef.Ofs), float32(h.Server.Time))
+	}
+
+	// Seed "self" -- the entity-pointer encoding the spawn QC uses to
+	// resolve "self.field" reads/writes back to the player edict's
+	// field block. Same encoding as the SpawnFn dispatch (step 6).
+	selfDef := p.FindGlobal("self")
+	if selfDef != nil {
+		_ = vm.SetGlobalInt(int(selfDef.Ofs), edictSelfPointer(h, player))
+	}
+
+	// SetNewParms warm-up: populates parm1..parm16 globals with the
+	// starting spawn-state (health, weapon, ammo). PutClientInServer
+	// reads these to seed the per-edict fields. The C upstream calls
+	// SetNewParms from SV_ConnectClient before PutClientInServer; we
+	// fold them together because the Go port has no per-client
+	// connect step here yet. Skipped silently when undefined.
+	if _, snpIdx := p.FindFunction("SetNewParms"); snpIdx >= 1 {
+		if err := vm.Run(int32(snpIdx)); err != nil {
+			fmt.Printf("QUAKE: SetNewParms vm.Run err: %v\n", err)
+		} else {
+			fmt.Printf("QUAKE: SetNewParms dispatched -- starting spawn parms seeded\n")
+		}
+	}
+
+	// PutClientInServer: the actual edict-init function. Re-seed "self"
+	// in case SetNewParms clobbered it (the upstream rebinds self
+	// before every dispatch; cheap insurance).
+	if selfDef != nil {
+		_ = vm.SetGlobalInt(int(selfDef.Ofs), edictSelfPointer(h, player))
+	}
+	_, pcisIdx := p.FindFunction("PutClientInServer")
+	if pcisIdx < 1 {
+		fmt.Printf("QUAKE: PutClientInServer not found in progs.dat -- player edict stays at bytecode defaults\n")
+		return
+	}
+	if err := vm.Run(int32(pcisIdx)); err != nil {
+		fmt.Printf("QUAKE: PutClientInServer vm.Run err: %v\n", err)
+		// Fall through: log whatever the partial dispatch left behind.
+	}
+
+	// Post-dispatch readout. Proves the QC actually populated the
+	// entvars: a successful PutClientInServer leaves
+	// health=100, view_ofs=(0,0,22), items=(IT_SHOTGUN|IT_AXE)=4097,
+	// weapon=IT_SHOTGUN=1 on the player edict. Field-not-found
+	// errors are surfaced as "<unset>" so callers can distinguish
+	// "progs strips this field" from "field present but zero".
+	v, _ := progs.NewEntVars(p, player)
+	healthStr := "<unset>"
+	if hv, err := v.ReadFloat("health"); err == nil {
+		healthStr = fmt.Sprintf("%g", hv)
+	}
+	viewOfsStr := "<unset>"
+	if vo, err := v.ReadVec3("view_ofs"); err == nil {
+		viewOfsStr = fmt.Sprintf("(%g,%g,%g)", vo[0], vo[1], vo[2])
+	}
+	itemsStr := "<unset>"
+	if it, err := v.ReadFloat("items"); err == nil {
+		itemsStr = fmt.Sprintf("%g (0x%x)", it, int32(it))
+	}
+	weaponStr := "<unset>"
+	if wp, err := v.ReadFloat("weapon"); err == nil {
+		weaponStr = fmt.Sprintf("%g", wp)
+	}
+	fmt.Printf("QUAKE: PutClientInServer dispatched -- player edict 1 health=%s view_ofs=%s items=%s weapon=%s\n",
+		healthStr, viewOfsStr, itemsStr, weaponStr)
 }
 
 // edictSelfPointer returns the QC "self" pointer for ent: the per-
