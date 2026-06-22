@@ -53,7 +53,7 @@ jobs:
       - run: go version
 
       - name: go vet
-        run: go vet $(go list ./... | grep -vE '/(reference|quake-tamago|backend/virtio/realdev)($|/)')
+        run: go vet $(go list -e ./... | grep -vE '/(reference|quake-tamago|backend/virtio/realdev)($|/)')
 
       - name: gofmt
         run: |
@@ -68,7 +68,7 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          for pkg in $(go list ./... | grep -vE '/(reference|quake-tamago|backend/virtio/realdev)($|/)'); do
+          for pkg in $(go list -e ./... | grep -vE '/(reference|quake-tamago|backend/virtio/realdev)($|/)'); do
             pkg_short=$(echo "$pkg" | sed 's|github.com/go-quake1/engine/||')
             out=$(go test -cover "$pkg" 2>&1 | tail -n 1)
             echo "$out"
@@ -101,7 +101,7 @@ jobs:
       - run: go version
 
       - name: go test
-        run: go test $(go list ./... | grep -vE '/(reference|quake-tamago|backend/virtio/realdev)($|/)')
+        run: go test $(go list -e ./... | grep -vE '/(reference|quake-tamago|backend/virtio/realdev)($|/)')
 
   emulated:
     name: test (${{ matrix.arch }}, qemu)
@@ -142,7 +142,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p _qemu
-          for pkg in $(go list ./... | grep -vE '/(reference|quake-tamago|backend/virtio/realdev)($|/)'); do
+          for pkg in $(go list -e ./... | grep -vE '/(reference|quake-tamago|backend/virtio/realdev)($|/)'); do
             name=$(echo "$pkg" | tr '/.' '__')
             if go test -c -cover -o "_qemu/${name}.test" "$pkg"; then
               echo "built ${name}.test for $pkg"
