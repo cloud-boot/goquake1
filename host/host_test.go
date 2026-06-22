@@ -1017,3 +1017,272 @@ func TestProgs_ReturnsInstalled(t *testing.T) {
 		t.Errorf("Progs() = %p want %p (the Progs installed via SetProgs)", got, p)
 	}
 }
+
+// --- runThink (SV_RunThink-equivalent top-level walker) -------------------
+
+// runThink with a nil progsRef short-circuits (no fields to read).
+// Counters reset to zero regardless.
+func TestRunThink_NilProgsShortCircuits(t *testing.T) {
+	h, _ := makeHost(t, nil, 1)
+	h.SetProgs(nil)
+	h.LastThinksDispatched = 7
+	h.LastThinkErrors = 3
+	h.runThink()
+	if h.LastThinksDispatched != 0 || h.LastThinkErrors != 0 {
+		t.Errorf("counters not reset on nil-progs short-circuit: dispatched=%d errors=%d",
+			h.LastThinksDispatched, h.LastThinkErrors)
+	}
+}
+
+// runThink walks [1, NumEdicts) and bound-clips against
+// len(Server.Edicts) defensively. Empty pool -> no work, no panic.
+func TestRunThink_EmptyEdictPool(t *testing.T) {
+	h, _ := makeHost(t, nil, 1)
+	// Pre-spawn: Server.Edicts is nil-length, NumEdicts==0.
+	h.runThink()
+	if h.LastThinksDispatched != 0 || h.LastThinkErrors != 0 {
+		t.Errorf("pre-spawn runThink should be a no-op: dispatched=%d errors=%d",
+			h.LastThinksDispatched, h.LastThinkErrors)
+	}
+}
+
+// Happy path: spawn an entity with nextthink scheduled inside the
+// current tic's window + think pointing at the k42 function. runThink
+// fires it, clears nextthink to 0, and bumps LastThinksDispatched.
+func TestRunThink_DispatchesScheduledThink(t *testing.T) {
+	bsp := buildHostBSP(t,
+		`{ "classname" "worldspawn" }
+		 { "classname" "monster_test" "origin" "0 0 0" }`, 1)
+	h, p := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	// Advance sv.time so nextthink=0.5 is in-window.
+	h.Server.Time = 1.0
+	// Slot 1 is the reserved client slot; the parsed monster_test
+	// entity lands at slot 2 (the first post-client slot).
+	ent := h.Server.Edicts[2]
+	ev, err := progs.NewEntVars(p, ent)
+	if err != nil {
+		t.Fatalf("NewEntVars: %v", err)
+	}
+	if err := ev.WriteFloat("nextthink", 0.5); err != nil {
+		t.Fatalf("WriteFloat nextthink: %v", err)
+	}
+	if err := ev.WriteInt32("think", 1); err != nil {
+		t.Fatalf("WriteInt32 think: %v", err)
+	}
+
+	h.runThink()
+
+	if h.LastThinksDispatched != 1 {
+		t.Errorf("LastThinksDispatched got %d want 1", h.LastThinksDispatched)
+	}
+	if h.LastThinkErrors != 0 {
+		t.Errorf("LastThinkErrors got %d want 0", h.LastThinkErrors)
+	}
+	cleared, err := ev.ReadFloat("nextthink")
+	if err != nil {
+		t.Fatalf("re-read nextthink: %v", err)
+	}
+	if cleared != 0 {
+		t.Errorf("nextthink should be cleared to 0; got %v", cleared)
+	}
+	// Confirm the QC function actually ran (k42 returns 42 into OfsReturn).
+	got, err := h.VM.GlobalFloat(progs.OfsReturn)
+	if err != nil {
+		t.Fatalf("GlobalFloat(OfsReturn): %v", err)
+	}
+	if got != 42 {
+		t.Errorf("OfsReturn got %v want 42 (proves think dispatched)", got)
+	}
+}
+
+// nil edict slot AND a Free edict slot are both skipped silently.
+func TestRunThink_SkipsNilAndFree(t *testing.T) {
+	bsp := buildHostBSP(t,
+		`{ "classname" "worldspawn" }
+		 { "classname" "monster_test" "origin" "0 0 0" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	// Stretch the edict pool with a nil slot + a freed slot; neither
+	// should be dispatched.
+	h.Server.Edicts = append(h.Server.Edicts, nil)
+	freed := &progs.Edict{Free: true, Fields: make([]byte, 32)}
+	h.Server.Edicts = append(h.Server.Edicts, freed)
+	h.Server.NumEdicts = len(h.Server.Edicts)
+	h.runThink()
+	if h.LastThinksDispatched != 0 || h.LastThinkErrors != 0 {
+		t.Errorf("dispatched=%d errors=%d want both 0", h.LastThinksDispatched, h.LastThinkErrors)
+	}
+}
+
+// runThink clips NumEdicts down to len(Server.Edicts) so a corrupted
+// count past the allocated pool can't index out of range.
+func TestRunThink_ClipsNumEdictsToPoolLen(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	h.Server.NumEdicts = len(h.Server.Edicts) + 100 // past the pool
+	// No panic + counters stay zero (every in-pool slot is either
+	// the world (skipped via i:=1 start) or a fresh client slot
+	// with nextthink=0).
+	h.runThink()
+	if h.LastThinksDispatched != 0 || h.LastThinkErrors != 0 {
+		t.Errorf("dispatched=%d errors=%d want both 0", h.LastThinksDispatched, h.LastThinkErrors)
+	}
+}
+
+// nextthink == 0 (default) -> per-slot skip.
+func TestRunThink_NoThinkScheduledSkips(t *testing.T) {
+	bsp := buildHostBSP(t,
+		`{ "classname" "worldspawn" }
+		 { "classname" "monster_test" "origin" "0 0 0" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	h.runThink()
+	if h.LastThinksDispatched != 0 {
+		t.Errorf("LastThinksDispatched got %d want 0 (no nextthink scheduled)",
+			h.LastThinksDispatched)
+	}
+}
+
+// nextthink > sv.time -> per-slot skip (think is in the future).
+func TestRunThink_FutureThinkSkips(t *testing.T) {
+	bsp := buildHostBSP(t,
+		`{ "classname" "worldspawn" }
+		 { "classname" "monster_test" "origin" "0 0 0" }`, 1)
+	h, p := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	h.Server.Time = 1.0
+	ent := h.Server.Edicts[2] // monster_test at slot 2 (slot 1 = client)
+	ev, _ := progs.NewEntVars(p, ent)
+	_ = ev.WriteFloat("nextthink", 5.0) // future
+	_ = ev.WriteInt32("think", 1)
+	h.runThink()
+	if h.LastThinksDispatched != 0 {
+		t.Errorf("LastThinksDispatched got %d want 0 (think is in the future)",
+			h.LastThinksDispatched)
+	}
+}
+
+// nextthink field absent (stripped progs) -> per-slot skip (no error,
+// no dispatch). Strategy: install a progs with a "nextthink" name but
+// no FieldDef for it; ReadFloat surfaces ErrFieldNotFound.
+func TestRunThink_MissingNextthinkSkips(t *testing.T) {
+	bsp := buildHostBSP(t,
+		`{ "classname" "worldspawn" }
+		 { "classname" "monster_test" "origin" "0 0 0" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	// Swap to a progs that declares no fields at all -> ReadFloat
+	// surfaces ErrFieldNotFound for every edict.
+	stripped := &progs.Progs{
+		Header:  progs.Header{EntityFields: 8},
+		Strings: []byte{0},
+	}
+	h.SetProgs(stripped)
+	h.runThink()
+	if h.LastThinksDispatched != 0 || h.LastThinkErrors != 0 {
+		t.Errorf("dispatched=%d errors=%d; missing field should be silent skip",
+			h.LastThinksDispatched, h.LastThinkErrors)
+	}
+}
+
+// think field absent (only nextthink is declared) -> per-slot skip.
+func TestRunThink_MissingThinkSkips(t *testing.T) {
+	bsp := buildHostBSP(t,
+		`{ "classname" "worldspawn" }
+		 { "classname" "monster_test" "origin" "0 0 0" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	// Build a progs that declares nextthink (so the schedule check
+	// passes) but no "think" field -> ReadInt32 surfaces
+	// ErrFieldNotFound.
+	strs := []byte{0}
+	nextthinkName := addStr(&strs, "nextthink")
+	p2 := &progs.Progs{
+		Header:  progs.Header{EntityFields: 8},
+		Strings: strs,
+		FieldDefs: []progs.Def{
+			{Type: uint16(progs.EvFloat), Ofs: 7, SName: nextthinkName},
+		},
+	}
+	h.SetProgs(p2)
+	// Now arm nextthink on slot 1 via the new EntVars.
+	h.Server.Time = 1.0
+	ev, err := progs.NewEntVars(p2, h.Server.Edicts[2]) // monster_test slot
+	if err != nil {
+		t.Fatalf("NewEntVars: %v", err)
+	}
+	if err := ev.WriteFloat("nextthink", 0.5); err != nil {
+		t.Fatalf("WriteFloat: %v", err)
+	}
+	h.runThink()
+	if h.LastThinksDispatched != 0 || h.LastThinkErrors != 0 {
+		t.Errorf("dispatched=%d errors=%d; missing think field should be silent skip",
+			h.LastThinksDispatched, h.LastThinkErrors)
+	}
+}
+
+// thinkCaller error (funcID=0 -> ErrBadFunctionIndex) is swallowed
+// and tallied into LastThinkErrors -- the frame does NOT abort.
+func TestRunThink_ThinkCallerErrorTalliedAndSwallowed(t *testing.T) {
+	bsp := buildHostBSP(t,
+		`{ "classname" "worldspawn" }
+		 { "classname" "monster_test" "origin" "0 0 0" }`, 1)
+	h, p := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	h.Server.Time = 1.0
+	ev, _ := progs.NewEntVars(p, h.Server.Edicts[2]) // monster_test slot
+	_ = ev.WriteFloat("nextthink", 0.5)
+	_ = ev.WriteInt32("think", 0) // funcID 0 -> vm.Run returns ErrBadFunctionIndex
+	h.runThink()
+	if h.LastThinksDispatched != 0 {
+		t.Errorf("LastThinksDispatched got %d want 0 (dispatch failed)",
+			h.LastThinksDispatched)
+	}
+	if h.LastThinkErrors != 1 {
+		t.Errorf("LastThinkErrors got %d want 1 (failure should be tallied)",
+			h.LastThinkErrors)
+	}
+}
+
+// Frame calls runThink as part of the per-tic sequence. Smoke-test:
+// schedule a think + call Frame, expect LastThinksDispatched == 1.
+func TestFrame_InvokesRunThink(t *testing.T) {
+	bsp := buildHostBSP(t,
+		`{ "classname" "worldspawn" }
+		 { "classname" "monster_test" "origin" "0 0 0" }`, 1)
+	h, p := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	// Pre-arm: sv.time will be advanced by dt at the head of Frame,
+	// so a nextthink at the resulting sv.time fires this frame.
+	h.Server.Time = 0.5
+	ev, _ := progs.NewEntVars(p, h.Server.Edicts[2]) // monster_test slot
+	_ = ev.WriteFloat("nextthink", 0.55)             // <= 0.5 + 0.05 = 0.55 (post-advance sv.time)
+	_ = ev.WriteInt32("think", 1)
+	if err := h.Frame(0.05); err != nil {
+		t.Fatalf("Frame: %v", err)
+	}
+	if h.LastThinksDispatched != 1 {
+		t.Errorf("Frame should have dispatched 1 think; LastThinksDispatched=%d",
+			h.LastThinksDispatched)
+	}
+}

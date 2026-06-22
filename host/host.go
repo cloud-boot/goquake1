@@ -85,6 +85,27 @@ type Host struct {
 	// reads it per 60 frames to log update flow); not used by the
 	// per-tic loop itself.
 	LastEntityUpdatesSent int
+
+	// LastThinksDispatched is the number of QC think functions the
+	// most recent [Host.Frame] call fired through the top-level
+	// [Host.runThink] walker (the SV_RunThink-equivalent pass that
+	// runs BEFORE RunPhysics so MOVETYPE_PUSH / WALK / STEP / NONE+
+	// SolidNot edicts -- which the per-MOVETYPE physics dispatcher
+	// silent-skips -- still get their per-tic think drive). Counts
+	// only the walker's own dispatches; the per-handler RunThink
+	// calls inside the physics dispatch path are not counted here.
+	// Exposed for bring-up instrumentation (quake-tamago logs it per
+	// 60 frames so the serial output proves monster animation is
+	// wired); not used by the per-tic loop itself.
+	LastThinksDispatched int
+
+	// LastThinkErrors is the count of think-dispatch errors the most
+	// recent [Host.Frame] call's runThink walker swallowed (logged +
+	// continued rather than aborting the frame). A QC function that
+	// calls a builtin the host has not stubbed yet (W_FireRifle,
+	// ai_walk, ...) surfaces as one of these. Exposed for bring-up
+	// instrumentation alongside LastThinksDispatched.
+	LastThinkErrors int
 }
 
 // ErrNilDep fires on a missing required NewHost dependency.
@@ -240,6 +261,94 @@ func (h *Host) runClientCmds() error {
 	return nil
 }
 
+// runThink is the per-tic SV_RunThink-equivalent walker. Iterates
+// every edict in [1, NumEdicts) (slot 0 is the world; the per-tic
+// SV_Physics loop also skips it). For each non-free edict whose
+// .nextthink is > 0 AND <= sv.time, clears .nextthink to 0, sets the
+// QC self / other globals via the existing thinkCaller bridge, and
+// invokes the QC function indexed by .think. tyrquake: the per-edict
+// SV_RunThink calls inside the per-MOVETYPE SV_Physics_* handlers,
+// hoisted to the top of the per-tic loop so MOVETYPEs the Go port
+// has no handler for yet (PUSH / WALK / STEP) and the
+// None+SolidNot free-entity case still get their think drive.
+//
+// Errors from thinkCaller (typically: the QC function called a
+// builtin the host has not stubbed yet) are tallied into
+// LastThinkErrors and swallowed -- one monster's missing-builtin
+// crash does NOT take down the rest of the frame. Successful
+// dispatches are tallied into LastThinksDispatched.
+//
+// Counters reset to zero at the top of every Frame call so the
+// per-60 instrumentation log in quake-tamago shows per-tic activity
+// rather than cumulative-since-boot totals.
+//
+// Pre-conditions silently handled (no error surfaced):
+//
+//   - h.progsRef nil          -> the bridge skips named-global writes
+//     but vm.Run still dispatches; the field
+//     lookups below need progs.NewEntVars so
+//     a nil progsRef short-circuits the
+//     whole walk (no fields to read).
+//   - ent nil OR ent.Free     -> per-slot skip (matches the C
+//     upstream's `if (ent->free) continue`).
+//   - nextthink field absent  -> per-slot skip (test stubs with
+//     stripped progs; real Q1 progs.dat
+//     always declares it).
+//   - think field absent      -> per-slot skip (same rationale).
+//   - nextthink <= 0          -> per-slot skip (no think scheduled).
+//   - nextthink > sv.time     -> per-slot skip (think is in the
+//     future); matches RunThink's
+//     deadline check.
+func (h *Host) runThink() {
+	h.LastThinksDispatched = 0
+	h.LastThinkErrors = 0
+	p := h.findProgs()
+	if p == nil {
+		return
+	}
+	// Walk slots [1, NumEdicts); slot 0 is the world entity. Bound
+	// the upper limit by len(h.Server.Edicts) defensively so a
+	// NumEdicts past the allocated pool can't index out of range.
+	n := h.Server.NumEdicts
+	if n > len(h.Server.Edicts) {
+		n = len(h.Server.Edicts)
+	}
+	now := float32(h.Server.Time)
+	for i := 1; i < n; i++ {
+		ent := h.Server.Edicts[i]
+		if ent == nil || ent.Free {
+			continue
+		}
+		// NewEntVars only errors on nil-arg; both guards above
+		// (ent != nil + the p != nil short-circuit at the head)
+		// ensure both inputs are non-nil so the error is dropped
+		// bsptrace-style.
+		ev, _ := progs.NewEntVars(p, ent)
+		thinktime, err := ev.ReadFloat("nextthink")
+		if err != nil {
+			continue
+		}
+		if thinktime <= 0 || thinktime > now {
+			continue
+		}
+		funcID, err := ev.ReadInt32("think")
+		if err != nil {
+			continue
+		}
+		// Clear nextthink BEFORE dispatch so a think that re-arms
+		// itself (writes ent.nextthink = now + delay) survives the
+		// clear. The preceding ReadFloat proved the field exists as
+		// EvFloat, so WriteFloat's error branch is unreachable here
+		// and is dropped bsptrace-style.
+		_ = ev.WriteFloat("nextthink", 0)
+		if err := h.thinkCaller(ent, funcID); err != nil {
+			h.LastThinkErrors++
+			continue
+		}
+		h.LastThinksDispatched++
+	}
+}
+
 // Frame runs one game tic: per-tic SV_Physics + SendClientFrames +
 // CleanupEnts + ClearDatagram + ClearReliableDatagram. tyrquake:
 // Host_Frame's server-side portion (the SV_Physics + SV_SendClient-
@@ -274,6 +383,20 @@ func (h *Host) Frame(dt float32) error {
 	if err := h.runClientCmds(); err != nil {
 		return err
 	}
+
+	// SV_RunThink-equivalent top-level pass. The per-MOVETYPE physics
+	// handlers each call server.RunThink internally for the slots they
+	// own, but the dispatcher silent-skips MOVETYPE_PUSH / WALK / STEP
+	// (no handler yet) plus the (None && SolidNot) free-entity case.
+	// Without a top-level walker those slots' .nextthink deadlines
+	// would never fire -- which kills monster animation (the QC
+	// monster_*_stand / walk1 chain re-arms ent.nextthink + writes
+	// ent.frame on every think). The walker fires think for ANY edict
+	// with a scheduled nextthink; double-walking a slot the physics
+	// dispatcher will also RunThink is safe because the first call
+	// clears nextthink to 0 and the second sees the cleared field as
+	// "nothing scheduled".
+	h.runThink()
 
 	ctx := world.PhysicsContext{
 		Worldmodel:  h.Server.WorldModel,

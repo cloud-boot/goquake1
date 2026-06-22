@@ -908,6 +908,61 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			}
 		}
 
+		// Per-tic SV_RunThink dispatch + .frame census. Fires on a
+		// sparse "early then per-30" cadence so the serial log
+		// captures (a) the post-spawn baseline (tic 0), (b) the
+		// first few tics where deadlines accumulate, (c) a periodic
+		// snapshot. Surfaces the SV_RunThink wire as a dispatch
+		// count and a .frame-distribution shift between snapshots.
+		// The .frame field is what monster QC think functions write
+		// on every per-tic dispatch to step through their animation
+		// cycle; a non-zero "dispatched" count + a growing
+		// max-frame value across snapshots proves the SV_RunThink
+		// walker is firing the QC bodies that animate monsters.
+		if realHost != nil && (frame < 12 || frame%30 == 0) {
+			fmt.Printf("QUAKE: thinks tic %d -- %d dispatched, %d errored (missing builtins are non-fatal)\n",
+				frame, realHost.LastThinksDispatched, realHost.LastThinkErrors)
+			if p := realHost.Progs(); p != nil {
+				base := realHost.Static.MaxClients + 1
+				scheduled := 0
+				framesAdvanced := 0
+				maxFrame := float32(0)
+				minNext := float32(0)
+				sample := ""
+				for i := base; i < realHost.Server.NumEdicts; i++ {
+					e := realHost.Server.Edicts[i]
+					if e == nil || e.Free {
+						continue
+					}
+					ev, evErr := progs.NewEntVars(p, e)
+					if evErr != nil {
+						continue
+					}
+					nt, _ := ev.ReadFloat("nextthink")
+					f, _ := ev.ReadFloat("frame")
+					if nt > 0 {
+						scheduled++
+						if minNext == 0 || nt < minNext {
+							minNext = nt
+						}
+					}
+					if f > 0 {
+						framesAdvanced++
+						if f > maxFrame {
+							maxFrame = f
+						}
+						if sample == "" {
+							th, _ := ev.ReadInt32("think")
+							sample = fmt.Sprintf(" first-with-frame=[slot=%d frame=%.0f nextthink=%.3f think=%d]",
+								i, f, nt, th)
+						}
+					}
+				}
+				fmt.Printf("QUAKE: think-census tic %d sv.time=%.3f -- %d edicts with future nextthink (soonest=%.3f), %d edicts with frame>0 (max=%.0f)%s\n",
+					frame, realHost.Server.Time, scheduled, minNext, framesAdvanced, maxFrame, sample)
+			}
+		}
+
 		// Rasterize each visible face via TransformFace + FillTexturedPolygon.
 		// Per-face texture pick: TexInfo.MiptexIdx -> miptexPics[idx].
 		// Faces that resolve to a null miptex slot OR a synthetic BSP
