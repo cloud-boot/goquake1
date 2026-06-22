@@ -399,7 +399,7 @@ func TestDrawAliasLit_BackSkinSeamFixup(t *testing.T) {
 }
 
 func TestDrawAliasLit_FrameGroupEmptyNoOp(t *testing.T) {
-	// Empty group -> framePose returns nil -> DrawAliasLit short-
+	// Empty group -> FramePose returns nil -> DrawAliasLit short-
 	// circuits before calling ComputeAliasVertexLights (which would
 	// error on a nil slice).
 	m := &mdl.Model{

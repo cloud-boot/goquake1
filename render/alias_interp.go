@@ -29,7 +29,7 @@ type AliasEntityInterp struct {
 // FrameIdxNext == FrameIdx.
 //
 // Algorithm (mirrors tyrquake R_AliasBlendPoseVerts in r_alias.c):
-//  1. Decode both frame's vertices via the existing framePose helper.
+//  1. Decode both frame's vertices via the existing FramePose helper.
 //  2. Lerp each vertex in BYTE space:
 //     lerped[i].V[k] = round(poseA[i].V[k]*(1-t) + poseB[i].V[k]*t)
 //     (Scale + ScaleOrigin are affine, so byte-space lerp produces
@@ -66,11 +66,11 @@ func DrawAliasInterp(fb *FrameBuffer, rd *RefDef, cm *ColorMap, lightLevel int,
 		return ErrAliasBadFrame
 	}
 
-	vertsA := framePose(model.Frames[ent.FrameIdx])
+	vertsA := FramePose(model.Frames[ent.FrameIdx])
 	if ent.Lerp == 0 || ent.FrameIdxNext == ent.FrameIdx {
 		return drawAliasFromPose(fb, rd, cm, lightLevel, model, skin, ent.AliasEntity, vertsA)
 	}
-	vertsB := framePose(model.Frames[ent.FrameIdxNext])
+	vertsB := FramePose(model.Frames[ent.FrameIdxNext])
 	if ent.Lerp == 1 {
 		return drawAliasFromPose(fb, rd, cm, lightLevel, model, skin, ent.AliasEntity, vertsB)
 	}

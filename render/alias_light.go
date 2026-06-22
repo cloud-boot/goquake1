@@ -137,9 +137,9 @@ func DrawAliasLit(fb *FrameBuffer, rd *RefDef, cm *ColorMap, shade AliasShadeRan
 		return ErrAliasBadFrame
 	}
 
-	verts := framePose(model.Frames[ent.FrameIdx])
+	verts := FramePose(model.Frames[ent.FrameIdx])
 	if verts == nil {
-		// Empty FrameGroup -- framePose returns nil; there is no work
+		// Empty FrameGroup -- FramePose returns nil; there is no work
 		// for the triangle loop. Skip the compute (which would error
 		// on the nil slice) and return early.
 		return nil

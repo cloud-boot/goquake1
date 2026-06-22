@@ -309,7 +309,7 @@ func TestDrawAlias_FrameGroupUsesFirst(t *testing.T) {
 }
 
 func TestDrawAlias_FrameGroupEmptyNoOp(t *testing.T) {
-	// Empty group -> framePose returns nil -> the per-vertex pose
+	// Empty group -> FramePose returns nil -> the per-vertex pose
 	// slice is empty; the triangle loop then index-panics if not
 	// short-circuited by an earlier guard. With a 0-triangle model
 	// the loop simply iterates zero work and DrawAlias returns nil.
@@ -362,14 +362,14 @@ func TestEntityRotation_ZeroIsIdentity(t *testing.T) {
 
 func TestFramePose_SingleReturnsVerts(t *testing.T) {
 	want := []mdl.TriVertx{{V: [3]byte{1, 2, 3}}}
-	got := framePose(mdl.Frame{Type: mdl.FrameSingle, Single: mdl.SingleFrame{Verts: want}})
+	got := FramePose(mdl.Frame{Type: mdl.FrameSingle, Single: mdl.SingleFrame{Verts: want}})
 	if len(got) != 1 || got[0].V != want[0].V {
-		t.Fatalf("framePose single = %v want %v", got, want)
+		t.Fatalf("FramePose single = %v want %v", got, want)
 	}
 }
 
 func TestFramePose_GroupNilReturnsNil(t *testing.T) {
-	if got := framePose(mdl.Frame{Type: mdl.FrameGroup, Group: nil}); got != nil {
-		t.Fatalf("framePose nil-group = %v want nil", got)
+	if got := FramePose(mdl.Frame{Type: mdl.FrameGroup, Group: nil}); got != nil {
+		t.Fatalf("FramePose nil-group = %v want nil", got)
 	}
 }

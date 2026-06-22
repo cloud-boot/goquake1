@@ -96,7 +96,7 @@ func DrawAlias(fb *FrameBuffer, rd *RefDef, cm *ColorMap, lightLevel int,
 		return ErrAliasBadFrame
 	}
 
-	verts := framePose(model.Frames[ent.FrameIdx])
+	verts := FramePose(model.Frames[ent.FrameIdx])
 	return drawAliasFromPose(fb, rd, cm, lightLevel, model, skin, ent, verts)
 }
 
@@ -216,13 +216,18 @@ func entityRotation(pitch, yaw, roll float32) Mat3 {
 	}
 }
 
-// framePose returns the per-vertex byte triples for the still pose
+// FramePose returns the per-vertex byte triples for the still pose
 // of a Frame. For FrameSingle the single record's verts are returned
 // verbatim; for FrameGroup the first sub-frame's verts stand in as
 // the still pose (no per-tic interpolation in this commit). If the
 // group is empty (a malformed .mdl) an empty slice is returned --
 // the caller's triangle loop then iterates zero work.
-func framePose(f mdl.Frame) []mdl.TriVertx {
+//
+// Exported so out-of-package callers (e.g. the quake-tamago alias
+// pass) can spot-check ComputeAliasVertexLights against the same
+// pose DrawAliasLit consumed, without duplicating the per-type
+// dispatch.
+func FramePose(f mdl.Frame) []mdl.TriVertx {
 	if f.Type == mdl.FrameGroup {
 		if f.Group == nil || len(f.Group.Frames) == 0 {
 			return nil

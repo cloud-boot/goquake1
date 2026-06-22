@@ -933,7 +933,7 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 
 		// Alias-model pass. Iterate the wire-mirrored State.Entities
 		// (the client's per-tic snapshot the server broadcast over
-		// svc_update) and rasterize one DrawAlias per entity whose
+		// svc_update) and rasterize one DrawAliasLit per entity whose
 		// ModelIdx resolves to a loaded .mdl. Entries with ModelIdx
 		// == 0 (no model) or aliasModels[ModelIdx] == nil (BSP
 		// submodel like "*1", or a missing/un-loadable .mdl) are
@@ -941,16 +941,31 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 		// world walk above, alien-format / missing entries have
 		// nothing to render here.
 		//
-		// SCOPE: single-frame draw (DrawAlias, not DrawAliasInterp);
-		// uniform lightLevel = 10 (the colormap is identity, so the
-		// per-vertex shading path is a follow-up). Skin texture: the
-		// per-entity SkinNum field is clamped to the model's available
-		// skins via the parallel aliasSkins slice (one *render.Pic per
-		// precache slot -- a single-skin model exposes its sole skin,
-		// multi-skin variants land in a future batch). On a render
-		// error we log + continue with the next entity so one bad
-		// entity doesn't sink the rest of the frame.
+		// SCOPE: single-frame draw (DrawAliasLit, not
+		// DrawAliasInterp); per-vertex gouraud-averaged-per-triangle
+		// shading via the model's lightnormal table dotted with a
+		// fixed LightDir. Ambient 0.3 keeps the unlit side visible;
+		// DirectMax 0.7 adds up to +0.7 on the lit side -- so each
+		// triangle gets its own colormap row instead of the uniform
+		// lightLevel=10 of the pre-gouraud DrawAlias path. Skin
+		// texture: the per-entity SkinNum field is clamped to the
+		// model's available skins via the parallel aliasSkins slice
+		// (one *render.Pic per precache slot -- a single-skin model
+		// exposes its sole skin, multi-skin variants land in a future
+		// batch). On a render error we log + continue with the next
+		// entity so one bad entity doesn't sink the rest of the frame.
+		aliasShade := render.AliasShadeRange{
+			Ambient:   0.3,
+			DirectMin: 0.0,
+			DirectMax: 0.7,
+			LightDir:  [3]float32{0, 0, -1},
+		}
 		aliasRendered := 0
+		var (
+			sampleES   client.EntityState
+			sampleAM   *mdl.Model
+			haveSample bool
+		)
 		for _, es := range runner.Client.Entities {
 			if es.ModelIdx <= 0 || es.ModelIdx >= len(aliasModels) {
 				continue
@@ -975,20 +990,58 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				FrameIdx:   frameIdx,
 				SkinIdx:    es.SkinNum,
 			}
-			if err := render.DrawAlias(fb, rd, &cm, 10, am, skin, ent); err != nil {
+			if err := render.DrawAliasLit(fb, rd, &cm, aliasShade, am, skin, ent); err != nil {
 				// Per-entity errors are non-fatal; log sparsely so
 				// one bad entity per tic doesn't drown the channel.
 				if frame%60 == 0 {
-					fmt.Printf("QUAKE: DrawAlias modelIdx=%d frame=%d err: %v\n",
+					fmt.Printf("QUAKE: DrawAliasLit modelIdx=%d frame=%d err: %v\n",
 						es.ModelIdx, frameIdx, err)
 				}
 				continue
+			}
+			if !haveSample {
+				sampleES = es
+				sampleAM = am
+				haveSample = true
 			}
 			aliasRendered++
 		}
 		if frame%60 == 0 {
 			fmt.Printf("QUAKE: tic %d rendered %d alias entities\n",
 				frame, aliasRendered)
+			// Spot-check that per-vertex shading actually varies for
+			// a representative entity: log the first few computed
+			// vertex lights from the sample's current frame pose.
+			// If every value is identical the gouraud path collapsed
+			// back to a flat-bright render (regression signal).
+			if haveSample {
+				fIdx := sampleES.Frame
+				if fIdx < 0 || fIdx >= len(sampleAM.Frames) {
+					fIdx = 0
+				}
+				verts := render.FramePose(sampleAM.Frames[fIdx])
+				if lights, err := render.ComputeAliasVertexLights(verts, aliasShade); err == nil && len(lights) > 0 {
+					// Variance summary across all vertices. Adjacent
+					// vertices on the same body part often share a
+					// normal-index, so a fixed lights[0:5] window
+					// can look uniform even when the model overall
+					// shades correctly -- min/max/distinct is the
+					// real "is gouraud actually firing" signal.
+					lmin, lmax := lights[0], lights[0]
+					seen := make(map[int]struct{}, len(lights))
+					for _, v := range lights {
+						if v < lmin {
+							lmin = v
+						}
+						if v > lmax {
+							lmax = v
+						}
+						seen[v] = struct{}{}
+					}
+					fmt.Printf("QUAKE: alias shade sample modelIdx=%d verts=%d distinct=%d min=%d max=%d\n",
+						sampleES.ModelIdx, len(lights), len(seen), lmin, lmax)
+				}
+			}
 		}
 		return nil
 	}
