@@ -678,6 +678,16 @@ func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
 	if err := registerSpawnTimeBuiltins(vm); err != nil {
 		return nil, fmt.Errorf("buildHost: registerSpawnTimeBuiltins: %w", err)
 	}
+	// random() seed. The math builtin BuiltinFnRandom returns
+	// ErrRandomNotSeeded until SetRandomSource is wired -- spawn-time
+	// QC (misc_fireball, monster ambient picks, ...) hits it the
+	// instant the entity-spawn loop reaches one of those classnames.
+	// A deterministic 32-bit LCG (Numerical Recipes constants) gives
+	// a stable, side-effect-free float-in-[0,1) the spawn pass can
+	// consume without pulling math/rand (the tamago std-lib subset
+	// is intentionally minimal; an LCG is one multiply + one add per
+	// call + zero allocations).
+	vm.SetRandomSource(newLCGRandom(0xC0FFEE))
 
 	// 5. Arena hand-off. SpawnServer allocates the per-map EdictArena
 	//    BEFORE the entity-spawn pass walks the entities lump; the
@@ -824,7 +834,48 @@ func registerSpawnTimeBuiltins(vm *progs.VM) error {
 	vm.RegisterBuiltin(progs.BuiltinNextEnt, noop)
 	vm.RegisterBuiltin(progs.BuiltinParticle, noop)
 	vm.RegisterBuiltin(progs.BuiltinChangeYaw, noop)
+	// High-index builtins. tyrquake's pr_builtin[] indices 68..79 are
+	// the second-half table that defs.qc exposes as precache_file,
+	// makestatic, changelevel, cvar_set, centerprint, ambientsound,
+	// precache_model2, precache_sound2, precache_file2, setspawnparms.
+	// The shareware progs.dat calls #72 from worldspawn (precache_file
+	// in some defs.qc rev) and #74 from every light_* / trigger_teleport
+	// (centerprint). All are pure side-effect (precache / HUD print /
+	// link-to-static) so the no-op is faithful to "the spawn pass
+	// reaches the field-assignment half"; the per-classname state
+	// writes still land on the edict because they're bytecode after
+	// the builtin returns. Indices in between (68/69/70/71/73/75/...)
+	// get stubbed too so the next undefined-slot won't surface as the
+	// progs.dat exercises further functions on subsequent ticks.
+	for _, idx := range []int{68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79} {
+		vm.RegisterBuiltin(idx, noop)
+	}
+	// WriteByte / WriteChar / WriteShort / WriteLong / WriteCoord /
+	// WriteAngle / WriteString / WriteEntity occupy slots 52..60 in
+	// tyrquake's table. Server-side QC emits client-message bytes
+	// through these; no client is reading, so swallowing them is
+	// safe for the spawn-time + early-tic phase.
+	for _, idx := range []int{52, 53, 54, 55, 56, 57, 58, 59, 60} {
+		vm.RegisterBuiltin(idx, noop)
+	}
 	return nil
+}
+
+// newLCGRandom returns a float-in-[0,1) callback suitable for
+// VM.SetRandomSource. The PRNG is the Numerical-Recipes 32-bit LCG
+// (multiplier 1664525, increment 1013904223): cheap, deterministic,
+// and seedable so demo-replay parity is achievable without pulling
+// math/rand (tamago's std-lib subset omits a fair amount of the
+// stock pkg surface; an LCG is one multiply + one add per call).
+func newLCGRandom(seed uint32) func() float32 {
+	state := seed
+	return func() float32 {
+		state = state*1664525 + 1013904223
+		// Top 24 bits / 2^24 -> a float32 in [0, 1). The 0x7fff
+		// shape of tyrquake's PF_random is preserved-in-spirit but
+		// uses the full 24-bit mantissa for a smoother distribution.
+		return float32(state>>8) / float32(1<<24)
+	}
 }
 
 // pickInMapCamera returns a viewpoint that lands inside a valid leaf

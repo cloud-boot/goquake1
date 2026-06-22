@@ -116,9 +116,15 @@ func (vm *VM) SetStateFieldOffsets(nextThink, frame, think int) {
 	vm.stateFieldsSet = true
 }
 
-// MaxStackDepth caps the EnterFunction stack -- tyrquake's
-// MAX_STACK_DEPTH.
-const MaxStackDepth = 32
+// MaxStackDepth caps the EnterFunction stack. tyrquake's
+// MAX_STACK_DEPTH is 32, which is enough for stock single-player QC
+// but the shareware progs.dat's spawn-time chains (worldspawn ->
+// precache_* fanout -> StartItem helpers etc.) can recurse deeper
+// than 32 frames once the spawn-pass-fires-everything entry path is
+// taken. 256 mirrors the FTE/QuakeForge-era headroom + leaves plenty
+// of slack for community progs without breaking the runaway-loop
+// guard's overall budget.
+const MaxStackDepth = 256
 
 // MaxLocalstack caps the per-call local slot saves; the value
 // matches tyrquake's LOCALSTACK_SIZE (~2048 slots) but the Go port
