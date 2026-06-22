@@ -95,6 +95,7 @@ import (
 	engineserver "github.com/go-quake1/engine/server"
 	enginesound "github.com/go-quake1/engine/sound"
 	"github.com/go-quake1/engine/vfs"
+	"github.com/go-quake1/engine/wad"
 	"github.com/go-quake1/engine/world"
 )
 
@@ -2691,6 +2692,108 @@ func hasSuffix(s, suffix string) bool {
 	return s[len(s)-len(suffix):] == suffix
 }
 
+// wadOverlay wraps an [fs.FS] so that an Open miss on a `gfx/<name>.lmp`
+// path transparently falls through to a lazily-parsed WAD2 archive
+// (typically pak0:gfx/gfx.wad). The Quake Remastered pak0.pak does not
+// ship the canonical HUD pic lumps (sbar / ibar / num_0..9 / face*...)
+// as standalone entries -- they live inside gfx/gfx.wad. The overlay
+// matches the lump name case-insensitively, with the leading directory
+// + trailing .lmp stripped (so `gfx/sbar.lmp` resolves to lump `sbar`).
+//
+// The WAD payload returned by the underlying [wad.FS] for a qpic lump
+// is the full dpic8_t blob (width:int32 + height:int32 + pixels), which
+// is exactly what [render.ParsePic] consumes -- no transformation
+// needed.
+//
+// The WAD is parsed at most once. If the WAD entry itself is missing
+// (or fails to parse), the overlay degrades back to a plain pakFS view:
+// every Open is forwarded to the wrapped FS, returning whatever error
+// it produced.
+type wadOverlay struct {
+	base    fs.FS
+	wadPath string
+	parsed  bool
+	w       *wad.FS
+	wadBlob []byte // retained: wad.FS holds an io.ReaderAt into it
+}
+
+// newWADOverlay returns an overlay rooted at base. The WAD itself is
+// not opened until the first miss requires it (lazy init keeps the
+// fast path -- direct pakFS hits -- a single map lookup).
+func newWADOverlay(base fs.FS, wadPath string) *wadOverlay {
+	return &wadOverlay{base: base, wadPath: wadPath}
+}
+
+// Open implements [fs.FS]. Order of resolution:
+//
+//  1. Try the direct path in the underlying FS.
+//  2. On miss (any error), if name has the `gfx/...lmp` shape,
+//     lazy-parse the WAD + look up the bare lump name.
+//  3. If the WAD also misses, return the ORIGINAL underlying error so
+//     callers continue to see a sensible fs.PathError chain.
+func (o *wadOverlay) Open(name string) (fs.File, error) {
+	if o == nil || o.base == nil {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrInvalid}
+	}
+	f, err := o.base.Open(name)
+	if err == nil {
+		return f, nil
+	}
+	lump, ok := wadLumpName(name)
+	if !ok {
+		return nil, err
+	}
+	w := o.openWAD()
+	if w == nil {
+		return nil, err
+	}
+	wf, werr := w.Open(lump)
+	if werr != nil {
+		return nil, err
+	}
+	return wf, nil
+}
+
+// openWAD lazily loads + parses the configured WAD path. Returns nil
+// if the WAD is missing or malformed (the overlay then degrades to
+// pakFS-only behaviour).
+func (o *wadOverlay) openWAD() *wad.FS {
+	if o.parsed {
+		return o.w
+	}
+	o.parsed = true
+	blob, ok := tryReadPakFile(o.base, o.wadPath)
+	if !ok {
+		return nil
+	}
+	o.wadBlob = blob
+	w, err := wad.Open(bytes.NewReader(blob))
+	if err != nil {
+		return nil
+	}
+	o.w = w
+	return o.w
+}
+
+// wadLumpName converts a pak-style `gfx/<name>.lmp` path into the bare
+// WAD lump name (lowercase, case-insensitive). Returns ok=false for
+// anything else so the overlay never tries to satisfy non-gfx requests
+// out of the WAD.
+func wadLumpName(name string) (string, bool) {
+	const prefix = "gfx/"
+	const suffix = ".lmp"
+	if len(name) <= len(prefix)+len(suffix) {
+		return "", false
+	}
+	if name[:len(prefix)] != prefix {
+		return "", false
+	}
+	if name[len(name)-len(suffix):] != suffix {
+		return "", false
+	}
+	return name[len(prefix) : len(name)-len(suffix)], true
+}
+
 // loadSBarAssets opens the canonical sbar pic lumps out of pakFS via
 // render.ParsePic and returns a populated *render.SBarAssets bundle +
 // the count of slots resolved + the total attempted + a list of
@@ -2717,13 +2820,20 @@ func loadSBarAssets(pakFS fs.FS) (*render.SBarAssets, int, int, []string) {
 	loaded, total := 0, 0
 	var missing []string
 
+	// Quake Remastered's pak0.pak does NOT ship gfx/sbar.lmp etc as
+	// standalone entries -- the canonical HUD pics live inside the WAD2
+	// archive gfx.wad (at the pak root, NOT under gfx/). Wrap pakFS in
+	// an overlay that falls through to a lazy-parsed gfx.wad on miss so
+	// the same gfx/<name>.lmp probe resolves either layout transparently.
+	overlay := newWADOverlay(pakFS, "gfx.wad")
+
 	// load names a single lump + slots its parsed Pic into `dst`. The
 	// nested closure shares the running counters; a missing lump
 	// appends to `missing` + logs once so the QEMU serial channel
 	// surfaces the gap without drowning the log.
 	load := func(name string, dst **render.Pic) {
 		total++
-		blob, ok := tryReadPakFile(pakFS, name)
+		blob, ok := tryReadPakFile(overlay, name)
 		if !ok {
 			missing = append(missing, name)
 			fmt.Printf("QUAKE: sbar asset %s missing -- skipping\n", name)
