@@ -14,6 +14,13 @@ import (
 	"github.com/go-quake1/engine/world"
 )
 
+// readClientMoves is the package-level seam Frame() walks to drain
+// each active client's inbox before RunPhysics dispatches PhysicsWalk.
+// The default is [server.ReadClientMoves]; tests swap it via the
+// runClientCmds path (see Frame's hookable form below) so the cmd-
+// drain step can be exercised without a real NetConn.
+var readClientMoves = server.ReadClientMoves
+
 // Host is the main game-loop coordinator. Owns the Server + Static
 // + VM + World + per-frame timing + the ThinkCaller bridge.
 // tyrquake: the global host_* variables in NQ/host.c (host_client,
@@ -185,6 +192,46 @@ func (h *Host) cmdAt(i int) server.UserCmd {
 // this for a non-identity function).
 func hostKeyAt(i int) world.Key { return world.Key(i) }
 
+// runClientCmds drains every active client's inbox via ReadClientMoves
+// then copies the resulting Cmd.ViewAngles into the bound edict's
+// `v_angle` entvars field. tyrquake: SV_RunClients in NQ/host.c -- the
+// per-tic SV_ReadClientMessage + SV_ClientThink call pair that runs
+// just before SV_Physics so PhysicsWalk sees the freshest UserCmd +
+// view angles.
+//
+// The v_angle copy is the minimal SV_RunCmd equivalent: PhysicsWalk's
+// CalcWishVel reads v_angle (NOT the cmd's ViewAngles) for the
+// forward/right basis, so without this propagation the player's
+// wishvel would always lock to v_angle's last value (zero at spawn).
+//
+// Slots without an Edict yet (ConnectClient ran but the edict pool
+// wasn't ready) and slots without a v_angle field (test stubs with
+// stripped progs) are skipped silently. Other errors -- a transport
+// failure, a bad clc opcode -- are surfaced verbatim so callers can
+// log + drop.
+func (h *Host) runClientCmds() error {
+	p := h.findProgs()
+	for _, c := range h.Static.Clients {
+		if c == nil || !c.Active || c.NetConnection == nil {
+			continue
+		}
+		if _, err := readClientMoves(c); err != nil {
+			return err
+		}
+		if p == nil || c.Edict == nil {
+			continue
+		}
+		// NewEntVars's nil-arg guard is unreachable here -- the p and
+		// c.Edict checks above ensure both inputs are non-nil -- so its
+		// error is dropped (bsptrace-style).
+		ev, _ := progs.NewEntVars(p, c.Edict)
+		// v_angle absent (stripped test progs) -> silent skip. A real
+		// Q1 progs.dat always declares it.
+		_ = ev.WriteVec3("v_angle", c.Cmd.ViewAngles)
+	}
+	return nil
+}
+
 // Frame runs one game tic: per-tic SV_Physics + SendClientFrames +
 // CleanupEnts + ClearDatagram + ClearReliableDatagram. tyrquake:
 // Host_Frame's server-side portion (the SV_Physics + SV_SendClient-
@@ -210,6 +257,15 @@ func (h *Host) Frame(dt float32) error {
 	// nil for a single-tic test: every think scheduled this frame
 	// fires this frame either way.
 	h.Server.Time += float64(dt)
+
+	// SV_RunClients-equivalent: drain each active client's inbox into
+	// its Client.Cmd, then mirror Cmd.ViewAngles into the bound edict's
+	// v_angle field so PhysicsWalk's wishvel basis is fresh this tic.
+	// Runs BEFORE RunPhysics so PhysicsWalk picks up the post-drain
+	// cmd via cmdAt.
+	if err := h.runClientCmds(); err != nil {
+		return err
+	}
 
 	ctx := world.PhysicsContext{
 		Worldmodel:  h.Server.WorldModel,

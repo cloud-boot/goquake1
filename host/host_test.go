@@ -410,6 +410,117 @@ func TestFrame_PropagatesSendClientFramesError(t *testing.T) {
 	}
 }
 
+// --- runClientCmds --------------------------------------------------------
+
+// runClientCmds is a no-op on a host with no active clients.
+func TestRunClientCmds_NoActiveClients(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 2)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if err := h.runClientCmds(); err != nil {
+		t.Errorf("runClientCmds with no active clients: %v want nil", err)
+	}
+}
+
+// runClientCmds skips an active client without an Edict (defensive
+// branch -- ConnectClient binds an edict but a test stub could carry
+// Active+NetConnection without a bound edict).
+func TestRunClientCmds_ActiveClientNoEdict(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	clientSide, _, err := h.ConnectLoopback()
+	if err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	_ = clientSide
+	// Detach the edict so the second-half v_angle copy is skipped.
+	h.Static.Clients[0].Edict = nil
+	if err := h.runClientCmds(); err != nil {
+		t.Errorf("runClientCmds with edict-less active client: %v want nil", err)
+	}
+}
+
+// runClientCmds skips the v_angle copy silently when the bound progs
+// lacks a v_angle field (test stubs with stripped progs). No error,
+// no panic.
+func TestRunClientCmds_NoVAngleField(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if _, _, err := h.ConnectLoopback(); err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	// progsForHost doesn't declare a v_angle field -- WriteVec3 returns
+	// ErrFieldNotFound which runClientCmds silently drops.
+	if err := h.runClientCmds(); err != nil {
+		t.Errorf("runClientCmds with no v_angle field: %v want nil", err)
+	}
+}
+
+// runClientCmds returns nil when the progs handle is nil -- the
+// v_angle copy is skipped, the drain still runs.
+func TestRunClientCmds_NoProgs(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if _, _, err := h.ConnectLoopback(); err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	h.SetProgs(nil)
+	if err := h.runClientCmds(); err != nil {
+		t.Errorf("runClientCmds with nil progs: %v want nil", err)
+	}
+}
+
+// runClientCmds propagates a ReadClientMoves transport error.
+func TestRunClientCmds_PropagatesReadError(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if _, _, err := h.ConnectLoopback(); err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	// Swap the package-level drain hook with a stub that errors.
+	want := errors.New("boom drain")
+	orig := readClientMoves
+	readClientMoves = func(*server.Client) (int, error) { return 0, want }
+	defer func() { readClientMoves = orig }()
+	if err := h.runClientCmds(); !errors.Is(err, want) {
+		t.Errorf("runClientCmds: got %v want %v", err, want)
+	}
+}
+
+// Frame calls runClientCmds before RunPhysics; a runClientCmds error
+// short-circuits the frame.
+func TestFrame_PropagatesRunClientCmdsError(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if _, _, err := h.ConnectLoopback(); err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	want := errors.New("frame drain boom")
+	orig := readClientMoves
+	readClientMoves = func(*server.Client) (int, error) { return 0, want }
+	defer func() { readClientMoves = orig }()
+	if err := h.Frame(0.05); !errors.Is(err, want) {
+		t.Errorf("Frame: got %v want %v", err, want)
+	}
+}
+
 // --- SpawnServer ----------------------------------------------------------
 
 func TestSpawnServer_HappyPath(t *testing.T) {

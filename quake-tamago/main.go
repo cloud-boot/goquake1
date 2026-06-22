@@ -56,6 +56,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -80,7 +81,6 @@ import (
 	"github.com/go-quake1/engine/client"
 	"github.com/go-quake1/engine/embedpak"
 	enginehost "github.com/go-quake1/engine/host"
-	"github.com/go-quake1/engine/mathlib"
 	"github.com/go-quake1/engine/model"
 	"github.com/go-quake1/engine/progs"
 	"github.com/go-quake1/engine/protocol"
@@ -494,13 +494,28 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	var surfaces bsprender.SurfaceList
 	frameCount := 0
 
-	// Seed the player edict's origin with the lattice-probe anchor when
-	// the QC spawn pass left it at the zero vector (the bytecode
-	// default for entities the entity-spawn parser doesn't relocate
-	// via info_player_start). Without this seed the per-tic integrator
-	// below would integrate FROM the world origin (which sits inside a
-	// solid leaf) and the lattice fallback in the camera-pick code
-	// would mask the player's actual position from view.
+	// Seed the player edict so the host's per-tic RunPhysics actually
+	// dispatches PhysicsWalk for slot 1:
+	//
+	//   - origin -- pickInMapCamera anchor when the QC spawn pass left
+	//     it at the bytecode zero vector (info_player_start isn't being
+	//     applied by SpawnFn yet). PhysicsWalk-from-the-world-origin
+	//     would trap the player inside a solid leaf forever.
+	//   - movetype = MOVETYPE_WALK + solid = SOLID_SLIDEBOX -- without
+	//     these the RunPhysics dispatcher hits its (movetype==None &&
+	//     solid==Not) free-entity skip and PhysicsWalk never runs.
+	//   - mins/maxs = standard Quake hull-1 player bounds (-16,-16,-24
+	//     .. 16,16,32). PhysicsWalk's PushEntity trace needs a real bbox
+	//     so the world collision actually clips against the BSP brushes.
+	//   - velocity / v_angle / flags / gravity zeroed so the first tic
+	//     starts from a known rest state; PhysicsWalk's CheckBottom will
+	//     latch FL_ONGROUND once the gravity pull settles the player
+	//     onto the floor.
+	//
+	// The full QC PutClientInServer would set additional fields
+	// (health, model, weapon, ...); we skip those -- they're not read
+	// by PhysicsWalk and the rendering path takes the origin from
+	// EdictOrigin directly.
 	if realHost != nil && playerSlot > 0 && !isSynth {
 		if eo, err := realHost.EdictOrigin(playerSlot); err == nil {
 			if eo[0] == 0 && eo[1] == 0 && eo[2] == 0 {
@@ -509,6 +524,13 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 					playerSlot, camOrigin)
 			}
 		}
+		if err := initPlayerForPhysicsWalk(realHost, playerSlot); err != nil {
+			fmt.Printf("QUAKE: initPlayerForPhysicsWalk(%d) failed: %v -- PhysicsWalk may not dispatch\n",
+				playerSlot, err)
+		} else {
+			fmt.Printf("QUAKE: player edict %d primed for PhysicsWalk (movetype=Walk solid=SlideBox hull1 mins/maxs)\n",
+				playerSlot)
+		}
 	}
 
 	// 6. Pre2DDraw closure. Runs per-tic from RunFrame BEFORE the 2D
@@ -516,7 +538,15 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	//    has just refreshed from mouse + arrow keys. viewOrigin is the
 	//    runner's anchor; we offset it by client.State.ViewHeightOffset
 	//    so jumping/crouching still nudges the camera.
-	const playerStepSpeed float32 = 320.0 // units / sec at full forward press
+	//
+	//    Player physics is now owned by host.Frame (called BEFORE
+	//    Pre2DDraw by the runloop): host.runClientCmds drains each
+	//    loopback inbox + mirrors cmd.ViewAngles into edict.v_angle,
+	//    then RunPhysics dispatches PhysicsWalk which integrates
+	//    gravity + accelerate + PushEntity-traces against the world.
+	//    Pre2DDraw is left to just read the post-physics origin via
+	//    EdictOrigin and render against it -- no more direction-only
+	//    integratePlayerCmd nudge.
 	runner.Pre2DDraw = func(fb *render.FrameBuffer, viewOrigin, viewAngles [3]float32) error {
 		frame := frameCount
 		frameCount++
@@ -527,24 +557,6 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 		// past the 2D overlay.
 		for i := range fb.Pixels {
 			fb.Pixels[i] = 0x10
-		}
-
-		// Drain the loopback server-side clc_move queue and integrate
-		// the latest UserCmd into the player edict's origin. This is
-		// the MVP stand-in for SV_Physics_Walk: just enough to make a
-		// key press visibly move the camera. A follow-up batch wires
-		// the real ground-physics integrator + worldmodel trace.
-		movesApplied := 0
-		if realHost != nil && playerSlot > 0 {
-			c := realHost.Static.Clients[playerSlot-1]
-			n, err := engineserver.ReadClientMoves(c)
-			if err != nil {
-				return fmt.Errorf("ReadClientMoves: %w", err)
-			}
-			movesApplied = n
-			if n > 0 {
-				_ = integratePlayerCmd(realHost, playerSlot, c.Cmd, playerStepSpeed, runloop.MinFrameTime)
-			}
 		}
 
 		// Pick the camera anchor for this frame. When the real host
@@ -622,8 +634,15 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			if runner.SoundPool != nil {
 				active = runner.SoundPool.ActiveCount()
 			}
-			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v fromEdict=%v viewAngles=%v movesApplied=%d clientConn=%d; %d surfaces; audio: %d active, %d mixed\n",
-				frame, origin, fromEdict, viewAngles, movesApplied,
+			cmdFwd, cmdSide := float32(0), float32(0)
+			if realHost != nil && playerSlot > 0 {
+				if c := realHost.Static.Clients[playerSlot-1]; c != nil {
+					cmdFwd = c.Cmd.ForwardMove
+					cmdSide = c.Cmd.SideMove
+				}
+			}
+			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v fromEdict=%v viewAngles=%v cmd.fwd=%v cmd.side=%v clientConn=%d; %d surfaces; audio: %d active, %d mixed\n",
+				frame, origin, fromEdict, viewAngles, cmdFwd, cmdSide,
 				int(runner.Client.Connection), surfaces.Len(),
 				active, enginesound.MixBufferStereoFrames)
 		}
@@ -1044,22 +1063,28 @@ func writePlayerOrigin(h *enginehost.Host, slot int, origin [3]float32) error {
 	return v.WriteVec3("origin", origin)
 }
 
-// integratePlayerCmd applies one UserCmd to the player edict's origin
-// via a minimal in-line integrator: forward / right basis from the
-// command's viewangles * forwardMove / sideMove * dt + upMove on the
-// Z axis. This is the MVP stand-in for SV_Physics_Walk -- enough to
-// make a key press visibly move the camera in-map. A follow-up batch
-// swaps it for the real ground-physics + worldmodel-trace tick.
+// initPlayerForPhysicsWalk seeds the per-edict entvars fields the
+// per-tic RunPhysics dispatcher + PhysicsWalk handler require to take
+// the player edict at slot through one tic of the MOVETYPE_WALK arm:
 //
-// speedScale is the conversion from the wire's int16 forward/side
-// magnitude (which client.BaseMove emits at cl_forwardspeed * dt
-// units; typical Quake range +/- 200) to world units per second. A
-// value of 1.0 means "the wire magnitude already is units/sec";
-// playerStepSpeed defaults to 320 which is sv_maxspeed's default.
+//   - movetype = MOVETYPE_WALK         (selects the PhysicsWalk handler)
+//   - solid    = SOLID_SLIDEBOX        (lets PushEntity actually trace)
+//   - mins/maxs = hull-1 (-16,-16,-24 .. 16,16,32) -- the standard Q1
+//     player hull. Without a real bbox the world-trace collapses to a
+//     ray and the player can clip through faces.
+//   - velocity / v_angle / flags / gravity = zero / 1.0 -- a clean
+//     rest state from which gravity can settle the player onto the
+//     floor and CheckBottom can latch FL_ONGROUND.
 //
-// Returns the propagated EntVars error or nil; out-of-range slot OR
-// nil edict returns [enginehost.ErrNoEdict].
-func integratePlayerCmd(h *enginehost.Host, slot int, cmd engineserver.UserCmd, speedScale, dt float32) error {
+// The full QC PutClientInServer would set additional fields (health,
+// model, weapon, ...); we skip those -- they're not read by PhysicsWalk
+// and the rendering path takes the origin from EdictOrigin directly.
+//
+// Returns the first EntVars error (typically ErrFieldNotFound on a
+// progs that strips one of these standard fields -- not a real Q1
+// progs.dat), or nil on success. Per-write errors are surfaced
+// verbatim so the caller can log + decide whether to abort.
+func initPlayerForPhysicsWalk(h *enginehost.Host, slot int) error {
 	if h == nil || slot < 0 || slot >= len(h.Server.Edicts) {
 		return enginehost.ErrNoEdict
 	}
@@ -1075,42 +1100,35 @@ func integratePlayerCmd(h *enginehost.Host, slot int, cmd engineserver.UserCmd, 
 	if err != nil {
 		return err
 	}
-	cur, err := v.ReadVec3("origin")
-	if err != nil {
+	if err := v.WriteFloat("movetype", float32(int32(engineserver.MoveTypeWalk))); err != nil {
 		return err
 	}
-	// Project the per-axis move scalars onto the world via the
-	// forward/right basis derived from viewangles. The wire's
-	// forwardmove / sidemove magnitudes are normalized to roughly
-	// +/-1 (sign of the button press); scale * dt gives the
-	// per-tic delta in world units.
-	forward, right, _ := mathlib.AngleVectors(cmd.ViewAngles)
-	dx := forward[0]*sign(cmd.ForwardMove) + right[0]*sign(cmd.SideMove)
-	dy := forward[1]*sign(cmd.ForwardMove) + right[1]*sign(cmd.SideMove)
-	dz := forward[2]*sign(cmd.ForwardMove) + right[2]*sign(cmd.SideMove) + sign(cmd.UpMove)
-	step := speedScale * dt
-	next := [3]float32{
-		cur[0] + dx*step,
-		cur[1] + dy*step,
-		cur[2] + dz*step,
+	if err := v.WriteFloat("solid", float32(int32(engineserver.SolidSlideBox))); err != nil {
+		return err
 	}
-	return v.WriteVec3("origin", next)
-}
-
-// sign returns -1 for negative inputs, 0 for zero, +1 for positive.
-// Used by integratePlayerCmd to collapse the wire's int16 magnitude
-// (which encodes per-axis "pressed in this direction" -- the raw
-// magnitude is the cl_forwardspeed * dt product BaseMove emits, which
-// varies frame-to-frame) into a stable per-tic direction vector.
-func sign(f float32) float32 {
-	switch {
-	case f > 0:
-		return 1
-	case f < 0:
-		return -1
-	default:
-		return 0
+	if err := v.WriteVec3("mins", [3]float32{-16, -16, -24}); err != nil {
+		return err
 	}
+	if err := v.WriteVec3("maxs", [3]float32{16, 16, 32}); err != nil {
+		return err
+	}
+	if err := v.WriteVec3("velocity", [3]float32{0, 0, 0}); err != nil {
+		return err
+	}
+	if err := v.WriteVec3("v_angle", [3]float32{0, 0, 0}); err != nil {
+		return err
+	}
+	if err := v.WriteFloat("flags", 0); err != nil {
+		return err
+	}
+	// gravity is QuakeWorld-only -- stock NQ id1 defs.qc does not
+	// declare it. PhysicsWalk's readStepGravityFactor handles the
+	// absent-field case by defaulting to 1.0, so the silent skip here
+	// is functionally identical to a successful write of 1.0.
+	if err := v.WriteFloat("gravity", 1.0); err != nil && !errors.Is(err, progs.ErrFieldNotFound) {
+		return err
+	}
+	return nil
 }
 
 // loadBSP returns the BSP bytes + size to render. Sources, in order:
