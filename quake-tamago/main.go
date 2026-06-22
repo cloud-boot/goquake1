@@ -1704,6 +1704,16 @@ func edictSlot(h *enginehost.Host, ent *progs.Edict) int32 {
 // renderer real .mdl names to walk + real per-edict indices to
 // dispatch by.
 //
+// EXCEPTION 2: traceline + findradius ship REAL implementations
+// (see [builtinTraceLine] / [builtinFindRadius]). Monster QC's
+// FindTarget loop calls findradius(self.origin, 1000) every think
+// and traceline(self.origin, target.origin, false, self) to check
+// the sightline -- both as no-ops returned an empty chain + an
+// inside-solid trace, so every monster's FindTarget short-circuited
+// + the idle->stand->walk transition never fired. Wiring the real
+// impls against the world brushmodel + the area-tree unblocks
+// monster AI's first wake-up cycle.
+//
 // Functional builtins (the math 9 from RegisterMathBuiltins) stay
 // real; the rest of the spawn-time side-effect builtins are stubbed
 // here. A real implementation would precache sounds, link entities
@@ -1724,13 +1734,13 @@ func registerSpawnTimeBuiltins(vm *progs.VM, h *enginehost.Host) error {
 	vm.RegisterBuiltin(progs.BuiltinObjError, noop)
 	vm.RegisterBuiltin(progs.BuiltinSpawn, noop)
 	vm.RegisterBuiltin(progs.BuiltinRemove, noop)
-	vm.RegisterBuiltin(progs.BuiltinTraceLine, noop)
+	vm.RegisterBuiltin(progs.BuiltinTraceLine, builtinTraceLine(h))
 	vm.RegisterBuiltin(progs.BuiltinCheckClient, noop)
 	vm.RegisterBuiltin(progs.BuiltinFind, noop)
 	vm.RegisterBuiltin(progs.BuiltinPrecacheSound, noop)
 	vm.RegisterBuiltin(progs.BuiltinPrecacheModel, builtinPrecacheModel(h))
 	vm.RegisterBuiltin(progs.BuiltinStuffCmd, noop)
-	vm.RegisterBuiltin(progs.BuiltinFindRadius, noop)
+	vm.RegisterBuiltin(progs.BuiltinFindRadius, builtinFindRadius(h))
 	vm.RegisterBuiltin(progs.BuiltinBPrint, noop)
 	vm.RegisterBuiltin(progs.BuiltinSPrint, noop)
 	vm.RegisterBuiltin(progs.BuiltinDPrint, noop)
@@ -2082,6 +2092,109 @@ func resolveModelBBox(h *enginehost.Host, cache *setModelCache, name string, idx
 	}
 	cache.mdlBBox[idx] = [2][3]float32{mins, maxs}
 	return mins, maxs, true
+}
+
+// builtinTraceLine returns a Builtin closure that implements the QC
+// traceline(v1, v2, nomonsters, forent) built-in (tyrquake's
+// PF_traceline at builtin slot 16). Runs a swept-line trace through
+// the world brushmodel + every solid candidate via [enginehost.Host.TraceLine],
+// then writes the result back into the QC-visible trace_* globals
+// via [enginehost.WriteTraceGlobals].
+//
+// Reads OFS_PARM0..3 = (v1 vec3, v2 vec3, nomonsters float, forent entity).
+// nomonsters != 0 selects [enginehost.MoveNoMonsters], which skips
+// non-BSP solid candidates (so monsters don't block each other's
+// sightlines through the world). The forent argument is the calling
+// entity -- typically `self` for monster QC; it is excluded from
+// the candidate list so the monster doesn't clip against its own
+// bounding box.
+//
+// Tolerated no-ops: nil host / nil server / nil progs / nil arena
+// all collapse to a clean trace (Fraction=1, EndPos=v2, InOpen=1,
+// trace_ent=world). Real Q1 progs declares every trace_* global so
+// the named-global write path lands the result; test stubs that omit
+// a subset silently skip those writes.
+func builtinTraceLine(h *enginehost.Host) progs.Builtin {
+	return func(vm *progs.VM) error {
+		v1, _ := vm.GlobalVector(progs.OfsParm0)
+		v2, _ := vm.GlobalVector(progs.OfsParm1)
+		nomon, _ := vm.GlobalFloat(progs.OfsParm2)
+		entPtr, _ := vm.GlobalInt(progs.OfsParm3)
+
+		var passEdict *progs.Edict
+		if arena := vm.Arena(); arena != nil {
+			if ed, _, err := arena.ResolvePointer(entPtr); err == nil {
+				passEdict = ed
+			}
+		}
+		mode := enginehost.MoveNormal
+		if nomon != 0 {
+			mode = enginehost.MoveNoMonsters
+		}
+
+		res, err := h.TraceLine(v1, v2, mode, passEdict)
+		if err != nil {
+			fmt.Printf("QUAKE: traceline: %v\n", err)
+			return nil
+		}
+
+		// Resolve trace_ent into an arena pointer. EntIdx == 0 is the
+		// world (always slot 0); EntIdx > 0 is a per-edict slot. -1
+		// (clean miss) and 0 (world) both map to the world pointer
+		// (the QC convention is "no clip = world is the trace ent").
+		var trEntPtr int32
+		if res.EntIdx > 0 {
+			if arena := vm.Arena(); arena != nil {
+				trEntPtr = arena.MakePointer(res.EntIdx, 0)
+			}
+		}
+		return enginehost.WriteTraceGlobals(vm, vm.Progs(), res, trEntPtr)
+	}
+}
+
+// builtinFindRadius returns a Builtin closure that implements the QC
+// findradius(org, rad) built-in (tyrquake's PF_findradius at builtin
+// slot 22). Reads OFS_PARM0 = org (vec3), OFS_PARM1 = rad (float);
+// walks every non-free, non-world solid edict whose bbox centre
+// falls within rad units of org; chains them via the `chain` ev_entity
+// field; writes the head edict's pointer into OFS_RETURN.
+//
+// End-of-chain sentinel = world (pointer 0). Empty result returns
+// a pointer-to-world (= 0) so the caller's `head = findradius(...)`
+// + `while (head != world)` loop terminates immediately.
+//
+// Tolerated no-ops: nil host / nil server / nil progs / nil arena
+// all return pointer 0 (= world). The `chain` field absent in progs
+// (test stubs) short-circuits to "return world" too -- the chain
+// can't be linked without somewhere to store the prev pointer.
+func builtinFindRadius(h *enginehost.Host) progs.Builtin {
+	return func(vm *progs.VM) error {
+		org, _ := vm.GlobalVector(progs.OfsParm0)
+		rad, _ := vm.GlobalFloat(progs.OfsParm1)
+
+		slots := h.FindRadius(org, rad)
+
+		arena := vm.Arena()
+		var pointerFor func(int) int32
+		if arena != nil {
+			pointerFor = func(slot int) int32 { return arena.MakePointer(slot, 0) }
+		}
+
+		var edicts []*progs.Edict
+		if h != nil && h.Server != nil {
+			edicts = h.Server.Edicts
+		}
+		headSlot, err := enginehost.ChainEdicts(vm.Progs(), edicts, slots, pointerFor)
+		if err != nil {
+			fmt.Printf("QUAKE: findradius: %v\n", err)
+			return vm.SetGlobalInt(progs.OfsReturn, 0)
+		}
+		var headPtr int32
+		if headSlot > 0 && arena != nil {
+			headPtr = arena.MakePointer(headSlot, 0)
+		}
+		return vm.SetGlobalInt(progs.OfsReturn, headPtr)
+	}
 }
 
 // solidKindFromEntvars reads the QC `solid` field off ev + maps it
