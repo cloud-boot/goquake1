@@ -1024,6 +1024,13 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 		if realHost != nil && (frame < 12 || frame%30 == 0) {
 			fmt.Printf("QUAKE: thinks tic %d -- %d dispatched, %d errored (missing builtins are non-fatal)\n",
 				frame, realHost.LastThinksDispatched, realHost.LastThinkErrors)
+			// Surface the first 8 unique error strings runThink swallowed
+			// this tic so the serial log names the failing builtin index
+			// instead of just counting (turns the count into actionable
+			// "stub THIS index" signal).
+			for _, msg := range realHost.LastThinkErrorMsgs {
+				fmt.Printf("QUAKE: think error -- %s\n", msg)
+			}
 			if p := realHost.Progs(); p != nil {
 				base := realHost.Static.MaxClients + 1
 				scheduled := 0
@@ -1736,6 +1743,34 @@ func registerSpawnTimeBuiltins(vm *progs.VM, h *enginehost.Host) error {
 	// through these; no client is reading, so swallowing them is
 	// safe for the spawn-time + early-tic phase.
 	for _, idx := range []int{52, 53, 54, 55, 56, 57, 58, 59, 60} {
+		vm.RegisterBuiltin(idx, noop)
+	}
+	// Monster-AI / per-tic builtin gap fill. tyrquake's pr_builtin[]
+	// (reference/common/pr_cmds.c) reserves the following slots that
+	// the named-constant block above leaves uncovered:
+	//
+	//   33 = PF_Fixme (alt-walkmove slot; defs.qc unused)
+	//   39 = PF_Fixme (between ceil + checkbottom)
+	//   42 = PF_Fixme (between pointcontents + fabs)
+	//   50 = PF_Fixme (between changeyaw + vectoangles)
+	//   61..66 = PF_Fixme (gap between WriteEntity + SV_MoveToGoal)
+	//   67 = SV_MoveToGoal (monster nav helper -- ai_walk's "step
+	//        toward goalentity" core; called by ai_walk/ai_run after
+	//        the deadline gate)
+	//
+	// Stubbing them as no-ops protects per-tic SV_RunThink dispatch
+	// from "OP_CALLn target builtin index not registered: N" errors
+	// when monster QC reaches ai_walk / ai_run / etc. The semantic
+	// gap (monsters won't actually navigate) is the same as walkmove
+	// being a no-op upstream of here -- DEFERRED to a real-AI batch
+	// that wires SV_MoveToGoal + traceline + walkmove against the
+	// world tree. The 80..89 tail covers anything mod-progs (Quake
+	// Mission Pack 1/2) may have appended past the shareware table.
+	for _, idx := range []int{
+		33, 39, 42, 50,
+		61, 62, 63, 64, 65, 66, 67,
+		80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
+	} {
 		vm.RegisterBuiltin(idx, noop)
 	}
 	return nil

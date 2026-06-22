@@ -6,6 +6,7 @@ package host
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/go-quake1/engine/model"
@@ -106,6 +107,15 @@ type Host struct {
 	// ai_walk, ...) surfaces as one of these. Exposed for bring-up
 	// instrumentation alongside LastThinksDispatched.
 	LastThinkErrors int
+
+	// LastThinkErrorMsgs accumulates the first 8 unique error strings
+	// the most recent [Host.Frame] call's runThink walker swallowed,
+	// in arrival order. Reset (re-allocated) at the top of every Frame
+	// alongside LastThinksDispatched / LastThinkErrors. Exposed for
+	// bring-up instrumentation so the per-tic log can name the missing
+	// builtin (or other failure) instead of just a count. The 8-entry
+	// cap bounds the cost of de-dup + log emission per tic.
+	LastThinkErrorMsgs []string
 }
 
 // ErrNilDep fires on a missing required NewHost dependency.
@@ -302,6 +312,7 @@ func (h *Host) runClientCmds() error {
 func (h *Host) runThink() {
 	h.LastThinksDispatched = 0
 	h.LastThinkErrors = 0
+	h.LastThinkErrorMsgs = h.LastThinkErrorMsgs[:0]
 	p := h.findProgs()
 	if p == nil {
 		return
@@ -343,6 +354,26 @@ func (h *Host) runThink() {
 		_ = ev.WriteFloat("nextthink", 0)
 		if err := h.thinkCaller(ent, funcID); err != nil {
 			h.LastThinkErrors++
+			// Capture up to 8 unique error strings per Frame so the
+			// caller's per-tic log can name the failure (typically:
+			// missing-builtin index) instead of just counting. Prefix
+			// the funcID so two distinct think functions that fail on
+			// the same underlying err (e.g. both miss the same builtin
+			// slot) still show up as separate diagnostic lines.
+			// De-dup + cap bounds the cost.
+			msg := fmt.Sprintf("think funcID=%d: %v", funcID, err)
+			if len(h.LastThinkErrorMsgs) < 8 {
+				seen := false
+				for _, prev := range h.LastThinkErrorMsgs {
+					if prev == msg {
+						seen = true
+						break
+					}
+				}
+				if !seen {
+					h.LastThinkErrorMsgs = append(h.LastThinkErrorMsgs, msg)
+				}
+			}
 			continue
 		}
 		h.LastThinksDispatched++

@@ -1260,6 +1260,87 @@ func TestRunThink_ThinkCallerErrorTalliedAndSwallowed(t *testing.T) {
 		t.Errorf("LastThinkErrors got %d want 1 (failure should be tallied)",
 			h.LastThinkErrors)
 	}
+	// LastThinkErrorMsgs captures the first 8 unique error strings so
+	// the per-tic instrumentation can name the failure; with a single
+	// erroring slot we expect exactly one captured message.
+	if got := len(h.LastThinkErrorMsgs); got != 1 {
+		t.Fatalf("LastThinkErrorMsgs len got %d want 1", got)
+	}
+	if h.LastThinkErrorMsgs[0] == "" {
+		t.Errorf("LastThinkErrorMsgs[0] should be the swallowed err.Error(); got empty")
+	}
+}
+
+// LastThinkErrorMsgs de-duplicates identical error strings. Strategy:
+// stretch the edict pool with 10 monster_test slots all firing the
+// same funcID 0 -> same per-slot error message; LastThinkErrors tallies
+// 10 but LastThinkErrorMsgs holds exactly 1 (dedup branch).
+func TestRunThink_ErrorMsgsDedup(t *testing.T) {
+	bsp := buildHostBSP(t,
+		`{ "classname" "worldspawn" }
+		 { "classname" "monster_test" "origin" "0 0 0" }`, 1)
+	h, p := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	h.Server.Time = 1.0
+	// Arm the seeded monster_test slot first (proves the dedup path).
+	ev, _ := progs.NewEntVars(p, h.Server.Edicts[2])
+	_ = ev.WriteFloat("nextthink", 0.5)
+	_ = ev.WriteInt32("think", 0)
+	// Append 9 more identical-failure slots so runThink walks 10 total.
+	for i := 0; i < 9; i++ {
+		extra := &progs.Edict{Fields: make([]byte, len(h.Server.Edicts[2].Fields))}
+		copy(extra.Fields, h.Server.Edicts[2].Fields)
+		h.Server.Edicts = append(h.Server.Edicts, extra)
+	}
+	h.Server.NumEdicts = len(h.Server.Edicts)
+	h.runThink()
+	if h.LastThinkErrors != 10 {
+		t.Errorf("LastThinkErrors got %d want 10", h.LastThinkErrors)
+	}
+	if got := len(h.LastThinkErrorMsgs); got != 1 {
+		t.Errorf("LastThinkErrorMsgs len got %d want 1 (dedup)", got)
+	}
+}
+
+// LastThinkErrorMsgs caps at 8 entries even when every error string is
+// distinct. Strategy: arm 10 erroring slots, each with a different
+// (also-bad) funcID. The capture prefixes the funcID into the msg so
+// each per-slot string is unique; dedup does NOT collapse them.
+// LastThinkErrors counts all 10, LastThinkErrorMsgs stops at 8.
+func TestRunThink_ErrorMsgsCap8(t *testing.T) {
+	bsp := buildHostBSP(t,
+		`{ "classname" "worldspawn" }
+		 { "classname" "monster_test" "origin" "0 0 0" }`, 1)
+	h, p := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	h.Server.Time = 1.0
+	// Arm seeded monster_test slot 2 with think funcID 1000 (way past
+	// the progs.Functions table -> ErrBadFunctionIndex with that
+	// prefix on the captured msg).
+	ev, _ := progs.NewEntVars(p, h.Server.Edicts[2])
+	_ = ev.WriteFloat("nextthink", 0.5)
+	_ = ev.WriteInt32("think", 1000)
+	// Append 9 more clones, each with a different (also-bad) funcID so
+	// every per-slot msg string is unique.
+	for i := 0; i < 9; i++ {
+		extra := &progs.Edict{Fields: make([]byte, len(h.Server.Edicts[2].Fields))}
+		copy(extra.Fields, h.Server.Edicts[2].Fields)
+		h.Server.Edicts = append(h.Server.Edicts, extra)
+		extraEv, _ := progs.NewEntVars(p, extra)
+		_ = extraEv.WriteInt32("think", int32(1001+i))
+	}
+	h.Server.NumEdicts = len(h.Server.Edicts)
+	h.runThink()
+	if h.LastThinkErrors != 10 {
+		t.Errorf("LastThinkErrors got %d want 10", h.LastThinkErrors)
+	}
+	if got := len(h.LastThinkErrorMsgs); got != 8 {
+		t.Errorf("LastThinkErrorMsgs len got %d want 8 (cap)", got)
+	}
 }
 
 // Frame calls runThink as part of the per-tic sequence. Smoke-test:
