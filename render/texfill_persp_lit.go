@@ -130,11 +130,11 @@ func FillPerspectiveLitTexturedPolygon(fb *FrameBuffer, tex *Pic, cm *ColorMap, 
 			y0, y1 := verts[i].Y, verts[j].Y
 			if (y0 <= yf && y1 > yf) || (y1 <= yf && y0 > yf) {
 				t := (yf - y0) / (y1 - y0)
-				xs[nXs] = verts[i].X + t*(verts[j].X-verts[i].X)
-				oozs[nXs] = hOoz[i] + t*(hOoz[j]-hOoz[i])
-				uozs[nXs] = hUoz[i] + t*(hUoz[j]-hUoz[i])
-				vozs[nXs] = hVoz[i] + t*(hVoz[j]-hVoz[i])
-				lozs[nXs] = hLoz[i] + t*(hLoz[j]-hLoz[i])
+				xs[nXs] = fma32(t, verts[j].X-verts[i].X, verts[i].X)
+				oozs[nXs] = fma32(t, hOoz[j]-hOoz[i], hOoz[i])
+				uozs[nXs] = fma32(t, hUoz[j]-hUoz[i], hUoz[i])
+				vozs[nXs] = fma32(t, hVoz[j]-hVoz[i], hVoz[i])
+				lozs[nXs] = fma32(t, hLoz[j]-hLoz[i], hLoz[i])
 				nXs++
 			}
 		}
@@ -177,10 +177,10 @@ func FillPerspectiveLitTexturedPolygon(fb *FrameBuffer, tex *Pic, cm *ColorMap, 
 			// Initial homogeneous values at the FIRST pixel center
 			// (x0 + 0.5), offset from xLeft.
 			xf := float32(x0) + 0.5
-			ooz := oozL + (xf-xLeft)*dOoz
-			uoz := uozL + (xf-xLeft)*dUoz
-			voz := vozL + (xf-xLeft)*dVoz
-			loz := lozL + (xf-xLeft)*dLoz
+			ooz := fma32(xf-xLeft, dOoz, oozL)
+			uoz := fma32(xf-xLeft, dUoz, uozL)
+			voz := fma32(xf-xLeft, dVoz, vozL)
+			loz := fma32(xf-xLeft, dLoz, lozL)
 
 			// First divide: real (u, v, l) at the first pixel.
 			z := 1.0 / ooz
@@ -202,10 +202,10 @@ func FillPerspectiveLitTexturedPolygon(fb *FrameBuffer, tex *Pic, cm *ColorMap, 
 					spanLen = PerspSubdivStep
 					// Advance the homogeneous accumulators to the
 					// start of the NEXT sub-span (8 pixels along).
-					oozEnd := ooz + dOoz*float32(PerspSubdivStep)
-					uozEnd := uoz + dUoz*float32(PerspSubdivStep)
-					vozEnd := voz + dVoz*float32(PerspSubdivStep)
-					lozEnd := loz + dLoz*float32(PerspSubdivStep)
+					oozEnd := fma32(dOoz, float32(PerspSubdivStep), ooz)
+					uozEnd := fma32(dUoz, float32(PerspSubdivStep), uoz)
+					vozEnd := fma32(dVoz, float32(PerspSubdivStep), voz)
+					lozEnd := fma32(dLoz, float32(PerspSubdivStep), loz)
 					zEnd := 1.0 / oozEnd
 					uNext = uozEnd * zEnd
 					vNext = vozEnd * zEnd
@@ -216,10 +216,10 @@ func FillPerspectiveLitTexturedPolygon(fb *FrameBuffer, tex *Pic, cm *ColorMap, 
 					// to pin the endpoint without overshooting.
 					spanLen = count
 					steps := float32(spanLen - 1)
-					oozEnd := ooz + dOoz*steps
-					uozEnd := uoz + dUoz*steps
-					vozEnd := voz + dVoz*steps
-					lozEnd := loz + dLoz*steps
+					oozEnd := fma32(dOoz, steps, ooz)
+					uozEnd := fma32(dUoz, steps, uoz)
+					vozEnd := fma32(dVoz, steps, voz)
+					lozEnd := fma32(dLoz, steps, loz)
 					zEnd := 1.0 / oozEnd
 					uNext = uozEnd * zEnd
 					vNext = vozEnd * zEnd
@@ -265,10 +265,10 @@ func FillPerspectiveLitTexturedPolygon(fb *FrameBuffer, tex *Pic, cm *ColorMap, 
 				// Advance to the next sub-span: homogeneous
 				// accumulators step by spanLen pixels; (u, v, l)
 				// resume from the divided-exact endpoints.
-				ooz += dOoz * float32(spanLen)
-				uoz += dUoz * float32(spanLen)
-				voz += dVoz * float32(spanLen)
-				loz += dLoz * float32(spanLen)
+				ooz = fma32(dOoz, float32(spanLen), ooz)
+				uoz = fma32(dUoz, float32(spanLen), uoz)
+				voz = fma32(dVoz, float32(spanLen), voz)
+				loz = fma32(dLoz, float32(spanLen), loz)
 				u = uNext
 				v = vNext
 				l = lNext
