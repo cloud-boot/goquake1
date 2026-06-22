@@ -12,6 +12,7 @@ import (
 	"github.com/go-quake1/engine/model"
 	"github.com/go-quake1/engine/progs"
 	"github.com/go-quake1/engine/server"
+	"github.com/go-quake1/engine/sound"
 	"github.com/go-quake1/engine/world"
 )
 
@@ -116,6 +117,38 @@ type Host struct {
 	// builtin (or other failure) instead of just a count. The 8-entry
 	// cap bounds the cost of de-dup + log emission per tic.
 	LastThinkErrorMsgs []string
+
+	// Sounds is the parallel-to-Server.SoundPrecache slice of parsed
+	// *sound.Sample blobs. Populated by [Host.PrecacheSound]; consumed
+	// by [Host.StartSound] / [Host.AmbientSound] to feed the mixer
+	// without re-parsing the WAV body. Index 0 is the empty-string
+	// sentinel slot (always nil); index >= 1 maps onto Server.SoundPrecache.
+	Sounds []*sound.Sample
+
+	// LastSoundsStarted is the cumulative count of successful
+	// [Host.StartSound] calls; bumped per per-tic sound-firing builtin.
+	// Exposed for bring-up instrumentation (quake-tamago logs the delta
+	// per 60-tic cadence so the serial output proves the QC builtin
+	// reached the mixer).
+	LastSoundsStarted int
+
+	// LastAmbientsStarted is the cumulative count of successful
+	// [Host.AmbientSound] calls. Separate from LastSoundsStarted so the
+	// instrumentation can distinguish "looped ambient tracks parked at
+	// spawn time" from "per-tic gameplay sound triggers".
+	LastAmbientsStarted int
+
+	// soundPool is the mixer pool installed via [Host.SetSoundPool].
+	// nil = audio path silent-no-ops (the runloop owns its own pool;
+	// the host needs a reference so the QC-driven StartSound builtin
+	// can park samples on the SAME pool the runloop's Paint walks).
+	soundPool *sound.Pool
+
+	// soundLoader is the WAV blob lookup installed via
+	// [Host.SetSoundLoader]. nil = PrecacheSound surfaces the no-loader
+	// path (ErrSoundLoadFailed). Decoupled from the host so the package
+	// stays free of any `pak` / `vfs` dependency.
+	soundLoader SoundLoader
 }
 
 // ErrNilDep fires on a missing required NewHost dependency.

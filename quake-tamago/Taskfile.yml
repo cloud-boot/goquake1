@@ -20,6 +20,7 @@ vars:
   PPM: '/tmp/quake-frame.ppm'
   SERIAL: '/tmp/quake-serial.log'
   MON: '/tmp/quake-mon.sock'
+  WAV: '/tmp/quake-audio.wav'   # PCM capture from virtio-sound (qemu-headless)
   CPU: '{{default "max" .CPU}}'
   MEM: '{{default "2G" .MEM}}'  # tamago boot fails silently with < 1G; 2G mirrors validate/run.sh
 
@@ -92,16 +93,25 @@ tasks:
           -kernel "{{.ELF}}"
 
   qemu-headless:
-    desc: Boot in QEMU headless + capture one screendump after 5 seconds.
+    desc: Boot in QEMU headless + capture one screendump after 5 seconds + capture virtio-sound PCM output to a WAV.
     deps: [build]
     cmds:
-      - rm -f "{{.PPM}}" "{{.SERIAL}}" "{{.MON}}"
+      - rm -f "{{.PPM}}" "{{.SERIAL}}" "{{.MON}}" "{{.WAV}}"
       - |
+        # virtio-sound output captured via -audiodev wav,path=...: QEMU
+        # mixes every running playback stream into a single 44.1 kHz
+        # stereo PCM and writes it as a WAV file. With the engine wired
+        # to drive sound + ambientsound through virtio-sound, this WAV
+        # is the autonomous-visual-verification (autonomous-audio-
+        # verification) artefact -- a non-silent WAV proves the engine
+        # actually emitted PCM, not just that the mixer ticked.
         qemu-system-x86_64 -M q35 -accel tcg -cpu {{.CPU}} -m {{.MEM}} \
           -display none -no-reboot -vga none \
           -device virtio-gpu-pci,id=vgpu \
           -device virtio-keyboard-pci,id=vkbd \
           -device virtio-mouse-pci,id=vmouse \
+          -device virtio-sound-pci,id=vsnd,audiodev=audio0 \
+          -audiodev wav,id=audio0,path={{.WAV}} \
           -serial "file:{{.SERIAL}}" \
           -monitor "unix:{{.MON}},server,nowait" \
           -kernel "{{.ELF}}" &
@@ -121,6 +131,7 @@ tasks:
         kill $QPID 2>/dev/null || true
         wait $QPID 2>/dev/null || true
       - test -s "{{.PPM}}" && echo "wrote {{.PPM}} ($(wc -c < {{.PPM}}) bytes)"
+      - test -s "{{.WAV}}" && echo "wrote {{.WAV}} ($(wc -c < {{.WAV}}) bytes)" || echo "WAV not captured (virtio-sound not driven)"
 
   capture-waypoints:
     desc: Boot QEMU headless + capture one PPM per demo-orbit waypoint (4 PPMs to /tmp/quake-orbit-NN.ppm).
@@ -132,5 +143,5 @@ tasks:
     desc: Remove build artifacts + any captured PPM/log files.
     cmds:
       - rm -rf {{.TASKFILE_DIR}}/build
-      - rm -f {{.PPM}} {{.SERIAL}} {{.MON}}
+      - rm -f {{.PPM}} {{.SERIAL}} {{.MON}} {{.WAV}}
       - rm -f /tmp/quake-orbit-*.ppm /tmp/quake-orbit-serial.log /tmp/quake-orbit-mon.sock

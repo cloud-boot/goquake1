@@ -513,6 +513,36 @@ func run() error {
 		fmt.Printf("QUAKE: sound pool seeded -- %d sample(s) playing on reserved-static slots\n", seeded)
 	}
 
+	// 11c. Unify the mixer pool: the runner currently owns a per-Runner
+	//      pool (allocated by NewRunnerFromVFS); replace it with the
+	//      host's pool (allocated INSIDE buildHost, BEFORE SpawnServer,
+	//      so the spawn-time QC's sound/ambientsound builtins landed
+	//      channels on a real pool from the start). After this swap
+	//      the per-tic runloop's Paint walks the SAME bank the
+	//      QC-driven StartSound / AmbientSound calls fill. Without
+	//      this the per-tic Paint would walk an unused empty pool and
+	//      the QC-channels' samples would never reach the mixer's
+	//      Paint output. Census of precached + mixer-loaded sounds is
+	//      emitted so the serial log proves the wiring took effect.
+	if realHost != nil && realHost.SoundPool() != nil {
+		runner.SoundPool = realHost.SoundPool()
+		precached := 0
+		for i := 1; i < len(realHost.Server.SoundPrecache); i++ {
+			if realHost.Server.SoundPrecache[i] != "" {
+				precached++
+			}
+		}
+		mixerSamples := 0
+		for _, s := range realHost.Sounds {
+			if s != nil {
+				mixerSamples++
+			}
+		}
+		active := realHost.SoundPool().ActiveCount()
+		fmt.Printf("QUAKE: mixer pool unified host<->runner -- %d sounds precached (wire), %d samples loaded (mixer), %d channels already active (ambient tracks parked at spawn time)\n",
+			precached, mixerSamples, active)
+	}
+
 	// 12. Build the Pre2DDraw hook (BSP load, mark/walk contexts,
 	//     synthetic texture, identity colormap) + anchor the camera
 	//     origin at pickInMapCamera. The closure is wired onto the
@@ -1012,14 +1042,21 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				entOrigin = es.Origin
 				entPresent = true
 			}
-			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v src=%s entOrigin=%v entPresent=%v (PlayerNum=%d, %d entities cached) viewAngles=%v cmd.fwd=%v cmd.side=%v clientConn=%d cl.vel=%v cl.viewh=%v cl.health=%d; %d surfaces; audio: %d active, %d mixed\n",
+			soundsStarted := 0
+			ambientsStarted := 0
+			if realHost != nil {
+				soundsStarted = realHost.LastSoundsStarted
+				ambientsStarted = realHost.LastAmbientsStarted
+			}
+			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v src=%s entOrigin=%v entPresent=%v (PlayerNum=%d, %d entities cached) viewAngles=%v cmd.fwd=%v cmd.side=%v clientConn=%d cl.vel=%v cl.viewh=%v cl.health=%d; %d surfaces; audio: %d active, %d mixed; sounds_started=%d ambients_started=%d\n",
 				frame, origin, viewSrc, entOrigin, entPresent,
 				runner.Client.PlayerNum, len(runner.Client.Entities),
 				viewAngles, cmdFwd, cmdSide,
 				int(runner.Client.Connection),
 				runner.Client.Velocity, runner.Client.ViewHeightOffset, runner.Client.Health,
 				surfaces.Len(),
-				active, enginesound.MixBufferStereoFrames)
+				active, enginesound.MixBufferStereoFrames,
+				soundsStarted, ambientsStarted)
 
 			// One-shot Entities-map census on the first per-60 log
 			// after the wire drain has populated svc_updates. Surfaces
@@ -1420,6 +1457,33 @@ func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
 	}
 	h.SetProgs(p)
 
+	// 3a. Sound loader: closure over the embedded pakFS so the QC
+	//     precache_sound + ambientsound builtins can resolve WAV blobs
+	//     by canonical "sound/<n>.wav" path. Without this hook, every
+	//     spawn-time precache_sound call surfaces ErrSoundLoadFailed
+	//     (the host's PrecacheSound logs + continues; the wire-side
+	//     precache slot is still filled so the missing-mixer-sample
+	//     path is the only fallout -- the slot just won't audibly fire
+	//     later).
+	h.SetSoundLoader(func(name string) ([]byte, bool) {
+		return tryReadPakFile(pakFS, name)
+	})
+
+	// 3b. Mixer pool: pre-allocate BEFORE SpawnServer runs so the
+	//     spawn-time QC's sound() + ambientsound() builtins land
+	//     channels on a real pool. Without this the spawn pass logs
+	//     "no sound pool wired" for every static ambient sound the
+	//     map's worldspawn function fires (water1, wind, ...). The
+	//     SAME pointer is later handed to the runner (in run()) so
+	//     the runloop's per-tic Paint walks the same channel bank.
+	//     The 8-static-slot count matches the runloop's existing
+	//     default for ambient (level-ambience) sources.
+	pool, perr := enginesound.NewPool(8)
+	if perr != nil {
+		return nil, fmt.Errorf("buildHost: NewPool: %w", perr)
+	}
+	h.SetSoundPool(pool)
+
 	// 4. Builtin table. RegisterMathBuiltins wires the 9 pure-math
 	//    builtins (normalize / vlen / vectoangles / random / ...);
 	//    registerSpawnTimeBuiltins layers no-op stubs on top of every
@@ -1761,7 +1825,7 @@ func registerSpawnTimeBuiltins(vm *progs.VM, h *enginehost.Host) error {
 	vm.RegisterBuiltin(progs.BuiltinSetModel, builtinSetModel(h))
 	vm.RegisterBuiltin(progs.BuiltinSetSize, noop)
 	vm.RegisterBuiltin(progs.BuiltinBreak, noop)
-	vm.RegisterBuiltin(progs.BuiltinSound, noop)
+	vm.RegisterBuiltin(progs.BuiltinSound, builtinSound(h))
 	vm.RegisterBuiltin(progs.BuiltinError, noop)
 	vm.RegisterBuiltin(progs.BuiltinObjError, noop)
 	vm.RegisterBuiltin(progs.BuiltinSpawn, noop)
@@ -1769,7 +1833,7 @@ func registerSpawnTimeBuiltins(vm *progs.VM, h *enginehost.Host) error {
 	vm.RegisterBuiltin(progs.BuiltinTraceLine, builtinTraceLine(h))
 	vm.RegisterBuiltin(progs.BuiltinCheckClient, noop)
 	vm.RegisterBuiltin(progs.BuiltinFind, noop)
-	vm.RegisterBuiltin(progs.BuiltinPrecacheSound, noop)
+	vm.RegisterBuiltin(progs.BuiltinPrecacheSound, builtinPrecacheSound(h))
 	vm.RegisterBuiltin(progs.BuiltinPrecacheModel, builtinPrecacheModel(h))
 	vm.RegisterBuiltin(progs.BuiltinStuffCmd, noop)
 	vm.RegisterBuiltin(progs.BuiltinFindRadius, builtinFindRadius(h))
@@ -1806,9 +1870,15 @@ func registerSpawnTimeBuiltins(vm *progs.VM, h *enginehost.Host) error {
 	// the builtin returns. Indices in between (68/69/70/71/73/75/...)
 	// get stubbed too so the next undefined-slot won't surface as the
 	// progs.dat exercises further functions on subsequent ticks.
-	for _, idx := range []int{68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79} {
+	for _, idx := range []int{68, 69, 70, 71, 72, 73, 75, 76, 77, 78, 79} {
 		vm.RegisterBuiltin(idx, noop)
 	}
+	// ambientsound(pos, samp, vol, atten) -- builtin #74. The C upstream
+	// PF_ambientsound (pr_cmds.c) calls SV_StartSound at the supplied
+	// world position with a static channel. Wired here against the
+	// host's mixer pool via [enginehost.Host.AmbientSound]; see
+	// [builtinAmbientSound] for the per-arg shape.
+	vm.RegisterBuiltin(74, builtinAmbientSound(h))
 	// WriteByte / WriteChar / WriteShort / WriteLong / WriteCoord /
 	// WriteAngle / WriteString / WriteEntity occupy slots 52..60 in
 	// tyrquake's table. Server-side QC emits client-message bytes
@@ -1876,6 +1946,207 @@ func builtinPrecacheModel(h *enginehost.Host) progs.Builtin {
 			fmt.Printf("QUAKE: precache_model(%q): %v\n", name, err)
 		}
 		return vm.SetGlobalInt(progs.OfsReturn, off)
+	}
+}
+
+// builtinPrecacheSound returns a Builtin closure that implements the
+// QuakeC precache_sound(name) built-in (tyrquake's PF_precache_sound
+// at builtin slot 19). Reads the string_t name from OFS_PARM0, loads
+// the WAV via the host's injected SoundLoader (the WAV body lives at
+// "sound/<name>" inside pak0), parses it via [sound.LoadWav], and
+// records both the wire-side precache slot (Server.SoundPrecache) and
+// the mixer-side parsed *Sample (h.Sounds[idx]) via
+// [enginehost.Host.PrecacheSound]. Writes the SAME string_t offset
+// back to OFS_RETURN so `self.noise = precache_sound("doors/medtry.wav")`
+// stores the original string onto the edict (matching precache_model).
+//
+// nil host / nil server is a tolerated no-op (matches the no-op stub
+// shape: spawn QC still proceeds to its field-assignment half). A
+// precache failure (loader miss, parse error, table full) is logged
+// + the call still returns the input string_t so QC bytecode stays
+// intact (the missing sound just won't audibly fire later).
+func builtinPrecacheSound(h *enginehost.Host) progs.Builtin {
+	return func(vm *progs.VM) error {
+		if h == nil || h.Server == nil {
+			return nil
+		}
+		off, _ := vm.GlobalInt(progs.OfsParm0)
+		name := vm.String(off)
+		if name == "" {
+			return vm.SetGlobalInt(progs.OfsReturn, off)
+		}
+		if _, err := h.PrecacheSound(name); err != nil {
+			fmt.Printf("QUAKE: precache_sound(%q): %v\n", name, err)
+		}
+		return vm.SetGlobalInt(progs.OfsReturn, off)
+	}
+}
+
+// builtinSound returns a Builtin closure that implements the QuakeC
+// sound(entity, channel, samplename, volume, attenuation) built-in
+// (tyrquake's PF_sound at builtin slot 8). Reads:
+//
+//	OFS_PARM0 = entity pointer
+//	OFS_PARM1 = channel (float, truncated to int 0..7)
+//	OFS_PARM2 = samplename (string_t)
+//	OFS_PARM3 = volume (float in [0, 1], scaled to 0..255)
+//	OFS_PARM4 = attenuation (float; ATTN_NORM=1, ATTN_NONE=0, ...)
+//
+// Dispatches the play-event onto h's mixer pool via
+// [enginehost.Host.StartSound]. The QC builtin returns void, so no
+// OFS_RETURN write is needed.
+//
+// Entity resolution: when the arena is attached the entity-pointer is
+// resolved to a slot via [progs.EdictArena.ResolvePointer]; on no-arena
+// / unresolvable pointer / world (slot 0) we pass entIdx=0 (the world).
+//
+// Spatialization is DEFERRED: the bring-up shape ignores the entity's
+// world position + attenuation and plays at full master volume (= the
+// sound is audible regardless of listener position). The leftVol /
+// rightVol arguments are -1 sentinels so [Host.StartSound] uses the
+// caller-supplied master volume on both ears. A follow-up batch wires
+// the per-tic [sound.Spatialize] pass once the camera origin + right
+// axis are threaded into the call site.
+//
+// Tolerated no-ops: nil host / no sound pool / empty name / missing
+// precache slot all return nil silently after logging. Surfacing the
+// error would abort the per-tic dispatch and skip the rest of the
+// frame's QC -- not what we want when one missing sound shouldn't
+// crash the game.
+func builtinSound(h *enginehost.Host) progs.Builtin {
+	return func(vm *progs.VM) error {
+		if h == nil {
+			return nil
+		}
+		entPtr, _ := vm.GlobalInt(progs.OfsParm0)
+		chanF, _ := vm.GlobalFloat(progs.OfsParm1)
+		nameOff, _ := vm.GlobalInt(progs.OfsParm2)
+		volF, _ := vm.GlobalFloat(progs.OfsParm3)
+		// PARM4 = attenuation; carried for the future Spatialize wiring
+		// (read here so the per-arg layout is documented + future code
+		// only flips one line, not five).
+		_, _ = vm.GlobalFloat(progs.OfsParm4)
+
+		name := vm.String(nameOff)
+		if name == "" {
+			return nil
+		}
+
+		// Resolve entity-pointer to a slot index. Slot 0 (world) is the
+		// upstream's "no specific origin" sentinel; non-world slots are
+		// for entity-attached sounds (weapon fire, monster grunt, ...).
+		entIdx := 0
+		if arena := vm.Arena(); arena != nil && entPtr != 0 {
+			if ed, _, err := arena.ResolvePointer(entPtr); err == nil {
+				for i, e := range h.Server.Edicts {
+					if e == ed {
+						entIdx = i
+						break
+					}
+				}
+			}
+		}
+
+		channel := int(chanF)
+		if channel < 0 {
+			channel = 0
+		}
+		if channel > 7 {
+			channel = 7
+		}
+		// QC's volume is [0, 1]; the mixer's range is [0, 255].
+		vol := int(volF * 255)
+		if vol < 0 {
+			vol = 0
+		}
+		if vol > 255 {
+			vol = 255
+		}
+
+		if _, err := h.StartSound(entIdx, channel, name, vol, -1, -1); err != nil {
+			// Log + continue. The most common failure here is "sample
+			// not precached" -- a real bug in the asset path but not
+			// a reason to abort the per-tic dispatch.
+			fmt.Printf("QUAKE: sound(ent=%d ch=%d %q vol=%d): %v\n",
+				entIdx, channel, name, vol, err)
+		}
+		return nil
+	}
+}
+
+// ambientSlotCounter is the round-robin index the per-call ambientsound
+// builtin advances so each ambient source in the map lands on its own
+// reserved-static channel. Wraps at pool.ReservedStatic (the call below
+// modulo-clamps). tyrquake's PF_ambientsound also allocates from a
+// fixed bank; the wrap is benign (>= ReservedStatic ambient sources
+// in one map is exceedingly rare in the shareware progs).
+var ambientSlotCounter int
+
+// builtinAmbientSound returns a Builtin closure that implements the
+// QuakeC ambientsound(position, samplename, volume, attenuation)
+// built-in (tyrquake's PF_ambientsound at builtin slot 74). Reads:
+//
+//	OFS_PARM0 = position (vec3, world-space anchor)
+//	OFS_PARM1 = samplename (string_t)
+//	OFS_PARM2 = volume (float in [0, 1])
+//	OFS_PARM3 = attenuation (float; typically ATTN_STATIC=3)
+//
+// Parks the sample on the next reserved-static channel via
+// [enginehost.Host.AmbientSound]. The position is logged but NOT yet
+// fed into a spatial mix (the mixer's Spatialize wiring is the
+// follow-up); for the audio-pipeline-validation goal what matters is
+// that ambient sources spawned by the map (water1, wind, gurgle,
+// generator hum) become non-silent on the mixer output the moment
+// SpawnServer's QC pass calls this builtin.
+//
+// Returns void.
+func builtinAmbientSound(h *enginehost.Host) progs.Builtin {
+	return func(vm *progs.VM) error {
+		if h == nil || h.SoundPool() == nil {
+			return nil
+		}
+		// Read the world-space anchor; carried for the future Spatialize
+		// wiring (the C upstream stores it on the static channel so
+		// SND_Spatialize can compute per-frame L/R falloff).
+		_, _ = vm.GlobalVector(progs.OfsParm0)
+		nameOff, _ := vm.GlobalInt(progs.OfsParm1)
+		volF, _ := vm.GlobalFloat(progs.OfsParm2)
+		_, _ = vm.GlobalFloat(progs.OfsParm3)
+
+		name := vm.String(nameOff)
+		if name == "" {
+			return nil
+		}
+
+		// Auto-precache: the upstream PF_ambientsound calls SV_FindIndex
+		// on the soundname + Sys_Error's if it's missing; the Go port
+		// triggers a precache here so map-spawn ambient sources don't
+		// need a separate precache_sound call (the QC startup pass for
+		// many entity classes calls ambientsound directly without
+		// pre-precaching).
+		if _, err := h.PrecacheSound(name); err != nil {
+			fmt.Printf("QUAKE: ambientsound precache(%q): %v\n", name, err)
+			return nil
+		}
+
+		reserved := h.SoundPool().ReservedStatic
+		if reserved <= 0 {
+			return nil
+		}
+		slot := ambientSlotCounter % reserved
+		ambientSlotCounter++
+
+		vol := int(volF * 255)
+		if vol < 0 {
+			vol = 0
+		}
+		if vol > 255 {
+			vol = 255
+		}
+		if _, err := h.AmbientSound(slot, 0, name, vol); err != nil {
+			fmt.Printf("QUAKE: ambientsound(%q vol=%d slot=%d): %v\n", name, vol, slot, err)
+		}
+		return nil
 	}
 }
 
