@@ -12,10 +12,13 @@
 //
 // First-bring-up scope:
 //
-//   - Synthetic asset VFS (palette + colormap + conchars built in code).
-//     The renderer-side asset pipeline keeps the synthetic lumps until
-//     the WAD/miptex bridge lands; the BSP and progs.dat are loaded
-//     out of the embedded pak0.pak via embedpak.OpenAsFS.
+//   - Asset VFS overlays the real pak (palette + colormap from
+//     gfx/palette.lmp + gfx/colormap.lmp) on top of a synthetic
+//     fallback (palette + colormap + conchars built in code). The
+//     real pak takes precedence per-lump; lumps the pak lacks (the
+//     Quake Remastered archive ships no gfx/conchars.lmp) fall
+//     through to the synthetic copy. The BSP and progs.dat are
+//     loaded out of the same embedded pak via embedpak.OpenAsFS.
 //
 //   - The real host.Host is constructed when embedpak.OpenAsFS yields a
 //     non-placeholder pak: progs.Load + progs.NewVM + model.NewCache +
@@ -180,22 +183,37 @@ func run() error {
 		return fmt.Errorf("virtio.New: %w", err)
 	}
 
-	// 5. Build a synthetic VFS with the minimum assets LoadStandard
-	//    needs (palette + colormap + conchars). The real pak0 carries
-	//    these lumps too but the WAD/miptex bridge that would consume
-	//    them is a follow-up; for first bring-up the synthetic copies
-	//    keep the asset side deterministic.
-	v := vfs.New()
-	v.Add(syntheticAssets())
-
-	// 6. Open the embedded pak once. Shared between loadBSP (renderer)
-	//    and the host's FileResolver (server-side worldmodel + miptex
-	//    bytes-by-name). nil means the placeholder is still installed;
-	//    the renderer falls back to synthbsp + the host stays stubbed.
+	// 5. Open the embedded pak once. Shared between loadBSP (renderer),
+	//    the host's FileResolver (server-side worldmodel + miptex bytes
+	//    by name) AND the asset vfs (palette/colormap/conchars). nil
+	//    means the placeholder is still installed; the renderer falls
+	//    back to synthbsp + the host stays stubbed.
 	pakFS, pakErr := embedpak.OpenAsFS()
 	if pakErr != nil {
 		fmt.Printf("QUAKE: embedpak.OpenAsFS failed (%v); host stays stubbed\n", pakErr)
 	}
+
+	// 6. Build the asset VFS as an ordered overlay: synthetic fallback
+	//    first, real pak last. vfs.SearchPath.Add prepends to the probe
+	//    chain, so the LAST Add wins -- the real pak's gfx/palette.lmp
+	//    (768 real id-Software bytes) takes precedence over the
+	//    deterministic synthetic palette, ditto for gfx/colormap.lmp.
+	//    The Quake Remastered pak ships palette + colormap but not
+	//    gfx/conchars.lmp; for that key the probe falls through to the
+	//    synthetic glyph sheet. assets.LoadStandard inside
+	//    NewRunnerFromVFS then sees the real bytes for the lumps the
+	//    pak provides + the synthetic bytes for the ones it doesn't.
+	v := vfs.New()
+	syn := syntheticAssets()
+	v.Add(syn) // fallback layer (prepended -> ends up last in probe order)
+	if pakFS != nil {
+		v.Add(pakFS) // real pak (prepended -> first in probe order)
+	}
+	reportLumpSources(v, pakFS, syn, []string{
+		"gfx/palette.lmp",
+		"gfx/colormap.lmp",
+		"gfx/conchars.lmp",
+	})
 
 	// 7. Build the real Host when a real pak is available. Failures
 	//    here log + fall back to stubHost so the binary still boots +
@@ -345,9 +363,9 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	//     of the BSP's LUMP_TEXTURES and stash one *render.Pic per
 	//     slot. Per-face texture pick happens inside Pre2DDraw via
 	//     BrushModel.FaceMipTexIdx. The pixels are palette-indexed in
-	//     the BSP's own (id1) palette; until the engine swaps its
-	//     synthetic palette for gfx/palette.lmp the visible colours
-	//     will look weird, but per-face texture variation is genuine.
+	//     the BSP's own (id1) palette; the asset VFS now serves the
+	//     real gfx/palette.lmp out of the embedded pak, so the
+	//     destination RGBA the renderer emits is in true id1 colours.
 	miptexPics, loaded, total, err := loadMiptexPics(file)
 	if err != nil {
 		return fmt.Errorf("loadMiptexPics: %w", err)
@@ -550,9 +568,9 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 // to the synthetic checker for those.
 //
 // The pixels are palette-indexed in the BSP's own (id1) palette; the
-// engine is still booted on a synthetic palette here, so on-screen the
-// colours look weird -- the GEOMETRY however is now correctly textured
-// per face. A future batch swaps the palette to gfx/palette.lmp.
+// engine now loads the real gfx/palette.lmp out of the embedded pak
+// (reportLumpSources in run() logs the swap), so the destination RGBA
+// the renderer emits is in true id1 colours.
 //
 // Returns (slice, loaded, total, err) where loaded is the count of
 // non-nil entries and total is the directory's slot count. A synthetic
@@ -945,6 +963,47 @@ func syntheticAssets() fs.FS {
 		"gfx/colormap.lmp": makeColorMapLump(),
 		"gfx/conchars.lmp": makeConcharsLump(),
 	}
+}
+
+// reportLumpSources probes each named lump against the live SearchPath
+// and prints which source (real pak vs synthetic fallback) wins.
+// The classification compares the resolved bytes (from v) against the
+// real pak's bytes for the same key: a match -> "real pak"; a mismatch
+// or missing-from-pak entry -> "synthetic". This gives the QEMU serial
+// log an unambiguous one-line confirmation that the palette swap
+// landed (the whole point of this batch) without having to eyeball
+// the PPM colours through a screendump.
+func reportLumpSources(v *vfs.SearchPath, pakFS fs.FS, syn fs.FS, lumps []string) {
+	for _, name := range lumps {
+		got, ok := tryReadFromFS(v, name)
+		if !ok {
+			fmt.Printf("QUAKE: %s NOT FOUND in any source\n", name)
+			continue
+		}
+		source := "synthetic"
+		if pakFS != nil {
+			if real, okp := tryReadFromFS(pakFS, name); okp && bytes.Equal(real, got) {
+				source = "real pak"
+			}
+		}
+		fmt.Printf("QUAKE: %s from %s (%d bytes)\n", name, source, len(got))
+	}
+}
+
+// tryReadFromFS opens name on src and returns its contents. Reports
+// (nil, false) on any failure so the caller can fall through without
+// classifying the underlying error.
+func tryReadFromFS(src fs.FS, name string) ([]byte, bool) {
+	f, err := src.Open(name)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
 }
 
 // memFS is a minimal in-memory fs.FS used in place of testing/fstest.MapFS.
