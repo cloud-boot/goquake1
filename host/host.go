@@ -286,6 +286,25 @@ func (h *Host) Frame(dt float32) error {
 		return err
 	}
 
+	// Per-client svc_clientdata compose+encode. Runs BEFORE
+	// SendClientFrames so the per-tic player snapshot lands at the
+	// head of client.Message, the broadcast datagrams append after,
+	// and FlushClientMessage drains the whole thing through the
+	// loopback NetConn in one shot.
+	//
+	// tyrquake: SV_WriteClientdataToMessage inside SV_SendClientDatagram
+	// -- per-client, just before the entity/datagram append phase.
+	//
+	// A nil Progs (test stubs that boot without a bytecode binding)
+	// short-circuits WriteClientData internally; the existing
+	// SendClientFrames + flush still run for the broadcast datagrams.
+	p := h.findProgs()
+	for _, c := range h.Static.Clients {
+		if err := h.Server.WriteClientData(c, p); err != nil {
+			return err
+		}
+	}
+
 	// SendClientFrames is best-effort per-client; its PerClientErrs
 	// surface here as the first non-nil entry (so the caller can
 	// log + decide whether to DropClient). The slice itself is
@@ -295,6 +314,18 @@ func (h *Host) Frame(dt float32) error {
 	for _, perr := range res.PerClientErrs {
 		if perr != nil {
 			return perr
+		}
+	}
+
+	// FlushClientMessage drains each client.Message buffer through
+	// its bound NetConnection via SendReliable, then clears it. This
+	// is the server-to-client back-channel: without it, the per-tic
+	// svc_clientdata + broadcast datagrams the loop above wrote into
+	// client.Message never reach the loopback peer + client.Tick's
+	// drain finds an empty inbox.
+	for _, c := range h.Static.Clients {
+		if err := h.Server.FlushClientMessage(c); err != nil {
+			return err
 		}
 	}
 

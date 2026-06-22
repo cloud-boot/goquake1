@@ -641,9 +641,11 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 					cmdSide = c.Cmd.SideMove
 				}
 			}
-			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v fromEdict=%v viewAngles=%v cmd.fwd=%v cmd.side=%v clientConn=%d; %d surfaces; audio: %d active, %d mixed\n",
+			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v fromEdict=%v viewAngles=%v cmd.fwd=%v cmd.side=%v clientConn=%d cl.vel=%v cl.viewh=%v cl.health=%d; %d surfaces; audio: %d active, %d mixed\n",
 				frame, origin, fromEdict, viewAngles, cmdFwd, cmdSide,
-				int(runner.Client.Connection), surfaces.Len(),
+				int(runner.Client.Connection),
+				runner.Client.Velocity, runner.Client.ViewHeightOffset, runner.Client.Health,
+				surfaces.Len(),
 				active, enginesound.MixBufferStereoFrames)
 		}
 

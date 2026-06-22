@@ -4,6 +4,8 @@
 
 package server
 
+import "github.com/go-quake1/engine/progs"
+
 // SendFrameResult is what SendClientFrames returns: per-client
 // success/failure flags so the caller can DropClient any that
 // failed mid-send.
@@ -83,4 +85,75 @@ func (s *Server) SendClientFrames(static *Static) SendFrameResult {
 		result.PerClientErrs[i] = s.PreparePerClientMessage(c)
 	}
 	return result
+}
+
+// WriteClientData composes one svc_clientdata snapshot for client
+// (using [ComposeClientDataFromEdict] over the client's bound
+// [progs.Edict]) + writes it into client.Message. Silent no-op
+// when:
+//
+//   - client is nil / inactive / unspawned (matches
+//     [Server.PreparePerClientMessage]'s skip),
+//   - client.Edict is nil (the edict-pool isn't bound yet --
+//     SpawnServer ran without a NewClient pre-allocated slot),
+//   - p is nil (no progs bound; the encoder has nothing to read).
+//
+// On a successful compose the encoded bytes land in client.Message,
+// where [Server.FlushClientMessage] picks them up at end-of-tic.
+//
+// Returns the propagated [EncodeClientData] error (sizebuf overflow);
+// nil otherwise. The function never short-circuits on a missing
+// edict field -- the compose helper substitutes zero / default for
+// anything that isn't declared on the bound progs.
+func (s *Server) WriteClientData(client *Client, p *progs.Progs) error {
+	if client == nil || !client.Active || !client.Spawned {
+		return nil
+	}
+	if client.Edict == nil || p == nil {
+		return nil
+	}
+	state := ComposeClientDataFromEdict(p, client.Edict)
+	return EncodeClientData(client.Message, state)
+}
+
+// FlushClientMessage drains client.Message through client.NetConnection
+// (cast to [NetConn]) via SendReliable, then clears the buffer. This
+// is the missing back-channel: until this fires, the per-tic
+// svc_clientdata + svc_update bytes the encoders write into
+// client.Message never leave the server-side struct, and the loopback
+// client side reads nothing.
+//
+// Silent no-op when:
+//
+//   - client is nil / inactive (skip matches the upstream's
+//     per-slot loop),
+//   - client.Message has zero bytes (nothing to flush this tic),
+//   - client.NetConnection is nil or doesn't implement [NetConn]
+//     (test stubs without a bound transport).
+//
+// On a successful flush the buffer is cleared so the next tic
+// starts fresh. The send-side payload is the entire Message in one
+// SendReliable call (loopback has no MTU on reliable; UDP netcode
+// will fragment as needed in a future port).
+//
+// Returns the propagated SendReliable error (typically
+// [ErrNetConnClosed]); nil otherwise. The Message is NOT cleared
+// when SendReliable errors -- callers can retry next tic, or
+// DropClient the slot.
+func (s *Server) FlushClientMessage(client *Client) error {
+	if client == nil || !client.Active {
+		return nil
+	}
+	if client.Message == nil || client.Message.Len() == 0 {
+		return nil
+	}
+	conn, ok := client.NetConnection.(NetConn)
+	if !ok {
+		return nil
+	}
+	if _, err := conn.SendReliable(client.Message.Bytes()); err != nil {
+		return err
+	}
+	client.Message.Clear()
+	return nil
 }

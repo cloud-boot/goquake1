@@ -379,34 +379,84 @@ func TestFrame_PropagatesRunPhysicsError(t *testing.T) {
 	}
 }
 
-// Frame propagates a SendClientFrames write error. Force this by
-// shrinking an active client's Message buffer to 0 capacity, then
-// pushing a byte into ReliableDatagram so PreparePerClientMessage's
-// Write surfaces a sizebuf overflow.
-func TestFrame_PropagatesSendClientFramesError(t *testing.T) {
+// Frame propagates the per-client svc_clientdata write error.
+// Force this by shrinking an active client's Message buffer to 0
+// capacity so EncodeClientData's first WriteByte overflows. Frame
+// surfaces the propagated sizebuf overflow before SendClientFrames
+// even runs.
+func TestFrame_PropagatesWriteClientDataError(t *testing.T) {
 	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
 	h, _ := makeHost(t, bsp, 1)
 	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
 		t.Fatalf("SpawnServer: %v", err)
 	}
-	// Wire a client + flip it Active + Spawned so SendClientFrames
-	// will actually try to write to its Message buffer.
 	_, _, err := h.ConnectLoopback()
 	if err != nil {
 		t.Fatalf("ConnectLoopback: %v", err)
 	}
 	c := h.Static.Clients[0]
 	c.Spawned = true
-	// Replace the client's Message buffer with a zero-cap one so a
-	// 1-byte Write overflows. Push a payload into ReliableDatagram
-	// (sized to MaxMsgLen so the seed always succeeds) -- the
-	// per-client copy then surfaces ErrSizeBufOverflow.
-	c.Message = sizebuf.New(nil)
+	c.Message = sizebuf.New(nil) // 0 cap forces the first encoder byte to overflow
+
+	if err := h.Frame(0.05); !errors.Is(err, sizebuf.ErrSizeBufOverflow) {
+		t.Errorf("Frame: got %v; want sizebuf overflow from WriteClientData", err)
+	}
+}
+
+// Frame propagates a SendClientFrames write error. We isolate the
+// SendClientFrames overflow from the now-eager WriteClientData
+// overflow by clearing the bound edict (so WriteClientData
+// short-circuits) and pushing a byte into ReliableDatagram that
+// exceeds the client's pruned Message capacity. The
+// PreparePerClientMessage copy then surfaces the propagated
+// sizebuf overflow.
+func TestFrame_PropagatesSendClientFramesError(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	_, _, err := h.ConnectLoopback()
+	if err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	c := h.Static.Clients[0]
+	c.Spawned = true
+	c.Edict = nil                // bypass WriteClientData (compose helper short-circuits)
+	c.Message = sizebuf.New(nil) // zero cap -> reliable-datagram copy overflows
 	if err := h.Server.ReliableDatagram.Write([]byte{0x42}); err != nil {
 		t.Fatalf("seed reliable_datagram: %v", err)
 	}
-	if err := h.Frame(0.05); err == nil {
-		t.Error("Frame: got nil; want propagated SendClientFrames error")
+	if err := h.Frame(0.05); !errors.Is(err, sizebuf.ErrSizeBufOverflow) {
+		t.Errorf("Frame: got %v; want sizebuf overflow from SendClientFrames", err)
+	}
+}
+
+// Frame propagates a FlushClientMessage SendReliable error. Close
+// the loopback peer so SendReliable returns ErrNetConnClosed, then
+// seed the reliable_datagram so the per-client copy puts at least
+// one byte into client.Message (so the flush actually fires).
+func TestFrame_PropagatesFlushClientMessageError(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	cli, _, err := h.ConnectLoopback()
+	if err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	c := h.Static.Clients[0]
+	c.Spawned = true
+	c.Edict = nil // bypass WriteClientData so the flush is the failing step
+	if err := h.Server.ReliableDatagram.Write([]byte{0x77}); err != nil {
+		t.Fatalf("seed reliable_datagram: %v", err)
+	}
+	if err := cli.Close(); err != nil {
+		t.Fatalf("close client side: %v", err)
+	}
+	if err := h.Frame(0.05); !errors.Is(err, server.ErrNetConnClosed) {
+		t.Errorf("Frame: got %v; want propagated ErrNetConnClosed from flush", err)
 	}
 }
 
