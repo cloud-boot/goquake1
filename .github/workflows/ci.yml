@@ -11,6 +11,12 @@
 #
 # CGO=0. GOWORK=off (the engine is a standalone module, no workspace).
 #
+# Excluded from the package globs: `reference` (vendored C source, not
+# Go), and `quake-tamago` + `backend/virtio/realdev` (the bare-metal
+# TamaGo target + its adapter, which `replace`-depend on local-only
+# go-virtio/usbarmory sibling checkouts absent on CI runners; they build
+# only in the developer's multi-repo workspace).
+#
 # Coverage gate: 100% on every Go package. The bsptrace 87.8% floor
 # exception was removed once the synthetic-hull backfill landed: the
 # upstream tyrquake backoff loop turned out to be unreachable in the
@@ -47,11 +53,11 @@ jobs:
       - run: go version
 
       - name: go vet
-        run: go vet ./...
+        run: go vet $(go list ./... | grep -vE '/(reference|quake-tamago|backend/virtio/realdev)($|/)')
 
       - name: gofmt
         run: |
-          unformatted=$(gofmt -l $(find . -name '*.go' -not -path './reference/*'))
+          unformatted=$(gofmt -l $(find . -name '*.go' -not -path './reference/*' -not -path './quake-tamago/*' -not -path './backend/virtio/realdev/*'))
           if [ -n "$unformatted" ]; then
             echo "::error::gofmt needs to be run on:"
             echo "$unformatted"
@@ -62,7 +68,7 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          for pkg in $(go list ./... | grep -v '/reference'); do
+          for pkg in $(go list ./... | grep -vE '/(reference|quake-tamago|backend/virtio/realdev)($|/)'); do
             pkg_short=$(echo "$pkg" | sed 's|github.com/go-quake1/engine/||')
             out=$(go test -cover "$pkg" 2>&1 | tail -n 1)
             echo "$out"
@@ -95,7 +101,7 @@ jobs:
       - run: go version
 
       - name: go test
-        run: go test $(go list ./... | grep -v '/reference')
+        run: go test $(go list ./... | grep -vE '/(reference|quake-tamago|backend/virtio/realdev)($|/)')
 
   emulated:
     name: test (${{ matrix.arch }}, qemu)
@@ -136,7 +142,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p _qemu
-          for pkg in $(go list ./... | grep -v '/reference'); do
+          for pkg in $(go list ./... | grep -vE '/(reference|quake-tamago|backend/virtio/realdev)($|/)'); do
             name=$(echo "$pkg" | tr '/.' '__')
             if go test -c -cover -o "_qemu/${name}.test" "$pkg"; then
               echo "built ${name}.test for $pkg"
