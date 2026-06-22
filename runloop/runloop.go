@@ -206,7 +206,11 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 	//    so a pre-signon Tick is a pure inbound-drain (no spurious
 	//    clc_move on the wire before the handshake completes).
 	in := client.TickInput{
-		Buttons:       r.Buttons,
+		// Pointer (not a copy) so the per-frame impulse drain inside
+		// KeyState lands on the runloop's persistent r.Buttons state.
+		// See client.TickInput.Buttons + client.BaseMove docs for the
+		// "0.5 forever" bug a stack copy would re-introduce.
+		Buttons:       &r.Buttons,
 		MouseDX:       snap.MouseDX,
 		MouseDY:       snap.MouseDY,
 		Sensitivity:   1,

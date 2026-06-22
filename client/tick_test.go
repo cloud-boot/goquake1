@@ -415,7 +415,7 @@ func TestTick_ForwardButtonProducesPositiveForwardMove(t *testing.T) {
 
 	in := defaultTickInput()
 	// Hold the +forward key for the entire frame.
-	in.Buttons.Forward.Pressed = 1
+	in.Buttons = &MovementButtons{Forward: ButtonState{Pressed: 1}}
 
 	if _, err := Tick(st, cli, in, [3]float32{}); err != nil {
 		t.Fatalf("Tick: %v", err)

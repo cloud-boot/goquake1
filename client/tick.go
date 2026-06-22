@@ -16,9 +16,16 @@ import (
 // TickInput is the per-frame caller-supplied input bundle. Frontends
 // (SDL / Wayland / DirectFB / TamaGo IO) fill this from their input
 // source each tick. tyrquake: IN_Move + the in_* cvar reads.
+//
+// Buttons is a POINTER, not a copy: [KeyState] (called by [BaseMove]
+// and [AdjustAngles] downstream) clears the per-frame impulse bits as
+// it samples them, and the drain MUST land on the caller's persistent
+// kbutton state -- a stack copy would let the down-edge bit live on
+// forever and KeyState would report a constant 0.5 every frame the key
+// stayed held, collapsing the move axes to cl_*speed/2 on the wire.
 type TickInput struct {
-	Buttons       MovementButtons // current button state (with this-frame events merged in)
-	MouseDX       float32         // pixel delta since last tick
+	Buttons       *MovementButtons // current button state (with this-frame events merged in)
+	MouseDX       float32          // pixel delta since last tick
 	MouseDY       float32
 	Sensitivity   float32     // cl_sensitivity cvar (typical default 3)
 	Speeds        InputSpeeds // per-axis sensitivity bundle (DefaultInputSpeeds() ok)
@@ -186,9 +193,16 @@ func Tick(
 	}
 
 	angles := ApplyMouseMove(viewAngles, in.MouseDX, in.MouseDY, in.Sensitivity)
-	angles = AdjustAngles(angles, in.Buttons, in.Speeds, in.Dt)
-
-	cmd := BaseMove(in.Buttons, in.Speeds, in.Dt)
+	// in.Buttons is a *MovementButtons -- pass through verbatim so
+	// KeyState's impulse drain (inside AdjustAngles + BaseMove) lands
+	// on the caller's persistent kbutton state, not a stack copy.
+	if in.Buttons != nil {
+		angles = AdjustAngles(angles, in.Buttons, in.Speeds, in.Dt)
+	}
+	var cmd server.UserCmd
+	if in.Buttons != nil {
+		cmd = BaseMove(in.Buttons, in.Speeds, in.Dt)
+	}
 	cmd.ViewAngles = angles
 	cmd.Buttons = in.ActionButtons
 	cmd.Impulse = in.Impulse

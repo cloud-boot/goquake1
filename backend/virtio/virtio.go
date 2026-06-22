@@ -201,10 +201,24 @@ func (b *Backend) PollInput() (backend.InputSnapshot, error) {
 			if !ok {
 				continue
 			}
-			if ev.Value == 1 {
+			// Linux EV_KEY value semantics (mirrored verbatim by
+			// virtio-input): 0=release, 1=press, 2=auto-repeat. The
+			// runloop's held-bit state in client.MovementButtons is
+			// already latched by the original press event, so repeats
+			// are redundant -- and crucially MUST NOT be funneled
+			// through the release path or the held bit gets cleared
+			// + an up-edge gets stamped on every repeat, collapsing
+			// KeyState() to 0.25 (both edges, !down) and the player's
+			// move axes to ~25% of cl_*speed. Drop repeats; preserve
+			// the press/release edges only.
+			switch ev.Value {
+			case 1:
 				b.pendingDown = append(b.pendingDown, kc)
-			} else {
+			case 0:
 				b.pendingUp = append(b.pendingUp, kc)
+			default:
+				// auto-repeat (Linux KeyValueRepeat=2) or any future
+				// value we don't model -- ignore.
 			}
 		case EventRelX:
 			b.pendingDX += float32(ev.Value)

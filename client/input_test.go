@@ -115,7 +115,7 @@ func held() ButtonState { return ButtonState{Pressed: 1} }
 
 func TestBaseMove_ForwardHeld(t *testing.T) {
 	b := MovementButtons{Forward: held()}
-	cmd := BaseMove(b, DefaultInputSpeeds(), 0.05)
+	cmd := BaseMove(&b, DefaultInputSpeeds(), 0.05)
 	if cmd.ForwardMove != 200 {
 		t.Errorf("forward-only: ForwardMove=%v want 200", cmd.ForwardMove)
 	}
@@ -126,7 +126,7 @@ func TestBaseMove_ForwardHeld(t *testing.T) {
 
 func TestBaseMove_ForwardAndBackCancel(t *testing.T) {
 	b := MovementButtons{Forward: held(), Back: held()}
-	cmd := BaseMove(b, DefaultInputSpeeds(), 0.05)
+	cmd := BaseMove(&b, DefaultInputSpeeds(), 0.05)
 	// 200 (forward) - 200 (back) = 0.
 	if cmd.ForwardMove != 0 {
 		t.Errorf("opposed forward/back: got %v want 0", cmd.ForwardMove)
@@ -135,7 +135,7 @@ func TestBaseMove_ForwardAndBackCancel(t *testing.T) {
 
 func TestBaseMove_StrafeLeft(t *testing.T) {
 	b := MovementButtons{MoveLeft: held()}
-	cmd := BaseMove(b, DefaultInputSpeeds(), 0.05)
+	cmd := BaseMove(&b, DefaultInputSpeeds(), 0.05)
 	if cmd.SideMove != -350 {
 		t.Errorf("strafe-left: SideMove=%v want -350", cmd.SideMove)
 	}
@@ -143,7 +143,7 @@ func TestBaseMove_StrafeLeft(t *testing.T) {
 
 func TestBaseMove_StrafeRight(t *testing.T) {
 	b := MovementButtons{MoveRight: held()}
-	cmd := BaseMove(b, DefaultInputSpeeds(), 0.05)
+	cmd := BaseMove(&b, DefaultInputSpeeds(), 0.05)
 	if cmd.SideMove != 350 {
 		t.Errorf("strafe-right: SideMove=%v want 350", cmd.SideMove)
 	}
@@ -151,12 +151,12 @@ func TestBaseMove_StrafeRight(t *testing.T) {
 
 func TestBaseMove_UpDown(t *testing.T) {
 	b := MovementButtons{Up: held()}
-	cmd := BaseMove(b, DefaultInputSpeeds(), 0.05)
+	cmd := BaseMove(&b, DefaultInputSpeeds(), 0.05)
 	if cmd.UpMove != 200 {
 		t.Errorf("up: UpMove=%v want 200", cmd.UpMove)
 	}
 	b = MovementButtons{Down: held()}
-	cmd = BaseMove(b, DefaultInputSpeeds(), 0.05)
+	cmd = BaseMove(&b, DefaultInputSpeeds(), 0.05)
 	if cmd.UpMove != -200 {
 		t.Errorf("down: UpMove=%v want -200", cmd.UpMove)
 	}
@@ -170,7 +170,7 @@ func TestBaseMove_SpeedKeyScales(t *testing.T) {
 		Up:        held(),
 		SpeedHeld: true,
 	}
-	cmd := BaseMove(b, DefaultInputSpeeds(), 0.05)
+	cmd := BaseMove(&b, DefaultInputSpeeds(), 0.05)
 	if cmd.ForwardMove != 400 {
 		t.Errorf("speed-key forward: %v want 400", cmd.ForwardMove)
 	}
@@ -182,10 +182,46 @@ func TestBaseMove_SpeedKeyScales(t *testing.T) {
 	}
 }
 
+// TestBaseMove_ImpulseDrainsAcrossFrames is the regression for the
+// "player walks at 25-50% of cl_*speed" bug: KeyState clears the
+// per-frame impulse bits as it samples them (tyrquake CL_KeyState
+// does the same on the static kbutton_t globals). If BaseMove took
+// MovementButtons by value, the drain would land on a stack copy and
+// the caller's persistent state would keep the down-edge bit forever
+// -- KeyState would then report 0.5 on every subsequent frame the key
+// stayed held (down-edge still set + down=1 -> 0.5), collapsing
+// ForwardMove to cl_forwardspeed/2 (=100 with the vanilla 200 default,
+// the symptom on bare-metal QEMU). The pointer signature wires the
+// drain back to the caller's struct: first sample sees impulse-down +
+// held (0.5), the SECOND sample on the same struct sees only held
+// (1.0). Pin both samples here so any future refactor that drops the
+// pointer (or introduces a stray copy) trips the test.
+func TestBaseMove_ImpulseDrainsAcrossFrames(t *testing.T) {
+	b := MovementButtons{
+		Forward: ButtonState{Pressed: 0b011}, // held + down-edge ("first frame pressed")
+	}
+	s := DefaultInputSpeeds()
+
+	// Frame 1: down-edge still set -> KeyState = 0.5 -> ForwardMove = 100.
+	cmd := BaseMove(&b, s, 0.05)
+	if cmd.ForwardMove != 100 {
+		t.Fatalf("frame 1 ForwardMove = %v want 100 (0.5 * 200)", cmd.ForwardMove)
+	}
+	if b.Forward.Pressed != 0b001 {
+		t.Fatalf("frame 1: impulse bits not drained from caller state; Pressed=%b want 001", b.Forward.Pressed)
+	}
+
+	// Frame 2: no edges, just held -> KeyState = 1.0 -> ForwardMove = 200.
+	cmd = BaseMove(&b, s, 0.05)
+	if cmd.ForwardMove != 200 {
+		t.Fatalf("frame 2 ForwardMove = %v want 200 (1.0 * 200) -- impulses must drain from caller state, not a copy", cmd.ForwardMove)
+	}
+}
+
 func TestBaseMove_ViewAnglesUntouched(t *testing.T) {
 	// BaseMove must not touch viewangles -- that's mouse + AdjustAngles' job.
 	b := MovementButtons{Forward: held(), MoveLeft: held()}
-	cmd := BaseMove(b, DefaultInputSpeeds(), 0.05)
+	cmd := BaseMove(&b, DefaultInputSpeeds(), 0.05)
 	if cmd.ViewAngles != ([3]float32{}) {
 		t.Errorf("ViewAngles must be zero: %v", cmd.ViewAngles)
 	}
@@ -246,7 +282,7 @@ func TestApplyMouseMove_RollUntouched(t *testing.T) {
 func TestAdjustAngles_LookupDecreasesPitch(t *testing.T) {
 	b := MovementButtons{Lookup: held()}
 	in := [3]float32{0, 0, 0}
-	out := AdjustAngles(in, b, DefaultInputSpeeds(), 0.1)
+	out := AdjustAngles(in, &b, DefaultInputSpeeds(), 0.1)
 	// pitch -= 0.1 * 150 * 1.0 = -15
 	if !approxEq(out[mathlib.Pitch], -15, 1e-4) {
 		t.Errorf("lookup pitch: got %v want -15", out[mathlib.Pitch])
@@ -255,7 +291,7 @@ func TestAdjustAngles_LookupDecreasesPitch(t *testing.T) {
 
 func TestAdjustAngles_LookdownIncreasesPitch(t *testing.T) {
 	b := MovementButtons{Lookdown: held()}
-	out := AdjustAngles([3]float32{}, b, DefaultInputSpeeds(), 0.1)
+	out := AdjustAngles([3]float32{}, &b, DefaultInputSpeeds(), 0.1)
 	if !approxEq(out[mathlib.Pitch], 15, 1e-4) {
 		t.Errorf("lookdown pitch: got %v want 15", out[mathlib.Pitch])
 	}
@@ -265,7 +301,7 @@ func TestAdjustAngles_RightDecreasesYaw(t *testing.T) {
 	// Q1 yaw grows CCW: right turn => yaw decreases.
 	b := MovementButtons{Right: held()}
 	in := [3]float32{0, 100, 0}
-	out := AdjustAngles(in, b, DefaultInputSpeeds(), 0.1)
+	out := AdjustAngles(in, &b, DefaultInputSpeeds(), 0.1)
 	// yaw -= 0.1 * 140 = 14 -> 86, then AngleMod wraps to [0, 360).
 	want := mathlib.AngleMod(86)
 	if !approxEq(out[mathlib.Yaw], want, 1e-3) {
@@ -276,7 +312,7 @@ func TestAdjustAngles_RightDecreasesYaw(t *testing.T) {
 func TestAdjustAngles_LeftIncreasesYaw(t *testing.T) {
 	b := MovementButtons{Left: held()}
 	in := [3]float32{0, 100, 0}
-	out := AdjustAngles(in, b, DefaultInputSpeeds(), 0.1)
+	out := AdjustAngles(in, &b, DefaultInputSpeeds(), 0.1)
 	want := mathlib.AngleMod(114)
 	if !approxEq(out[mathlib.Yaw], want, 1e-3) {
 		t.Errorf("left yaw: got %v want %v", out[mathlib.Yaw], want)
@@ -285,7 +321,7 @@ func TestAdjustAngles_LeftIncreasesYaw(t *testing.T) {
 
 func TestAdjustAngles_SpeedKeyScalesAngleRate(t *testing.T) {
 	b := MovementButtons{Lookdown: held(), SpeedHeld: true}
-	out := AdjustAngles([3]float32{}, b, DefaultInputSpeeds(), 0.1)
+	out := AdjustAngles([3]float32{}, &b, DefaultInputSpeeds(), 0.1)
 	// speed = 0.1 * 1.5 = 0.15; pitch += 0.15 * 150 = 22.5
 	if !approxEq(out[mathlib.Pitch], 22.5, 1e-4) {
 		t.Errorf("speed-key pitch: got %v want 22.5", out[mathlib.Pitch])
@@ -295,7 +331,7 @@ func TestAdjustAngles_SpeedKeyScalesAngleRate(t *testing.T) {
 func TestAdjustAngles_PitchClampHigh(t *testing.T) {
 	b := MovementButtons{Lookdown: held()}
 	// Start at +89, big dt -> would overshoot 90, must clamp.
-	out := AdjustAngles([3]float32{89, 0, 0}, b, DefaultInputSpeeds(), 10)
+	out := AdjustAngles([3]float32{89, 0, 0}, &b, DefaultInputSpeeds(), 10)
 	if out[mathlib.Pitch] != 90 {
 		t.Errorf("pitch upper clamp: got %v want 90", out[mathlib.Pitch])
 	}
@@ -303,7 +339,7 @@ func TestAdjustAngles_PitchClampHigh(t *testing.T) {
 
 func TestAdjustAngles_PitchClampLow(t *testing.T) {
 	b := MovementButtons{Lookup: held()}
-	out := AdjustAngles([3]float32{-89, 0, 0}, b, DefaultInputSpeeds(), 10)
+	out := AdjustAngles([3]float32{-89, 0, 0}, &b, DefaultInputSpeeds(), 10)
 	if out[mathlib.Pitch] != -90 {
 		t.Errorf("pitch lower clamp: got %v want -90", out[mathlib.Pitch])
 	}
@@ -312,14 +348,14 @@ func TestAdjustAngles_PitchClampLow(t *testing.T) {
 func TestAdjustAngles_RollClampHigh(t *testing.T) {
 	// Roll input not driven by buttons -- the clamp triggers on
 	// whatever the caller passes in.
-	out := AdjustAngles([3]float32{0, 0, 75}, MovementButtons{}, DefaultInputSpeeds(), 0.1)
+	out := AdjustAngles([3]float32{0, 0, 75}, &MovementButtons{}, DefaultInputSpeeds(), 0.1)
 	if out[mathlib.Roll] != 50 {
 		t.Errorf("roll upper clamp: got %v want 50", out[mathlib.Roll])
 	}
 }
 
 func TestAdjustAngles_RollClampLow(t *testing.T) {
-	out := AdjustAngles([3]float32{0, 0, -75}, MovementButtons{}, DefaultInputSpeeds(), 0.1)
+	out := AdjustAngles([3]float32{0, 0, -75}, &MovementButtons{}, DefaultInputSpeeds(), 0.1)
 	if out[mathlib.Roll] != -50 {
 		t.Errorf("roll lower clamp: got %v want -50", out[mathlib.Roll])
 	}
@@ -328,7 +364,7 @@ func TestAdjustAngles_RollClampLow(t *testing.T) {
 func TestAdjustAngles_NoSpeedKey(t *testing.T) {
 	// SpeedHeld=false branch (the other branch is exercised above).
 	b := MovementButtons{Lookdown: held(), SpeedHeld: false}
-	out := AdjustAngles([3]float32{}, b, DefaultInputSpeeds(), 0.1)
+	out := AdjustAngles([3]float32{}, &b, DefaultInputSpeeds(), 0.1)
 	if !approxEq(out[mathlib.Pitch], 15, 1e-4) {
 		t.Errorf("no-speed-key pitch: got %v want 15", out[mathlib.Pitch])
 	}

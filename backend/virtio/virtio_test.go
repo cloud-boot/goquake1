@@ -281,6 +281,35 @@ func TestPollInput_KeyDownUpMouseQuit(t *testing.T) {
 	}
 }
 
+// TestPollInput_RepeatDropped pins the autorepeat-vs-release distinction.
+// Linux EV_KEY value=2 (KeyValueRepeat) is emitted by the virtio-input
+// device on every key auto-repeat tick (~33 ms). Treating it as a
+// release (the old code's `else` arm) clears the runloop's held bit +
+// stamps an up-edge every repeat -- KeyState() then collapses to 0.25
+// (both edges, !down) and the player's move axes drop to ~25% of the
+// configured cl_*speed (the symptom: cmd.fwd=50 with cl_forwardspeed=
+// 200). The driver MUST drop repeats; the original press event already
+// latched the held bit and the runloop carries it across frames.
+func TestPollInput_RepeatDropped(t *testing.T) {
+	fb := newFakeFB(1, 1)
+	in := &fakeInput{events: []InputEvent{
+		{Kind: EventKey, Code: 17, Value: 1}, // KEY_W down
+		{Kind: EventKey, Code: 17, Value: 2}, // KEY_W auto-repeat -- MUST be dropped
+		{Kind: EventKey, Code: 17, Value: 2}, // another repeat -- MUST be dropped
+	}}
+	b, _ := New(fb, in, nil, nil)
+	snap, err := b.PollInput()
+	if err != nil {
+		t.Fatalf("PollInput: %v", err)
+	}
+	if len(snap.KeysDown) != 1 || snap.KeysDown[0] != backend.KeyW {
+		t.Fatalf("KeysDown = %v want exactly [KeyW] (no repeats)", snap.KeysDown)
+	}
+	if len(snap.KeysUp) != 0 {
+		t.Fatalf("KeysUp = %v want [] (repeats must NOT be treated as releases)", snap.KeysUp)
+	}
+}
+
 func TestPollInput_UnmappedKeyDropped(t *testing.T) {
 	fb := newFakeFB(1, 1)
 	in := &fakeInput{events: []InputEvent{

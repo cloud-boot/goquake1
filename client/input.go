@@ -173,7 +173,16 @@ type MovementButtons struct {
 // upstream's static in_strafe / in_klook kbuttons; this Go port
 // drops them for now -- the call sites that need them can wrap
 // [BaseMove] and re-mux their buttons before passing them in.
-func BaseMove(buttons MovementButtons, speeds InputSpeeds, dt float32) server.UserCmd {
+//
+// MUTATION CONTRACT: BaseMove takes a pointer because KeyState clears
+// the per-frame impulse bits as it samples them (tyrquake's CL_KeyState
+// does the same on the static kbutton_t globals). A by-value MovementButtons
+// would clear the impulses on a stack copy and the caller's persistent
+// state would keep the down-edge bit forever, collapsing KeyState to a
+// constant 0.5 every subsequent frame the key is held (and the player's
+// move axes to 50% of cl_*speed). Pass a pointer to the runloop's
+// persistent state -- the impulse drain MUST land on that struct.
+func BaseMove(buttons *MovementButtons, speeds InputSpeeds, dt float32) server.UserCmd {
 	_ = dt // upstream CL_BaseMove also ignores host_frametime here
 
 	var cmd server.UserCmd
@@ -270,7 +279,10 @@ func ApplyMouseMove(currentAngles [3]float32, dx, dy float32, sensitivity float3
 // [-90, +90]; roll is clamped to +/-50. The cvar values are hard-
 // coded to the upstream defaults for the same reason as in
 // [ApplyMouseMove].
-func AdjustAngles(currentAngles [3]float32, buttons MovementButtons, speeds InputSpeeds, dt float32) [3]float32 {
+//
+// Like [BaseMove], buttons is passed by pointer so KeyState's
+// per-frame impulse drain lands on the runloop's persistent state.
+func AdjustAngles(currentAngles [3]float32, buttons *MovementButtons, speeds InputSpeeds, dt float32) [3]float32 {
 	const maxPitch float32 = 90
 	const minPitch float32 = -90
 	const maxRoll float32 = 50
