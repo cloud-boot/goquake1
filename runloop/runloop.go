@@ -56,6 +56,17 @@ type Runner struct {
 	// Audio state.
 	SoundPool *sound.Pool
 
+	// Particle pool. Optional (nil = no per-tic particle advance,
+	// matches the historical bring-up behaviour from the renderer
+	// pre-this-batch). When non-nil [RunFrame] calls Pool.Run between
+	// the client tick and the Pre2DDraw hook so the closure can hand
+	// the already-advanced pool to DrawParticles/DrawParticleQuads.
+	ParticlePool *render.Pool
+	// ParticleGravity is the world-gravity scalar fed into
+	// Pool.Run -- typically the server's sv_gravity cvar (default
+	// 800 in Q1). Zero = no gravity force on ParticleGrav/Slow types.
+	ParticleGravity float32
+
 	// Per-frame input bundles (advanced by the input event handler).
 	Buttons    client.MovementButtons
 	Speeds     client.InputSpeeds
@@ -224,6 +235,19 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		return err
 	}
 	r.ViewAngles = out.ViewAngles
+
+	// 4b) Particle pool per-tic step. Advances every alive particle
+	//     by dt seconds using the world gravity scalar; expired
+	//     particles are freed back into the pool. Runs BEFORE
+	//     Pre2DDraw so the closure renders the up-to-date state.
+	//     A nil pool skips the step (matches the legacy bring-up
+	//     where the renderer existed but the per-tic advance was
+	//     not yet wired). tyrquake: CL_RunParticles inside
+	//     Host_Frame's per-tic block, between the server tick and
+	//     the screen update.
+	if r.ParticlePool != nil {
+		r.ParticlePool.Run(dt, r.ParticleGravity, nowSec)
+	}
 
 	// 5) Optional 3D pass. The closure owns the BSP walk +
 	//    rasterization; on return r.FrameBuffer holds the rendered

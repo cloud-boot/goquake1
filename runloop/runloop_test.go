@@ -952,6 +952,55 @@ func TestRunFrame_MouseDeltaFeedsViewAngles(t *testing.T) {
 	}
 }
 
+// ----- particle pool per-tic step -----------------------------------
+
+func TestRunFrame_ParticlePoolNilSkipsAdvance(t *testing.T) {
+	// Sanity: nil ParticlePool path is the historical default + must
+	// not introduce a panic. Covered implicitly by every existing
+	// happy-path test, but pinned here to lock the guard.
+	r, _ := newRunner(t, backend.NewRecorder(0, 0))
+	if r.ParticlePool != nil {
+		t.Fatalf("expected nil ParticlePool by default")
+	}
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame nil-pool: %v", err)
+	}
+}
+
+func TestRunFrame_ParticlePoolStepAdvancesLiveSlots(t *testing.T) {
+	r, _ := newRunner(t, backend.NewRecorder(0, 0))
+	pool := render.NewPool()
+	// Seed two particles whose lifetimes straddle the per-tic now=1.
+	pool.Spawn(render.Particle{
+		Velocity: [3]float32{10, 0, 100},
+		Die:      10,
+		Type:     render.ParticleGrav,
+	}, 0)
+	pool.Spawn(render.Particle{
+		Velocity: [3]float32{0, 0, 0},
+		Die:      0.5, // < now -> expires this tic
+		Type:     render.ParticleStatic,
+	}, 0)
+	r.ParticlePool = pool
+	r.ParticleGravity = 800
+
+	if err := r.RunFrame(1, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	// First particle survived; Velocity[2] = 100 - dt*gravity*0.05
+	// = 100 - 1*800*0.05 = 60.
+	if got := pool.Particles[0].Velocity[2]; got != 60 {
+		t.Fatalf("alive particle Vel[2] = %v, want 60", got)
+	}
+	// Second particle expired -> Die reset to 0 + NumAlive 1.
+	if pool.Particles[1].Die != 0 {
+		t.Fatalf("expired particle Die = %v, want 0", pool.Particles[1].Die)
+	}
+	if pool.NumAlive != 1 {
+		t.Fatalf("pool.NumAlive = %d, want 1", pool.NumAlive)
+	}
+}
+
 // abs32 is the |x| helper for float32 (Go's math.Abs is float64).
 // Kept package-local to the runloop tests rather than promoted; the
 // numeric-tolerance check sites are all here.

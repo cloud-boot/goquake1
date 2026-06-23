@@ -57,6 +57,16 @@ type VM struct {
 	// pulls from. nil means the random() builtin returns
 	// ErrRandomNotSeeded.
 	randomSource func() float32
+
+	// particleSink is the side-effect closure BuiltinFnParticle hands
+	// the four QC stack values to (origin, dir, color, count). nil
+	// means BuiltinFnParticle silently swallows the call -- matches
+	// the "side-effect builtin with no embedder wiring is a no-op"
+	// convention the other builtins (setorigin, sound, ...) follow
+	// in quake-tamago's noop registrations. The embedder wires this
+	// via SetParticleSink to bridge QC particle() calls into
+	// render.Pool.Emit (which holds the per-process 2048-slot pool).
+	particleSink func(origin, dir [3]float32, color int, count int)
 }
 
 // SetArena wires an EdictArena into the VM so the LOAD_*, STORE_P_*,

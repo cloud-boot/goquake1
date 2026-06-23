@@ -64,6 +64,7 @@ func TestApply_MsgTime_UpdatedOnEveryCall(t *testing.T) {
 		{"KilledMonster", DecodedKilledMonster{}},
 		{"FoundSecret", DecodedFoundSecret{}},
 		{"Particle", DecodedParticle{}},
+		{"TempEntity", DecodedTempEntity{Kind: TEGunshot}},
 		{"Sound", DecodedSound{}},
 		{"Baseline", DecodedBaseline{}},
 		{"Update", DecodedUpdate{}},
@@ -778,6 +779,7 @@ func TestApply_DocumentedNoOps_DoNotMutate(t *testing.T) {
 		{"KilledMonster", DecodedKilledMonster{}},
 		{"FoundSecret", DecodedFoundSecret{}},
 		{"Particle", DecodedParticle{Origin: [3]float32{1, 2, 3}, Count: 10}},
+		{"TempEntity", DecodedTempEntity{Kind: TEGunshot, Origin: [3]float32{1, 2, 3}}},
 		{"Sound", DecodedSound{EntityIdx: 5, SoundNum: 10, Volume: 200}},
 	}
 	for _, c := range cases {
@@ -810,6 +812,114 @@ func TestApply_DocumentedNoOps_DoNotMutate(t *testing.T) {
 				t.Errorf("state mutated by no-op arm: %+v", s)
 			}
 		})
+	}
+}
+
+// --- DecodedParticle dispatch ------------------------------------------
+
+func TestApply_Particle_NoSink_StateUnmodified(t *testing.T) {
+	s := NewState()
+	s.Health = 77
+	msg := DecodedParticle{
+		Origin: [3]float32{1, 2, 3},
+		Dir:    [3]float32{0, 0, 1},
+		Color:  73,
+		Count:  64,
+	}
+	if err := Apply(s, msg, 5.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	// EmitParticles is nil, so the arm is a silent no-op + Health
+	// stays put. MsgTime still updates (always-on side effect).
+	if s.Health != 77 {
+		t.Fatalf("Health = %d, want 77", s.Health)
+	}
+	if s.MsgTime != 5.0 {
+		t.Fatalf("MsgTime = %v, want 5.0", s.MsgTime)
+	}
+}
+
+func TestApply_Particle_SinkInvokedWithDecodedArgs(t *testing.T) {
+	s := NewState()
+	var got struct {
+		origin, dir [3]float32
+		color       int
+		count       int
+		calls       int
+	}
+	s.EmitParticles = func(origin, dir [3]float32, color, count int) {
+		got.origin = origin
+		got.dir = dir
+		got.color = color
+		got.count = count
+		got.calls++
+	}
+	msg := DecodedParticle{
+		Origin: [3]float32{10, 20, 30},
+		Dir:    [3]float32{-1, 0, 1},
+		Color:  73,
+		Count:  20,
+	}
+	if err := Apply(s, msg, 3.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if got.calls != 1 {
+		t.Fatalf("sink calls = %d, want 1", got.calls)
+	}
+	if got.origin != msg.Origin || got.dir != msg.Dir ||
+		got.color != msg.Color || got.count != msg.Count {
+		t.Fatalf("sink args mismatch: got %+v, want %+v", got, msg)
+	}
+}
+
+// --- DecodedTempEntity dispatch ----------------------------------------
+
+func TestApply_TempEntity_NoSink_StateUnmodified(t *testing.T) {
+	s := NewState()
+	s.Health = 44
+	msg := DecodedTempEntity{Kind: TEGunshot, Origin: [3]float32{9, 8, 7}}
+	if err := Apply(s, msg, 4.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.Health != 44 {
+		t.Fatalf("Health = %d, want 44", s.Health)
+	}
+	if s.MsgTime != 4.0 {
+		t.Fatalf("MsgTime = %v, want 4.0", s.MsgTime)
+	}
+}
+
+func TestApply_TempEntity_SinkInvokedPerKind(t *testing.T) {
+	s := NewState()
+	type capture struct {
+		kind   int
+		origin [3]float32
+	}
+	var caught []capture
+	s.EmitTempEntity = func(kind int, origin [3]float32) {
+		caught = append(caught, capture{kind: kind, origin: origin})
+	}
+	kinds := []TempEntityKind{
+		TESpike, TESuperSpike, TEGunshot, TEExplosion,
+		TETarExplosion, TEWizSpike, TEKnightSpike,
+		TELavaSplash, TETeleport,
+	}
+	for i, k := range kinds {
+		msg := DecodedTempEntity{Kind: k, Origin: [3]float32{float32(i), 0, 0}}
+		if err := Apply(s, msg, 1.0); err != nil {
+			t.Fatalf("Apply kind=%v: %v", k, err)
+		}
+	}
+	if len(caught) != len(kinds) {
+		t.Fatalf("captured %d, want %d", len(caught), len(kinds))
+	}
+	for i, k := range kinds {
+		if caught[i].kind != int(k) {
+			t.Fatalf("call %d kind = %d, want %d", i, caught[i].kind, k)
+		}
+		if caught[i].origin[0] != float32(i) {
+			t.Fatalf("call %d origin = %v, want [%d,0,0]", i, caught[i].origin, i)
+		}
 	}
 }
 

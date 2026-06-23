@@ -627,6 +627,67 @@ func run() error {
 			precached, mixerSamples, active)
 	}
 
+	// 11d. Particle pool wiring. One 2048-slot pool per process; the
+	//      runner steps it each tic (Pool.Run with sv_gravity = 800);
+	//      the Pre2DDraw closure draws it after the alias entities;
+	//      QC builtin #48 emits into it via the VM's particleSink
+	//      bridge; the client's svc_particle + svc_temp_entity arms
+	//      emit into it via the State.EmitParticles / .EmitTempEntity
+	//      callbacks. A shared cheap-LCG-derived byte source feeds
+	//      both Emit (which needs ~6 bytes per particle) and
+	//      EmitTrail (which needs ~3 per step); using the gameplay
+	//      random seed +0x01 keeps the streams decorrelated.
+	particlePool := render.NewPool()
+	particleRNG := newLCGByteSource(0xC0FFEF)
+	runner.ParticlePool = particlePool
+	runner.ParticleGravity = 800
+
+	// QC builtin #48 -- particle(org, dir, color, count). Bridges the
+	// VM into the pool via Pool.Emit (= R_RunParticleEffect). Without
+	// this the SpawnBlood / TraceAttack puff-spawn QC calls every
+	// gunshot makes are silent no-ops + the demo runs particle-free.
+	if realHost != nil && realHost.VM != nil {
+		realHost.VM.SetParticleSink(func(origin, dir [3]float32, color, count int) {
+			particlePool.Emit(origin, dir, byte(color), count, float32(realHost.Server.Time), particleRNG)
+		})
+	}
+
+	// svc_particle wire arm -- the same shape as the QC builtin but
+	// driven directly by the server (e.g. flash-only effects the
+	// progs.dat fires without going through PF_particle). Apply's
+	// DecodedParticle arm now dispatches into this sink.
+	clientState.EmitParticles = func(origin, dir [3]float32, color, count int) {
+		now := clientState.MsgTime
+		particlePool.Emit(origin, dir, byte(color), count, now, particleRNG)
+	}
+
+	// svc_temp_entity point-effect arm. Wire the bigger-burst pool
+	// helpers (R_ParticleExplosion / R_LavaSplash / R_TeleportSplash)
+	// per TE_* kind; the smaller dust-burst kinds (Spike / Gunshot /
+	// SuperSpike / WizSpike / KnightSpike) collapse to Emit with the
+	// upstream's canonical (count, color) shorthand.
+	clientState.EmitTempEntity = func(kind int, origin [3]float32) {
+		now := clientState.MsgTime
+		switch kind {
+		case protocol.TEExplosion, protocol.TETarExplosion:
+			render.ParticleExplosion(particlePool, origin, now, particleRNG)
+		case protocol.TELavaSplash:
+			render.LavaSplash(particlePool, origin, now, particleRNG)
+		case protocol.TETeleport:
+			render.TeleportSplash(particlePool, origin, now, particleRNG)
+		case protocol.TEGunshot:
+			particlePool.Emit(origin, [3]float32{}, 0, 20, now, particleRNG)
+		case protocol.TESpike, protocol.TESuperSpike:
+			particlePool.Emit(origin, [3]float32{}, 0, 10, now, particleRNG)
+		case protocol.TEKnightSpike:
+			particlePool.Emit(origin, [3]float32{}, 226, 20, now, particleRNG)
+		case protocol.TEWizSpike:
+			particlePool.Emit(origin, [3]float32{}, 20, 30, now, particleRNG)
+		}
+	}
+	fmt.Printf("QUAKE: particle pool wired -- cap=%d gravity=%v (QC #48 + svc_particle + svc_temp_entity)\n",
+		render.MaxParticles, runner.ParticleGravity)
+
 	// 12. Build the Pre2DDraw hook (BSP load, mark/walk contexts,
 	//     synthetic texture, identity colormap) + anchor the camera
 	//     origin at pickInMapCamera. The closure is wired onto the
@@ -674,7 +735,7 @@ func run() error {
 	fmt.Printf("QUAKE: sbar -- loaded %d/%d assets, missing: %v\n",
 		sbarLoaded, sbarTotal, sample)
 
-	if err := setupRenderer(runner, pakFS, realHost, playerSlot, aliasModels, aliasSkins, sbarAssets); err != nil {
+	if err := setupRenderer(runner, pakFS, realHost, playerSlot, aliasModels, aliasSkins, sbarAssets, particleRNG); err != nil {
 		return fmt.Errorf("setupRenderer: %w", err)
 	}
 
@@ -713,7 +774,7 @@ func run() error {
 // trace stack on purpose: the goal of this bring-up is "key press moves
 // the camera", not "physically correct movement". A follow-up batch
 // swaps the integrator for the real SV_Physics tick.
-func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int, aliasModels []*mdl.Model, aliasSkins []*render.Pic, sbarAssets *render.SBarAssets) error {
+func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int, aliasModels []*mdl.Model, aliasSkins []*render.Pic, sbarAssets *render.SBarAssets, particleRNG func() byte) error {
 	// 1. Source the BSP bytes: real pak0.pak first, synthbsp fallback.
 	bspBytes, size, err := loadBSP(pakFS)
 	if err != nil {
@@ -846,6 +907,15 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	markCtx := bsprender.NewMarkContext(bm)
 	var surfaces bsprender.SurfaceList
 	frameCount := 0
+	// prevEntityOrigin tracks the last-seen Origin per entity slot so
+	// per-tic rocket/grenade/gib trails can emit one particle stream
+	// per cm of motion between ticks. Mirrors tyrquake's per-entity
+	// trail_origin field in CL_LinkEntities -- on each tic the
+	// closure asks `if model is trail-bearing AND prevOrigin known`,
+	// emits a Pool.EmitTrail from prevOrigin to current Origin, then
+	// updates prevOrigin. Map keys are entity numbers (matches the
+	// client State.Entities key space).
+	prevEntityOrigin := make(map[int][3]float32)
 	// loggedWireSpawn latches the one-shot "server-side Spawned
 	// observed true" trace so the line appears at most once per
 	// process lifetime. Since the per-tic SendEntityUpdates broadcast
@@ -1157,7 +1227,11 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				soundsStarted = realHost.LastSoundsStarted
 				ambientsStarted = realHost.LastAmbientsStarted
 			}
-			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v src=%s entOrigin=%v entPresent=%v (PlayerNum=%d, %d entities cached) viewAngles=%v cmd.fwd=%v cmd.side=%v clientConn=%d cl.vel=%v cl.viewh=%v cl.health=%d; %d surfaces; audio: %d active, %d mixed; sounds_started=%d ambients_started=%d\n",
+			activeParticles := 0
+			if runner.ParticlePool != nil {
+				activeParticles = runner.ParticlePool.NumAlive
+			}
+			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v src=%s entOrigin=%v entPresent=%v (PlayerNum=%d, %d entities cached) viewAngles=%v cmd.fwd=%v cmd.side=%v clientConn=%d cl.vel=%v cl.viewh=%v cl.health=%d; %d surfaces; audio: %d active, %d mixed; sounds_started=%d ambients_started=%d; particles: %d active\n",
 				frame, origin, viewSrc, entOrigin, entPresent,
 				runner.Client.PlayerNum, len(runner.Client.Entities),
 				viewAngles, cmdFwd, cmdSide,
@@ -1165,7 +1239,8 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				runner.Client.Velocity, runner.Client.ViewHeightOffset, runner.Client.Health,
 				surfaces.Len(),
 				active, enginesound.MixBufferStereoFrames,
-				soundsStarted, ambientsStarted)
+				soundsStarted, ambientsStarted,
+				activeParticles)
 
 			// Sample spatialized channel: scan the dynamic + reserved
 			// channel pools for the FIRST active channel and log its
@@ -1346,6 +1421,47 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			}
 		}
 
+		// Per-tic projectile trail emission. Walk the wire-mirrored
+		// State.Entities map; for each entity whose ModelIdx resolves
+		// to a precache name flagged with a trail (rocket = grenade
+		// smoke trail, gib = blood drip, knight/scrag = tracer line,
+		// Voor = sucking-orb trail), emit Pool.EmitTrail between the
+		// previous-tic origin and the current origin. Skips entities
+		// we have no prior-origin for (first observation -- the next
+		// tic seeds the trail). tyrquake equivalent: the per-entity
+		// EF_ROCKET / EF_GRENADE / EF_GIB / EF_ZOMGIB / EF_TRACER /
+		// EF_TRACER2 / EF_TRACER3 dispatch inside CL_LinkEntities ->
+		// R_RocketTrail.
+		trailNow := runner.Client.MsgTime
+		if realHost != nil && runner.ParticlePool != nil {
+			precache := realHost.Server.ModelPrecache
+			seenThisTic := make(map[int]struct{}, len(runner.Client.Entities))
+			for entNum, es := range runner.Client.Entities {
+				seenThisTic[entNum] = struct{}{}
+				if es.ModelIdx <= 0 || es.ModelIdx >= len(precache) {
+					continue
+				}
+				kind, ok := trailKindForModel(precache[es.ModelIdx])
+				if !ok {
+					continue
+				}
+				prev, hadPrev := prevEntityOrigin[entNum]
+				prevEntityOrigin[entNum] = es.Origin
+				if !hadPrev {
+					continue
+				}
+				runner.ParticlePool.EmitTrail(prev, es.Origin, kind, trailNow, particleRNG)
+			}
+			// Garbage-collect prevOrigin entries whose entity slot no
+			// longer exists in the live map (entity freed / detonated /
+			// out-of-PVS). Keeps the map size bounded.
+			for k := range prevEntityOrigin {
+				if _, ok := seenThisTic[k]; !ok {
+					delete(prevEntityOrigin, k)
+				}
+			}
+		}
+
 		// Alias-model pass. Iterate the wire-mirrored State.Entities
 		// (the client's per-tic snapshot the server broadcast over
 		// svc_update) and rasterize one DrawAliasInterpLit per entity
@@ -1501,6 +1617,19 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 					fmt.Printf("QUAKE: alias shade sample modelIdx=%d verts=%d distinct=%d min=%d max=%d\n",
 						sampleES.ModelIdx, len(lights), len(seen), lmin, lmax)
 				}
+			}
+		}
+
+		// Particle pass. Runs AFTER alias entities (so monsters don't
+		// paint over particle bursts they triggered, e.g. blood from a
+		// player gibbing) and BEFORE the HUD/sbar pass (so particles
+		// land in the world layer, not on top of the status bar).
+		// DrawParticleQuads early-returns on a nil pool / rd; pool was
+		// wired at runner-build time so nil is a structural impossibility
+		// here, but the no-op guard keeps the call site safe regardless.
+		if err := render.DrawParticleQuads(fb, rd, runner.ParticlePool, runner.Client.MsgTime); err != nil {
+			if frame%60 == 0 {
+				fmt.Printf("QUAKE: DrawParticleQuads err: %v\n", err)
 			}
 		}
 
@@ -2796,6 +2925,57 @@ func newLCGRandom(seed uint32) func() float32 {
 		// uses the full 24-bit mantissa for a smoother distribution.
 		return float32(state>>8) / float32(1<<24)
 	}
+}
+
+// newLCGByteSource returns a uniform-byte callback for the particle
+// pool's Emit / EmitTrail RNG arg. Uses the same Numerical-Recipes
+// 32-bit LCG as newLCGRandom (a separate goroutine of state so
+// gameplay random + particle random don't sample the same stream);
+// callers feed it as `rng func() byte` -- each call rotates a byte
+// out of the high half of the LCG state for a uniform 0..255
+// distribution.
+func newLCGByteSource(seed uint32) func() byte {
+	state := seed
+	return func() byte {
+		state = state*1664525 + 1013904223
+		return byte(state >> 24)
+	}
+}
+
+// trailKindForModel maps a precache model name to the trail kind
+// tyrquake's CL_LinkEntities dispatches based on the entity's
+// per-model EF_* bits. The C upstream sets those bits at model-load
+// time inside Mod_LoadModel; the Go port collapses the bit table
+// down to a name-based lookup because the engine doesn't yet
+// re-derive the per-model EF_* mask from the .mdl flags field.
+//
+// Returns (kind, true) when the model name is trail-bearing,
+// (0, false) otherwise so the caller's tic loop skips the entity.
+//
+// Names mirror id1's canonical alias-model paths -- "progs/missile.mdl"
+// is the rocket (id1 progs.dat) and "progs/grenade.mdl" the grenade;
+// "progs/gib*.mdl" / "progs/zom_gib.mdl" emit blood drips; the
+// scrag/wizard/knight tracer + Voor orb mirror the upstream's
+// EF_TRACER / EF_TRACER2 / EF_TRACER3 bits which are model-pinned.
+func trailKindForModel(name string) (render.TrailKind, bool) {
+	switch name {
+	case "progs/missile.mdl":
+		return render.TrailRocket, true
+	case "progs/grenade.mdl":
+		return render.TrailGrenade, true
+	case "progs/gib1.mdl", "progs/gib2.mdl", "progs/gib3.mdl",
+		"progs/zom_gib.mdl":
+		return render.TrailBlood, true
+	case "progs/k_spike.mdl":
+		return render.TrailSlightBlood, true
+	case "progs/w_spike.mdl":
+		return render.TrailTracer, true
+	case "progs/laser.mdl":
+		return render.TrailTracer2, true
+	case "progs/v_spike.mdl":
+		return render.TrailVoor, true
+	}
+	return 0, false
 }
 
 // pickInMapCamera returns a viewpoint that lands inside a valid leaf

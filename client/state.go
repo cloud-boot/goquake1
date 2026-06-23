@@ -236,6 +236,44 @@ type State struct {
 	// Like Baselines, the map is allocated by [NewState] + reset by
 	// [State.Clear] so per-map state doesn't leak.
 	Entities map[int]EntityState
+
+	// EmitParticles is the optional sink that the [Apply] arm for
+	// [DecodedParticle] dispatches into, mirroring tyrquake's
+	// svc_particle handler that calls R_RunParticleEffect. nil is a
+	// silent no-op (the historical bring-up behaviour). The embedder
+	// wires this to render.Pool.Emit -- the client package itself
+	// MUST stay free of any render-layer dependency so the wire
+	// decoder + state machine remain testable in isolation, hence
+	// the callback indirection.
+	//
+	// Signature mirrors PF_particle / R_RunParticleEffect:
+	//
+	//	origin -- world-space anchor for the burst
+	//	dir    -- per-axis velocity bias the renderer adds onto its
+	//	          random per-particle jitter
+	//	color  -- palette base index (renderer keeps top 5 bits,
+	//	          jitters the low 3 per particle)
+	//	count  -- number of particles to spawn
+	EmitParticles func(origin, dir [3]float32, color, count int)
+
+	// EmitTempEntity is the optional sink the [Apply] arm for the
+	// svc_temp_entity point-effect family (TE_Spike, TE_SuperSpike,
+	// TE_Gunshot, TE_Explosion, TE_TarExplosion, TE_WizSpike,
+	// TE_KnightSpike, TE_LavaSplash, TE_Teleport) dispatches into.
+	// nil is a silent no-op so callers that don't yet wire it keep
+	// the historical bring-up behaviour (the temp-entity decoder
+	// landed before the particle pool did; this arm was previously
+	// documented as "particle pool + sound mixer -- separate layers"
+	// in the apply.go comment block).
+	//
+	// Bridges into render.Pool.Emit / Pool.ParticleExplosion /
+	// Pool.LavaSplash / Pool.TeleportSplash depending on the Kind:
+	// the embedder's closure switches on Kind and picks the right
+	// pool method. The client package stays render-agnostic.
+	//
+	// Signature: (kind = the TE_* sub-type byte, origin = the wire-
+	// reported world-space coord).
+	EmitTempEntity func(kind int, origin [3]float32)
 }
 
 // ErrAlreadyConnected is returned by [State.SetConnecting] when

@@ -127,6 +127,12 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 	case DecodedUpdate:
 		applyUpdate(state, m, nowSec)
 		return nil
+	case DecodedParticle:
+		applyParticle(state, m)
+		return nil
+	case DecodedTempEntity:
+		applyTempEntity(state, m)
+		return nil
 	case DecodedNop,
 		DecodedPrint,
 		DecodedStuffText,
@@ -135,14 +141,13 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 		DecodedSellScreen,
 		DecodedKilledMonster,
 		DecodedFoundSecret,
-		DecodedParticle,
 		DecodedSound:
 		// Documented no-op arms:
 		//   - Nop:                       connection-alive heartbeat
 		//   - Print / StuffText:         renderer/UI + console concern
 		//   - Finale / Cutscene / SellScreen: UI-state transitions
 		//   - KilledMonster / FoundSecret:    gameplay sound triggers
-		//   - Particle / Sound:          particle pool + sound mixer (separate layers)
+		//   - Sound:                     sound mixer (separate layer)
 		return nil
 	}
 	return fmt.Errorf("%w: %T", ErrApplyUnknown, msg)
@@ -257,6 +262,58 @@ func applyBaseline(state *State, m DecodedBaseline) {
 		Angles:   m.Angles,
 		Alpha:    m.Alpha,
 	}
+}
+
+// applyParticle dispatches a svc_particle burst into the embedder's
+// optional [State.EmitParticles] sink. nil sink = silent no-op
+// (mirrors the historical bring-up behaviour: the particle decoder
+// landed before the renderer pool did, and the apply arm was a
+// documented "particle pool is a separate layer" no-op). Once the
+// embedder wires the sink to render.Pool.Emit the same arm starts
+// driving real particles.
+//
+// tyrquake: the svc_particle case inside CL_ParseServerMessage --
+// the C upstream parses origin/dir/color/count off the wire then
+// calls R_RunParticleEffect directly (no callback indirection
+// because the C engine has a global *r_particles pool); the Go
+// port keeps the engine-renderer split clean via the sink.
+func applyParticle(state *State, m DecodedParticle) {
+	if state.EmitParticles == nil {
+		return
+	}
+	state.EmitParticles(m.Origin, m.Dir, m.Color, m.Count)
+}
+
+// applyTempEntity dispatches a svc_temp_entity point-effect into the
+// embedder's optional [State.EmitTempEntity] sink. Lightning beams
+// and TEExplosion2 carry payload beyond a single Origin (start/end
+// for beams, colourmap range for the alt explosion) -- those are
+// still no-ops for now because the bring-up pool doesn't yet
+// reproduce the beam-segment + colour-mapped variants. The
+// point-effect family (Spike / SuperSpike / Gunshot / Explosion /
+// TarExplosion / WizSpike / KnightSpike / LavaSplash / Teleport)
+// is the bulk of the visible carnage and is dispatched here.
+//
+// nil sink = silent no-op so callers that don't yet wire the pool
+// keep the historical "TE arm is a stub" behaviour.
+//
+// tyrquake: CL_ParseTEnt -- the per-kind switch that calls
+// R_ParticleExplosion / R_RunParticleEffect / R_LavaSplash /
+// R_TeleportSplash / CL_NewDLight depending on the TE_* byte.
+// Light-emission (CL_NewDLight calls) is out of scope here -- the
+// dynamic-lighting pool is wired separately when the bring-up gets
+// to it.
+func applyTempEntity(state *State, m DecodedTempEntity) {
+	if state.EmitTempEntity == nil {
+		return
+	}
+	// Point-effect kinds are the only ones with a meaningful Origin
+	// payload alone. Lightning beams (TELightning*/TEBeam) and the
+	// TEExplosion2 alt-explosion carry additional fields the bring-
+	// up doesn't yet render via this hook; the embedder's switch
+	// can still inspect Kind and dispatch them if it grows that
+	// capability later.
+	state.EmitTempEntity(int(m.Kind), m.Origin)
 }
 
 // applyUpdate handles svc_update: seed the entity's live state from
