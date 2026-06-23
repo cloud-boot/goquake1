@@ -96,6 +96,7 @@ import (
 	"github.com/go-quake1/engine/runloop"
 	engineserver "github.com/go-quake1/engine/server"
 	enginesound "github.com/go-quake1/engine/sound"
+	enginespr "github.com/go-quake1/engine/spr"
 	"github.com/go-quake1/engine/vfs"
 	"github.com/go-quake1/engine/wad"
 	"github.com/go-quake1/engine/world"
@@ -661,6 +662,29 @@ func run() error {
 		particlePool.Emit(origin, dir, byte(color), count, now, particleRNG)
 	}
 
+	// Load the s_explod.spr explosion sprite. id1 ships it at one of
+	// two canonical paths (progs/ on early shareware, sprites/ on the
+	// retail release); try both, and fall back to nil so the temp-
+	// entity arm degrades to particles-only when the asset is missing.
+	// The sprite count log goes out unconditionally so the QEMU serial
+	// stream proves whether the bring-up has billboarded explosions
+	// available or is running particles-only.
+	explosionSprite, explosionPath := loadExplosionSprite(pakFS)
+	spritesLoaded := 0
+	if explosionSprite != nil {
+		spritesLoaded = 1
+	}
+	fmt.Printf("QUAKE: sprites loaded %d (s_explod path=%q)\n",
+		spritesLoaded, explosionPath)
+
+	// Ephemeral client-side billboard pool. Holds in-flight explosion
+	// sprites: TE_EXPLOSION spawns one, the per-tic Pre2DDraw walks
+	// them via DrawSpriteAtTime. Spawning a sprite is additive on top
+	// of the particle burst -- the upstream renders BOTH at impact
+	// (R_ParticleExplosion fires the 1024-particle shower AND the
+	// CL_NewTempEntity arm queues the s_explod.spr billboard).
+	tempSpritePool := client.NewTempSpritePool()
+
 	// svc_temp_entity point-effect arm. Wire the bigger-burst pool
 	// helpers (R_ParticleExplosion / R_LavaSplash / R_TeleportSplash)
 	// per TE_* kind; the smaller dust-burst kinds (Spike / Gunshot /
@@ -671,6 +695,11 @@ func run() error {
 		switch kind {
 		case protocol.TEExplosion, protocol.TETarExplosion:
 			render.ParticleExplosion(particlePool, origin, now, particleRNG)
+			// Stack the billboard on top when the sprite is present;
+			// silent fall-back to particles-only otherwise.
+			if explosionSprite != nil {
+				tempSpritePool.Spawn(origin, now, 0)
+			}
 		case protocol.TELavaSplash:
 			render.LavaSplash(particlePool, origin, now, particleRNG)
 		case protocol.TETeleport:
@@ -735,7 +764,7 @@ func run() error {
 	fmt.Printf("QUAKE: sbar -- loaded %d/%d assets, missing: %v\n",
 		sbarLoaded, sbarTotal, sample)
 
-	if err := setupRenderer(runner, pakFS, realHost, playerSlot, aliasModels, aliasSkins, sbarAssets, particleRNG); err != nil {
+	if err := setupRenderer(runner, pakFS, realHost, playerSlot, aliasPrecache, aliasModels, aliasSkins, sbarAssets, particleRNG, tempSpritePool, explosionSprite); err != nil {
 		return fmt.Errorf("setupRenderer: %w", err)
 	}
 
@@ -774,7 +803,7 @@ func run() error {
 // trace stack on purpose: the goal of this bring-up is "key press moves
 // the camera", not "physically correct movement". A follow-up batch
 // swaps the integrator for the real SV_Physics tick.
-func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int, aliasModels []*mdl.Model, aliasSkins []*render.Pic, sbarAssets *render.SBarAssets, particleRNG func() byte) error {
+func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int, aliasPrecache []string, aliasModels []*mdl.Model, aliasSkins []*render.Pic, sbarAssets *render.SBarAssets, particleRNG func() byte, tempSpritePool *client.TempSpritePool, explosionSprite *enginespr.Sprite) error {
 	// 1. Source the BSP bytes: real pak0.pak first, synthbsp fallback.
 	bspBytes, size, err := loadBSP(pakFS)
 	if err != nil {
@@ -1631,6 +1660,54 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			if frame%60 == 0 {
 				fmt.Printf("QUAKE: DrawParticleQuads err: %v\n", err)
 			}
+		}
+
+		// Temp-sprite pass. Walks the explosion-billboard pool and
+		// blits each live sprite via DrawSpriteAtTime. Runs AFTER the
+		// particle pass so the bright sprite flash overlays the
+		// scatter-shower (the upstream draw order in
+		// R_DrawViewModel + R_DrawSpriteModel).  Skips silently when
+		// the sprite is nil (asset missing -- the temp-sprite pool is
+		// also kept empty by the EmitTempEntity arm in that case).
+		//
+		// The walk ALSO ages out expired slots even when explosionSprite
+		// is nil, so a future hot-reload that swaps the sprite in
+		// mid-run starts from a clean pool.
+		spritesDrawn := 0
+		tempSpritePool.Walk(now, func(origin [3]float32, elapsed float32) {
+			if explosionSprite == nil {
+				return
+			}
+			if err := render.DrawSpriteAtTime(fb, rd, explosionSprite, origin, elapsed); err != nil {
+				if frame%60 == 0 {
+					fmt.Printf("QUAKE: DrawSpriteAtTime err: %v\n", err)
+				}
+				return
+			}
+			spritesDrawn++
+		})
+
+		// Per-tic in-flight projectile census. Counts entities whose
+		// model name (looked up through the alias precache the alias
+		// loader walked) maps to a projectile trail kind -- rockets,
+		// grenades, spikes, lasers, voorballs. The number is the
+		// renderer-visible projectile population at the top of the
+		// frame, the proof that the alias pipeline IS rendering the
+		// in-flight missiles (the existing per-entity DrawAliasInterpLit
+		// pass above already draws them; this counter surfaces the
+		// census so the QEMU serial log proves the route).
+		if frame%60 == 0 {
+			missiles := 0
+			for _, es := range runner.Client.Entities {
+				if es.ModelIdx <= 0 || es.ModelIdx >= len(aliasPrecache) {
+					continue
+				}
+				if _, ok := trailKindForModel(aliasPrecache[es.ModelIdx]); ok {
+					missiles++
+				}
+			}
+			fmt.Printf("QUAKE: tic %d missiles in flight: %d, explosion sprites: %d/%d (drawn/alive)\n",
+				frame, missiles, spritesDrawn, tempSpritePool.NumAlive(now))
 		}
 
 		// HUD/sbar pass. Runs AFTER the alias entities (so monsters /
@@ -3438,6 +3515,44 @@ func seedSoundPool(pool *enginesound.Pool, pakFS fs.FS, names []string) int {
 		seeded++
 	}
 	return seeded
+}
+
+// loadExplosionSprite opens the canonical s_explod.spr asset from the
+// embedded pak so the TE_EXPLOSION client arm can spawn billboarded
+// flashes on top of the particle shower. Tries both upstream paths in
+// order (early shareware paks shipped it under progs/; the retail
+// release moved it to sprites/), returning (sprite, resolvedPath) on
+// the first hit. (nil, "") when neither path is present -- callers
+// silently degrade to particles-only.
+//
+// A malformed .spr (truncated, bad magic, unsupported version) is
+// treated the same as a missing file: log the parse error so the
+// QEMU serial stream surfaces the cause, then return (nil, "") so
+// the bring-up keeps booting.
+//
+// nil pakFS returns (nil, "") -- placeholder-pak boots never have
+// real sprite assets.
+func loadExplosionSprite(pakFS fs.FS) (*enginespr.Sprite, string) {
+	if pakFS == nil {
+		return nil, ""
+	}
+	candidates := []string{
+		"progs/s_explod.spr",
+		"sprites/s_explod.spr",
+	}
+	for _, path := range candidates {
+		blob, ok := tryReadPakFile(pakFS, path)
+		if !ok {
+			continue
+		}
+		sp, err := enginespr.Load(bytes.NewReader(blob), int64(len(blob)))
+		if err != nil {
+			fmt.Printf("QUAKE: spr.Load(%s) err: %v\n", path, err)
+			continue
+		}
+		return sp, path
+	}
+	return nil, ""
 }
 
 // loadAliasModels walks the model precache and opens every entry that
