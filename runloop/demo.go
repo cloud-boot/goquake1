@@ -69,29 +69,25 @@ type Demo struct {
 
 // demoActive reports whether the runner should swap in the demo
 // playback for this tic. True iff Runner.Demo is non-nil AND its
-// Reader is set AND the menu is at the attract-loop screens
-// (StateMain or StateNone). When a player picks "New Game" the
-// menu transitions to StateNone via StateSkill -> the demo halts on
-// the NEXT tic; while the player navigates the title menu the
-// recorded stream plays behind the overlay.
+// Reader is set AND the menu is on the title screen (StateMain).
+// When the player picks "Single Player" (or any sub-menu activate)
+// the menu transitions away from StateMain -> demoActive flips false
+// -> host.Frame takes over and the real game runs. StateNone
+// explicitly does NOT play demo: that's the "game running, no menu"
+// path; letting the attract loop override it would make the player
+// see recorded gameplay instead of their own session.
 //
 // Returns false when r is nil so the function is safe on a
-// half-built test runner.
+// half-built test runner. With no menu wired the attract loop runs
+// unconditionally (bring-up path).
 func (r *Runner) demoActive() bool {
 	if r == nil || r.Demo == nil || r.Demo.Reader == nil {
 		return false
 	}
 	if r.Menu == nil {
-		// No menu wired -> attract loop runs unconditionally; the
-		// embedder is on the bring-up path where the menu hasn't
-		// been added yet but the demo should still play.
 		return true
 	}
-	switch r.Menu.State {
-	case menu.StateMain, menu.StateNone:
-		return true
-	}
-	return false
+	return r.Menu.State == menu.StateMain
 }
 
 // interruptDemoOnInput clears Runner.Demo when snap carries any

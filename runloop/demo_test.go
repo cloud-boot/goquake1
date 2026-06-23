@@ -85,13 +85,15 @@ func TestDemoActive_MenuStateMainTrue(t *testing.T) {
 	}
 }
 
-func TestDemoActive_MenuStateNoneTrue(t *testing.T) {
+func TestDemoActive_MenuStateNoneFalse(t *testing.T) {
+	// StateNone = "game running, no menu" -- demo MUST NOT play, else
+	// the attract loop overrides the player's live session.
 	r := &Runner{
 		Demo: &Demo{Reader: newDemoReader(t)},
 		Menu: &menu.Menu{State: menu.StateNone},
 	}
-	if !r.demoActive() {
-		t.Errorf("menu StateNone demoActive = false, want true")
+	if r.demoActive() {
+		t.Errorf("menu StateNone demoActive = true, want false (gameplay path)")
 	}
 }
 
