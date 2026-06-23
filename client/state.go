@@ -274,6 +274,28 @@ type State struct {
 	// Signature: (kind = the TE_* sub-type byte, origin = the wire-
 	// reported world-space coord).
 	EmitTempEntity func(kind int, origin [3]float32)
+
+	// EmitBeam is the optional sink the [Apply] arm for the
+	// svc_temp_entity lightning family (TE_Lightning1 / TE_Lightning2 /
+	// TE_Lightning3 / TE_Beam) dispatches into. nil is a silent no-op
+	// so callers that don't yet wire it keep the historical "lightning
+	// is a stub" behaviour. tyrquake: CL_ParseBeam in cl_tent.c (the
+	// per-kind switch that picks bolt1/bolt2/bolt3.mdl + queues the
+	// per-tic CL_UpdateBeams pass).
+	//
+	// Bridges into the client-side [BeamPool] (or the embedder's own
+	// per-frame renderer) via:
+	//
+	//	kind  -- TE_* sub-type byte (TELightning1 / 2 / 3 / TEBeam)
+	//	ent   -- owning entity index (the player's or boss's slot)
+	//	start -- traceline source (the owner's muzzle)
+	//	end   -- traceline endpoint (impact / max range)
+	//
+	// The client package stays render-agnostic; the embedder's closure
+	// switches on kind, looks up the matching bolt mdl, and either
+	// spawns a [Beam] in a [BeamPool] (the canonical client-side path)
+	// or hands the segments to a custom renderer.
+	EmitBeam func(kind, ent int, start, end [3]float32)
 }
 
 // ErrAlreadyConnected is returned by [State.SetConnecting] when

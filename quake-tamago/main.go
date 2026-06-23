@@ -685,6 +685,24 @@ func run() error {
 	// CL_NewTempEntity arm queues the s_explod.spr billboard).
 	tempSpritePool := client.NewTempSpritePool()
 
+	// Lightning-bolt alias models (bolt1/bolt2/bolt3.mdl, one per
+	// TE_LIGHTNING* sub-type). Each is a 30-unit +X-aligned tile mesh
+	// the per-tic Pre2DDraw chains end-to-end along the beam vector.
+	// Missing entries (placeholder pak, or a build that ships only a
+	// subset) silently degrade: the EmitBeam arm logs nothing + the
+	// per-tic Walk renders the segments only when the matching mdl
+	// resolved. tyrquake: cl_main.c precaches progs/bolt[1-3].mdl
+	// statically; the Go port pulls them out of pak0 on demand.
+	boltModels, boltSkins, boltLoaded := loadBoltModels(pakFS)
+	fmt.Printf("QUAKE: bolt models loaded %d/3 (TE_LIGHTNING1/2/3 + TE_BEAM)\n", boltLoaded)
+
+	// Client-side lightning-beam pool. tyrquake: cl_beams[MAX_BEAMS].
+	// Holds in-flight bolts: each TE_LIGHTNING* / TE_BEAM message
+	// spawns or extends a slot; the per-tic Pre2DDraw walks them via
+	// BeamPool.Walk and draws each tile via DrawAliasInterpLit. The
+	// pool ages out slots whose .die < now (BeamLifetime = 0.2 s).
+	beamPool := client.NewBeamPool()
+
 	// svc_temp_entity point-effect arm. Wire the bigger-burst pool
 	// helpers (R_ParticleExplosion / R_LavaSplash / R_TeleportSplash)
 	// per TE_* kind; the smaller dust-burst kinds (Spike / Gunshot /
@@ -716,6 +734,18 @@ func run() error {
 	}
 	fmt.Printf("QUAKE: particle pool wired -- cap=%d gravity=%v (QC #48 + svc_particle + svc_temp_entity)\n",
 		render.MaxParticles, runner.ParticleGravity)
+
+	// svc_temp_entity lightning arm. The wire decoder fires this for
+	// TE_LIGHTNING1 / 2 / 3 / TE_BEAM with the owner entity + start +
+	// end of the traceline the server emitted. We queue the bolt into
+	// the client-side BeamPool; the per-tic Pre2DDraw walks it and
+	// renders each 30-unit tile via DrawAliasInterpLit on the matching
+	// bolt mdl. tyrquake: CL_ParseBeam in cl_tent.c -- the same shape.
+	clientState.EmitBeam = func(kind, ent int, start, end [3]float32) {
+		beamPool.Spawn(kind, ent, start, end, clientState.MsgTime)
+	}
+	fmt.Printf("QUAKE: beam pool wired -- cap=%d lifetime=%vs segment=%v (TE_LIGHTNING1/2/3 + TE_BEAM)\n",
+		client.MaxBeams, client.BeamLifetime, client.BeamSegmentLength)
 
 	// 12. Build the Pre2DDraw hook (BSP load, mark/walk contexts,
 	//     synthetic texture, identity colormap) + anchor the camera
@@ -764,7 +794,7 @@ func run() error {
 	fmt.Printf("QUAKE: sbar -- loaded %d/%d assets, missing: %v\n",
 		sbarLoaded, sbarTotal, sample)
 
-	if err := setupRenderer(runner, pakFS, realHost, playerSlot, aliasPrecache, aliasModels, aliasSkins, sbarAssets, particleRNG, tempSpritePool, explosionSprite); err != nil {
+	if err := setupRenderer(runner, pakFS, realHost, playerSlot, aliasPrecache, aliasModels, aliasSkins, sbarAssets, particleRNG, tempSpritePool, explosionSprite, beamPool, boltModels, boltSkins); err != nil {
 		return fmt.Errorf("setupRenderer: %w", err)
 	}
 
@@ -803,7 +833,7 @@ func run() error {
 // trace stack on purpose: the goal of this bring-up is "key press moves
 // the camera", not "physically correct movement". A follow-up batch
 // swaps the integrator for the real SV_Physics tick.
-func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int, aliasPrecache []string, aliasModels []*mdl.Model, aliasSkins []*render.Pic, sbarAssets *render.SBarAssets, particleRNG func() byte, tempSpritePool *client.TempSpritePool, explosionSprite *enginespr.Sprite) error {
+func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int, aliasPrecache []string, aliasModels []*mdl.Model, aliasSkins []*render.Pic, sbarAssets *render.SBarAssets, particleRNG func() byte, tempSpritePool *client.TempSpritePool, explosionSprite *enginespr.Sprite, beamPool *client.BeamPool, boltModels [3]*mdl.Model, boltSkins [3]*render.Pic) error {
 	// 1. Source the BSP bytes: real pak0.pak first, synthbsp fallback.
 	bspBytes, size, err := loadBSP(pakFS)
 	if err != nil {
@@ -1686,6 +1716,66 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			}
 			spritesDrawn++
 		})
+
+		// Lightning-beam pass. Walks the BeamPool and draws one alias
+		// model per 30-unit tile of every live bolt via
+		// DrawAliasInterpLit. Per-tile (yaw, pitch) come from
+		// BeamSegments so each bolt mdl visually points end-ward; the
+		// (FrameIdx, Lerp) pair is pinned to frame 0 because bolt
+		// models are single-frame meshes (no animation to interp).
+		// Skips silently when the matching bolt mdl is nil (asset
+		// missing in this pak); the Walk still ages the slot so a
+		// future hot-reload starts from a clean pool. Runs AFTER the
+		// temp-sprite pass so the bright bolt overlays any concurrent
+		// explosion. tyrquake: CL_UpdateBeams in cl_tent.c.
+		beamsDrawn := 0
+		beamSegmentsDrawn := 0
+		beamPool.Walk(now, func(seg client.BeamSegment) {
+			var bm *mdl.Model
+			var bskin *render.Pic
+			switch seg.Kind {
+			case protocol.TELightning1:
+				bm, bskin = boltModels[0], boltSkins[0]
+			case protocol.TELightning2, protocol.TEBeam:
+				bm, bskin = boltModels[1], boltSkins[1]
+			case protocol.TELightning3:
+				bm, bskin = boltModels[2], boltSkins[2]
+			default:
+				return
+			}
+			if bm == nil {
+				return
+			}
+			if bskin == nil {
+				bskin = fallbackTex
+			}
+			ent := render.AliasEntityInterp{
+				AliasEntity: render.AliasEntity{
+					Origin:     seg.Origin,
+					AnglePitch: seg.Pitch,
+					AngleYaw:   seg.Yaw,
+					AngleRoll:  0,
+					FrameIdx:   0,
+					SkinIdx:    0,
+				},
+				FrameIdxNext: 0,
+				Lerp:         0,
+			}
+			if err := render.DrawAliasInterpLit(fb, rd, &cm, aliasShade, bm, bskin, ent); err != nil {
+				if frame%60 == 0 {
+					fmt.Printf("QUAKE: DrawAliasInterpLit(bolt kind=%d) err: %v\n", seg.Kind, err)
+				}
+				return
+			}
+			beamSegmentsDrawn++
+			if seg.Index == 0 {
+				beamsDrawn++
+			}
+		})
+		if frame%60 == 0 {
+			fmt.Printf("QUAKE: lightning beams active=%d segments=%d\n",
+				beamsDrawn, beamSegmentsDrawn)
+		}
 
 		// Per-tic in-flight projectile census. Counts entities whose
 		// model name (looked up through the alias precache the alias
@@ -3609,6 +3699,58 @@ func loadAliasModels(pakFS fs.FS, precache []string) ([]*mdl.Model, []*render.Pi
 		loaded++
 	}
 	return models, skins, loaded, names
+}
+
+// loadBoltModels opens the three canonical lightning-bolt alias models
+// out of pak0: progs/bolt1.mdl, progs/bolt2.mdl, progs/bolt3.mdl
+// (TE_LIGHTNING1 / 2 / 3 respectively; TE_BEAM re-uses bolt2). Returns
+// parallel three-slot arrays plus the count of slots that resolved --
+// missing files / parse failures leave the slot nil so the per-tic
+// beam Walk in setupRenderer can silently skip them.
+//
+// A nil pakFS returns three nil slots + 0 (placeholder-pak boot path,
+// no .mdl files anywhere).
+func loadBoltModels(pakFS fs.FS) (models [3]*mdl.Model, skins [3]*render.Pic, loaded int) {
+	if pakFS == nil {
+		return
+	}
+	paths := [3]string{
+		"progs/bolt.mdl",  // some shareware builds shipped bolt.mdl
+		"progs/bolt2.mdl", // TE_LIGHTNING2 + TE_BEAM (the thunderbolt)
+		"progs/bolt3.mdl", // TE_LIGHTNING3 (boss beam)
+	}
+	// TE_LIGHTNING1 (low-end boss bolt) is conventionally progs/bolt.mdl
+	// in the shareware paks; later retail variants ship progs/bolt1.mdl.
+	// Try the bolt1 alias first, fall back to bolt.
+	alt1 := "progs/bolt1.mdl"
+	if blob, ok := tryReadPakFile(pakFS, alt1); ok {
+		if m, err := mdl.Load(bytes.NewReader(blob), int64(len(blob))); err == nil {
+			models[0] = m
+			skins[0] = firstSkinAsPic(m)
+			loaded++
+		} else {
+			fmt.Printf("QUAKE: mdl.Load(%s) err: %v\n", alt1, err)
+		}
+	}
+	startIdx := 0
+	if models[0] != nil {
+		startIdx = 1 // skip slot 0; already loaded via bolt1.mdl alias
+	}
+	for i := startIdx; i < 3; i++ {
+		blob, ok := tryReadPakFile(pakFS, paths[i])
+		if !ok {
+			continue
+		}
+		m, err := mdl.Load(bytes.NewReader(blob), int64(len(blob)))
+		if err != nil {
+			fmt.Printf("QUAKE: mdl.Load(%s) err: %v\n", paths[i], err)
+			continue
+		}
+		models[i] = m
+		skins[i] = firstSkinAsPic(m)
+		loaded++
+	}
+	return
 }
 
 // firstSkinAsPic returns the model's first single-skin as a *render.Pic

@@ -284,35 +284,38 @@ func applyParticle(state *State, m DecodedParticle) {
 	state.EmitParticles(m.Origin, m.Dir, m.Color, m.Count)
 }
 
-// applyTempEntity dispatches a svc_temp_entity point-effect into the
-// embedder's optional [State.EmitTempEntity] sink. Lightning beams
-// and TEExplosion2 carry payload beyond a single Origin (start/end
-// for beams, colourmap range for the alt explosion) -- those are
-// still no-ops for now because the bring-up pool doesn't yet
-// reproduce the beam-segment + colour-mapped variants. The
-// point-effect family (Spike / SuperSpike / Gunshot / Explosion /
-// TarExplosion / WizSpike / KnightSpike / LavaSplash / Teleport)
-// is the bulk of the visible carnage and is dispatched here.
+// applyTempEntity dispatches a svc_temp_entity sub-event into the
+// embedder's optional sinks: point-effect kinds (Spike / SuperSpike /
+// Gunshot / Explosion / TarExplosion / WizSpike / KnightSpike /
+// LavaSplash / Teleport) go through [State.EmitTempEntity] with the
+// wire-reported Origin; lightning kinds (TELightning1 / 2 / 3 / TEBeam)
+// go through [State.EmitBeam] with the (Start, End) traceline + the
+// owning entity index. TEExplosion2 still routes to EmitTempEntity
+// (colour-mapped explosion is a future renderer batch -- the embedder
+// is free to inspect Kind and dispatch it locally if it grows that
+// capability later).
 //
-// nil sink = silent no-op so callers that don't yet wire the pool
+// nil sinks = silent no-ops so callers that don't yet wire the pool
 // keep the historical "TE arm is a stub" behaviour.
 //
 // tyrquake: CL_ParseTEnt -- the per-kind switch that calls
 // R_ParticleExplosion / R_RunParticleEffect / R_LavaSplash /
-// R_TeleportSplash / CL_NewDLight depending on the TE_* byte.
-// Light-emission (CL_NewDLight calls) is out of scope here -- the
-// dynamic-lighting pool is wired separately when the bring-up gets
-// to it.
+// R_TeleportSplash / CL_NewDLight / CL_ParseBeam depending on the
+// TE_* byte. Light-emission (CL_NewDLight calls) is out of scope here
+// -- the dynamic-lighting pool is wired separately when the bring-up
+// gets to it.
 func applyTempEntity(state *State, m DecodedTempEntity) {
+	switch m.Kind {
+	case TELightning1, TELightning2, TELightning3, TEBeam:
+		if state.EmitBeam == nil {
+			return
+		}
+		state.EmitBeam(int(m.Kind), m.EntityNum, m.Start, m.End)
+		return
+	}
 	if state.EmitTempEntity == nil {
 		return
 	}
-	// Point-effect kinds are the only ones with a meaningful Origin
-	// payload alone. Lightning beams (TELightning*/TEBeam) and the
-	// TEExplosion2 alt-explosion carry additional fields the bring-
-	// up doesn't yet render via this hook; the embedder's switch
-	// can still inspect Kind and dispatch them if it grows that
-	// capability later.
 	state.EmitTempEntity(int(m.Kind), m.Origin)
 }
 
