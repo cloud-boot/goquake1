@@ -39,6 +39,25 @@ type UserCmd struct {
 	Impulse     uint8 // "+impulse N" weapon / cheat number
 }
 
+// Per-tic trigger-button bitmask values that ride on
+// [UserCmd.Buttons]. Mirror tyrquake's NQ/keys.h BUTTON_* defines
+// and the matching client-side constants in `client.ButtonAttack /
+// client.ButtonJump`. The values are the canonical on-wire shape
+// the QC progs read as self.button0 / self.button2 floats; do not
+// renumber or every shipping mod breaks.
+//
+// Living here (next to the UserCmd struct that carries them) so the
+// server + host packages can interpret the bitmask without taking
+// a circular dep on the client package's input keymap.
+const (
+	// ButtonAttack is the +attack bit (= self.button0). tyrquake:
+	// BUTTON_ATTACK = 1.
+	ButtonAttack uint8 = 1
+	// ButtonJump is the +jump bit (= self.button2). tyrquake:
+	// BUTTON_JUMP = 2.
+	ButtonJump uint8 = 2
+)
+
 // Server is the per-map runtime state. Lives from SV_SpawnServer
 // (map load) through SV_SendClientMessages (per-tick frames) until
 // the next SV_SpawnServer wipes it. tyrquake: server_t in NQ/server.h.

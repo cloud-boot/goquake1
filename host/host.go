@@ -278,21 +278,34 @@ func hostKeyAt(i int) world.Key { return world.Key(i) }
 
 // runClientCmds drains every active client's inbox via ReadClientMoves
 // then copies the resulting Cmd.ViewAngles into the bound edict's
-// `v_angle` entvars field. tyrquake: SV_RunClients in NQ/host.c -- the
-// per-tic SV_ReadClientMessage + SV_ClientThink call pair that runs
-// just before SV_Physics so PhysicsWalk sees the freshest UserCmd +
-// view angles.
+// `v_angle` entvars field plus the per-tic trigger-button bits
+// (button0 = +attack, button2 = +jump) and the +impulse byte.
+// tyrquake: SV_RunClients in NQ/host.c -- the per-tic
+// SV_ReadClientMessage + SV_ClientThink call pair that runs just
+// before SV_Physics so PhysicsWalk sees the freshest UserCmd + view
+// angles, and so the per-tic PlayerPostThink QC dispatch sees a
+// fresh self.button0 / self.button2 / self.impulse the W_WeaponFrame
+// + ImpulseCommands chain reads.
 //
-// The v_angle copy is the minimal SV_RunCmd equivalent: PhysicsWalk's
-// CalcWishVel reads v_angle (NOT the cmd's ViewAngles) for the
-// forward/right basis, so without this propagation the player's
-// wishvel would always lock to v_angle's last value (zero at spawn).
+// The v_angle copy is the minimal SV_RunCmd equivalent for movement:
+// PhysicsWalk's CalcWishVel reads v_angle (NOT the cmd's ViewAngles)
+// for the forward/right basis, so without this propagation the
+// player's wishvel would always lock to v_angle's last value (zero
+// at spawn).
+//
+// The button0 / button2 / impulse propagation is the minimal
+// SV_RunCmd equivalent for triggers: PlayerPostThink reads
+// self.button0 inside W_WeaponFrame ("if (self.button0) W_Attack();")
+// and self.impulse inside ImpulseCommands ("ImpulseCommands();" at
+// the top of PlayerPostThink). Without it, +attack on the client
+// flips the on-wire `buttons` bit but the QC dispatch sees zero on
+// the edict's field, so W_Attack never runs and no shot is fired.
 //
 // Slots without an Edict yet (ConnectClient ran but the edict pool
-// wasn't ready) and slots without a v_angle field (test stubs with
-// stripped progs) are skipped silently. Other errors -- a transport
-// failure, a bad clc opcode -- are surfaced verbatim so callers can
-// log + drop.
+// wasn't ready) and slots without a given field (test stubs with
+// stripped progs) are skipped silently per field. Other errors -- a
+// transport failure, a bad clc opcode -- are surfaced verbatim so
+// callers can log + drop.
 func (h *Host) runClientCmds() error {
 	p := h.findProgs()
 	for _, c := range h.Static.Clients {
@@ -312,8 +325,30 @@ func (h *Host) runClientCmds() error {
 		// v_angle absent (stripped test progs) -> silent skip. A real
 		// Q1 progs.dat always declares it.
 		_ = ev.WriteVec3("v_angle", c.Cmd.ViewAngles)
+		// button0 (=ButtonAttack), button2 (=ButtonJump), impulse:
+		// per-tic trigger bits the QC reads via self.button0 /
+		// self.button2 / self.impulse. Stripped test progs without
+		// these fields silent-skip; real Q1 progs.dat always
+		// declares them as EvFloat.
+		_ = ev.WriteFloat("button0", boolToFloat(c.Cmd.Buttons&server.ButtonAttack != 0))
+		_ = ev.WriteFloat("button2", boolToFloat(c.Cmd.Buttons&server.ButtonJump != 0))
+		_ = ev.WriteFloat("impulse", float32(c.Cmd.Impulse))
 	}
 	return nil
+}
+
+// boolToFloat is the inline "0 or 1" helper the button-bit
+// propagation in [Host.runClientCmds] uses to flatten a bitmask test
+// into the EvFloat value QC reads. tyrquake encodes per-tic buttons
+// as floats on the entvars (button0 / button1 / button2) even though
+// the on-wire shape is a single byte bitmask -- the QC compiler has
+// no integer type, so the bit-to-float widen happens at the server-
+// to-VM boundary.
+func boolToFloat(b bool) float32 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // runThink is the per-tic SV_RunThink-equivalent walker. Iterates

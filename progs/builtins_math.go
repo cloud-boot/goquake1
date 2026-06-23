@@ -7,6 +7,8 @@ package progs
 import (
 	"errors"
 	"math"
+
+	"github.com/go-quake1/engine/mathlib"
 )
 
 // MathBuiltinIDs gathers the official QuakeC builtin index numbers
@@ -78,12 +80,23 @@ var ErrRandomNotSeeded = errors.New("progs: random() builtin called but no SetRa
 // (float)0x7fff` shape so byte-equal demos work both ways.
 func (vm *VM) SetRandomSource(fn func() float32) { vm.randomSource = fn }
 
-// RegisterMathBuiltins wires the 9 pure-math QuakeC builtins
-// (normalize / vlen / vectoyaw / vectoangles / random / fabs /
-// rint / floor / ceil) into the VM at their canonical index numbers.
-// Callers that want to override individual builtins do so AFTER
-// this call.
+// RegisterMathBuiltins wires the 10 pure-math QuakeC builtins
+// (makevectors / normalize / vlen / vectoyaw / vectoangles / random
+// / fabs / rint / floor / ceil) into the VM at their canonical
+// index numbers. Callers that want to override individual builtins
+// do so AFTER this call.
+//
+// makevectors is included here -- not in the per-embedder
+// side-effect builtins -- because its output is pure math (the
+// AngleVectors basis from a pitch/yaw/roll input) parked in three
+// QC globals, with no I/O or world state involved. Without a real
+// implementation, W_FireShotgun's "makevectors(self.v_angle);
+// traceline(src, src + v_forward * 2048, ...)" chain reads v_forward
+// = (0,0,0) every tic and every shot trace collapses to a degenerate
+// zero-length ray that never clips anything -- so the player can
+// hold +attack forever without ever damaging a monster.
 func (vm *VM) RegisterMathBuiltins() {
+	vm.RegisterBuiltin(BuiltinMakeVectors, BuiltinFnMakeVectors)
 	vm.RegisterBuiltin(BuiltinRandom, BuiltinFnRandom)
 	vm.RegisterBuiltin(BuiltinNormalize, BuiltinFnNormalize)
 	vm.RegisterBuiltin(BuiltinVLen, BuiltinFnVLen)
@@ -93,6 +106,47 @@ func (vm *VM) RegisterMathBuiltins() {
 	vm.RegisterBuiltin(BuiltinRInt, BuiltinFnRInt)
 	vm.RegisterBuiltin(BuiltinFloor, BuiltinFnFloor)
 	vm.RegisterBuiltin(BuiltinCeil, BuiltinFnCeil)
+}
+
+// BuiltinFnMakeVectors implements void makevectors(vector angles).
+// tyrquake: PF_makevectors (pr_cmds.c) -- computes the forward /
+// right / up basis from the pitch/yaw/roll input and parks each
+// triple at the QC globals named v_forward / v_right / v_up.
+//
+// The QC bytecode reads the resulting basis through plain global
+// loads (OP_LOAD_V) at the slot offsets the FindGlobal lookup
+// resolves, so the writes are by name -- a progs.dat that omits
+// any of the three globals (test stubs with stripped definitions)
+// silently skips the write for that one and returns nil; real Q1
+// progs.dat always declares all three.
+//
+// A nil bound progs (test stubs constructed without NewVM(p))
+// surfaces as the early-return no-op; the read path doesn't have
+// FindGlobal so writes can't be located.
+func BuiltinFnMakeVectors(vm *VM) error {
+	if vm == nil || vm.progs == nil {
+		return nil
+	}
+	angles, _ := vm.GlobalVector(OfsParm0)
+	forward, right, up := mathlib.AngleVectors(angles)
+	type binding struct {
+		name string
+		v    [3]float32
+	}
+	for _, b := range []binding{
+		{"v_forward", forward},
+		{"v_right", right},
+		{"v_up", up},
+	} {
+		def := vm.progs.FindGlobal(b.name)
+		if def == nil {
+			continue
+		}
+		if err := vm.SetGlobalVector(int(def.Ofs), b.v); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // BuiltinFnNormalize implements vector normalize(vector).

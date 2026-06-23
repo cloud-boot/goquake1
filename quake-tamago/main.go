@@ -1552,9 +1552,10 @@ func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
 	}
 	h.SetSoundPool(pool)
 
-	// 4. Builtin table. RegisterMathBuiltins wires the 9 pure-math
-	//    builtins (normalize / vlen / vectoangles / random / ...);
-	//    registerSpawnTimeBuiltins layers no-op stubs on top of every
+	// 4. Builtin table. RegisterMathBuiltins wires the 10 pure-math
+	//    builtins (makevectors / normalize / vlen / vectoangles /
+	//    random / ...); registerSpawnTimeBuiltins layers no-op stubs
+	//    on top of every
 	//    builtin a typical Q1 entity-spawn QC function calls
 	//    (precache_model / precache_sound / setmodel / setorigin /
 	//    setsize / lightstyle / dprint / stuffcmd / cvar / particle /
@@ -1885,10 +1886,12 @@ func edictSlot(h *enginehost.Host, ent *progs.Edict) int32 {
 // the no-op shape is sufficient + safer than a half-port that crashes.
 func registerSpawnTimeBuiltins(vm *progs.VM, h *enginehost.Host) error {
 	noop := func(_ *progs.VM) error { return nil }
-	// makevectors writes v_forward/right/up; spawn-time entities
-	// rarely consult those, so the stub leaves them untouched. A
-	// future batch wires the real math.
-	vm.RegisterBuiltin(progs.BuiltinMakeVectors, noop)
+	// makevectors is NOT registered here: RegisterMathBuiltins
+	// (the prior call in buildHost) wires the real
+	// [progs.BuiltinFnMakeVectors] against v_forward / v_right /
+	// v_up. Overwriting it with a no-op here would silently break
+	// W_FireShotgun's aim basis -- every traceline (src, src +
+	// v_forward * 2048, ...) would collapse to a zero-length ray.
 	vm.RegisterBuiltin(progs.BuiltinSetOrigin, noop)
 	vm.RegisterBuiltin(progs.BuiltinSetModel, builtinSetModel(h))
 	vm.RegisterBuiltin(progs.BuiltinSetSize, noop)
