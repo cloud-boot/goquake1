@@ -1,0 +1,62 @@
+# Top-level Taskfile for cross-cutting engine workflows.
+#
+# Per-target builds (bare-metal tamago) live in their own subdirectory
+# Taskfiles -- this file owns the toolchain-agnostic flows: the
+# browser-side wasm build + the tiny local file server that hosts it.
+#
+# Usage:
+#   task build-wasm     # compiles cmd/quake-wasm to cmd/quake-wasm/web/quake.wasm
+#   task serve-wasm     # binds localhost:8080 to cmd/quake-wasm/web/
+#   task wasm           # build-wasm then serve-wasm (one-step "play in browser")
+#
+# Requires:
+#   - GO pointing at a Go toolchain (defaults to "go" on PATH).
+#     GOOS=js GOARCH=wasm has been a stable Go cross-target since Go 1.11.
+#   - $(go env GOROOT)/lib/wasm/wasm_exec.js -- the runtime glue the
+#     HTML host page loads. Refreshed on every build-wasm so the JS
+#     shim always matches the wasm payload's runtime expectations.
+
+version: "3"
+
+vars:
+  GO:
+    sh: echo "${GO:-go}"
+  WASM_OUT: '{{.TASKFILE_DIR}}/cmd/quake-wasm/web/quake.wasm'
+  WASM_EXEC_DST: '{{.TASKFILE_DIR}}/cmd/quake-wasm/web/wasm_exec.js'
+
+tasks:
+  build-wasm:
+    desc: Compile cmd/quake-wasm to a browser-loadable quake.wasm payload, then refresh the wasm_exec.js shim from the active Go toolchain so the runtime glue matches.
+    cmds:
+      - mkdir -p {{.TASKFILE_DIR}}/cmd/quake-wasm/web
+      - |
+        GOWORK=off GOOS=js GOARCH=wasm "{{.GO}}" build \
+          -trimpath -ldflags '-s -w' \
+          -o "{{.WASM_OUT}}" \
+          ./cmd/quake-wasm/
+      - |
+        WASM_EXEC_SRC=$("{{.GO}}" env GOROOT)/lib/wasm/wasm_exec.js
+        if [ ! -f "$WASM_EXEC_SRC" ]; then
+          WASM_EXEC_SRC=$("{{.GO}}" env GOROOT)/misc/wasm/wasm_exec.js
+        fi
+        if [ ! -f "$WASM_EXEC_SRC" ]; then
+          echo "build-wasm: wasm_exec.js missing from active Go toolchain" >&2
+          exit 1
+        fi
+        cp "$WASM_EXEC_SRC" "{{.WASM_EXEC_DST}}"
+      - |
+        echo "build-wasm: wrote {{.WASM_OUT}} ($(wc -c < "{{.WASM_OUT}}") bytes)"
+        echo "build-wasm: refreshed {{.WASM_EXEC_DST}}"
+
+  serve-wasm:
+    desc: Serve cmd/quake-wasm/web/ on localhost:8080 (blocks until Ctrl-C). Open http://localhost:8080/ in any modern browser to play.
+    cmds:
+      - |
+        echo "serve-wasm: open http://localhost:8080/"
+        GOWORK=off "{{.GO}}" run ./cmd/serve-wasm/
+
+  wasm:
+    desc: One-step browser-play -- build the wasm payload, then serve it on localhost:8080.
+    deps: [build-wasm]
+    cmds:
+      - task: serve-wasm

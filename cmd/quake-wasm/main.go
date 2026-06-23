@@ -1,0 +1,414 @@
+// Copyright (c) 1996-1997 Id Software, Inc.
+// Copyright (c) 2026 the go-quake1/engine authors.
+// SPDX-License-Identifier: BSD-3-Clause
+
+//go:build js && wasm
+
+// quake-wasm is the browser-side entry point for the Go-native Quake
+// engine. It mirrors the structure of quake-tamago/main.go but swaps
+// the bare-metal virtio probe for the backend/wasm.NewDefault Canvas2D
+// + DOMInput + WebAudio adapter set and drops the tamago-specific
+// boot sequence (no PCI scan, no kernel halt).
+//
+// Scope: first browser bring-up. The engine is wired with a stub
+// host + synthbsp fallback world, so the in-browser canvas paints
+// the title menu + console + a synthetic-BSP scene. Real pak0 / real
+// host follow in a later batch (the wasm Backend itself is already
+// production-ready; the bottleneck is the cmd/-side glue to load
+// real assets via fetch()).
+//
+// Loop driver: in a single-threaded GOOS=js GOARCH=wasm environment
+// the Go scheduler cooperates with the JS event loop via runtime
+// calls that yield (channel ops, time.Sleep). [runloop.Runner.RunUntilQuit]
+// is blocking, but every per-frame call to Backend.PollInput drains
+// the DOM event queue + every Backend.QueueAudio yields long enough
+// for the browser to deliver the next batch of DOM events. The user
+// closes the tab to exit; the engine also receives EventQuit via the
+// beforeunload listener installed by backend/wasm.NewDOMInput.
+package main
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"syscall/js"
+	"time"
+
+	"github.com/go-quake1/engine/assets"
+	"github.com/go-quake1/engine/backend/wasm"
+	"github.com/go-quake1/engine/bspfile"
+	"github.com/go-quake1/engine/bspfile/synthbsp"
+	"github.com/go-quake1/engine/bsprender"
+	"github.com/go-quake1/engine/client"
+	"github.com/go-quake1/engine/embedpak"
+	"github.com/go-quake1/engine/model"
+	"github.com/go-quake1/engine/render"
+	"github.com/go-quake1/engine/runloop"
+	engineserver "github.com/go-quake1/engine/server"
+	"github.com/go-quake1/engine/vfs"
+)
+
+// fbWidth / fbHeight match the vanilla DOS Quake framebuffer so the
+// software rasterizer's per-pixel work stays affordable in a wasm
+// runtime. The HTML host page upscales via CSS image-rendering:
+// pixelated for crisp browser-window display.
+const (
+	fbWidth  = 320
+	fbHeight = 240
+)
+
+// stubHost satisfies [runloop.HostFramer] for the first bring-up.
+// The real id-Software game-server tick lands in a follow-up batch;
+// for now the loop just processes input + paints the world walk.
+type stubHost struct{}
+
+// Frame is a no-op: simulation arrives once a real pak is wired.
+func (stubHost) Frame(_ float32) error { return nil }
+
+func main() {
+	if err := run(); err != nil {
+		// In a browser context Println is captured by Go's wasm
+		// runtime + relayed to console.error -- the user opens
+		// DevTools to see the failure reason.
+		fmt.Println("QUAKE: FAIL", err)
+		// Block on an empty channel so the JS-side wasm instance
+		// stays alive long enough for the console message to flush
+		// + so DOM event handlers retain their js.Func references.
+		<-make(chan struct{})
+		return
+	}
+	fmt.Println("QUAKE: exited cleanly")
+}
+
+// run is main's testability seam (mirrors quake-tamago/main.go). It
+// returns errors instead of halting so the browser console carries
+// the failure reason; main then blocks on receipt.
+func run() error {
+	// 1. Build the wasm backend over canvas#quake. NewDefault
+	//    constructs the Framebuffer / Input / Audio adapters
+	//    + the performance.now clock. Audio failures (e.g. the
+	//    user hasn't gestured yet so AudioContext can't construct)
+	//    degrade to silent rather than abort.
+	be, err := wasm.NewDefault("#quake", fbWidth, fbHeight)
+	if err != nil {
+		return fmt.Errorf("wasm.NewDefault: %w", err)
+	}
+	logf("backend up -- canvas=#quake size=%dx%d", fbWidth, fbHeight)
+
+	// 2. Try the embedded pak. The placeholder ships empty (12 bytes)
+	//    so embedpak.OpenAsFS returns ErrEmbedPakEmpty -- we fall
+	//    through to the synthbsp + synthetic-asset path. The hook is
+	//    kept here so a future build that embeds real pak0 picks it
+	//    up with no code change.
+	pakFS, pakErr := embedpak.OpenAsFS()
+	if pakErr != nil {
+		logf("embedpak.OpenAsFS: %v -- using synthetic assets + synthbsp", pakErr)
+	}
+
+	// 3. Build the asset VFS: synthetic fallback first, real pak last
+	//    (vfs.Add prepends, so the LAST Add wins).
+	v := vfs.New()
+	v.Add(syntheticAssets())
+	if pakFS != nil {
+		v.Add(pakFS)
+	}
+
+	// 4. Loopback client/server pair. No real host -> bare loopback
+	//    whose server side is silently dropped.
+	cli, _ := engineserver.NewLoopbackConn()
+	clientState := client.NewState()
+
+	// 5. Build the Runner via the standard SetupOpts path. The
+	//    backend.Backend.Size() return (fbWidth x fbHeight) drives
+	//    framebuffer + RGBA buffer dimensions.
+	runner, err := runloop.NewRunnerFromVFS(runloop.SetupOpts{
+		VFS:            v,
+		Host:           stubHost{},
+		Client:         clientState,
+		Conn:           cli,
+		Backend:        be,
+		BackgroundIdx:  0x20, // pleasant grey
+		NotifyLifetime: 3,
+		MaxNotifyRows:  4,
+	})
+	if err != nil {
+		return fmt.Errorf("NewRunnerFromVFS: %w", err)
+	}
+	runner.Console.Print("PURE-GO QUAKE 1 -- browser bring-up\n")
+	runner.Console.Print("backend/wasm: Canvas2D + DOMInput + WebAudio\n")
+	logf("runner up -- console seeded, entering RunUntilQuit")
+
+	// 6. Wire a minimal Pre2DDraw that walks a synthbsp scene so the
+	//    canvas paints actual 3D pixels (not just the clear colour).
+	//    On any setup failure the closure stays nil + the canvas
+	//    shows the 2D layer alone (console / menu overlay).
+	if err := setupSynthRenderer(runner); err != nil {
+		logf("setupSynthRenderer skipped: %v -- 2D-only fallback", err)
+	}
+
+	// 7. Surface a runtime-visible "ready" badge on the page so the
+	//    user knows the wasm payload is alive even before the first
+	//    frame paints. Pure best-effort: missing #status is fine.
+	if status := js.Global().Get("document").Call("getElementById", "status"); !status.IsNull() && !status.IsUndefined() {
+		status.Set("textContent", fmt.Sprintf("running -- %dx%d canvas, loopback host", fbWidth, fbHeight))
+	}
+
+	return runner.RunUntilQuit()
+}
+
+// setupSynthRenderer wires a Pre2DDraw closure that paints the
+// synthbsp BuildWithFaces scene. The closure is intentionally minimal:
+// it skips the menu / Compose2D / sound paths (those still run via
+// the runner's per-tic schedule, this just handles the 3D layer).
+func setupSynthRenderer(runner *runloop.Runner) error {
+	bspBytes, size, err := synthbsp.BuildWithFaces()
+	if err != nil {
+		return fmt.Errorf("synthbsp.BuildWithFaces: %w", err)
+	}
+	file, err := bspfile.Open(newReaderAt(bspBytes), size)
+	if err != nil {
+		return fmt.Errorf("bspfile.Open: %w", err)
+	}
+	bm, err := model.LoadBrush(file, 0)
+	if err != nil {
+		return fmt.Errorf("model.LoadBrush: %w", err)
+	}
+	faces, err := file.Faces()
+	if err != nil {
+		return fmt.Errorf("file.Faces: %w", err)
+	}
+
+	// Synth-BSP overlays (mirrors quake-tamago/main.go's isSynth path).
+	walkCtx := bsprender.NewWalkContext(bm)
+	allFaceIdx := make([]int, len(faces))
+	for i := range allFaceIdx {
+		allFaceIdx[i] = i
+	}
+	walkCtx.LeafFaces = func(id int) []int {
+		if walkCtx.NodeKind(id) == bsprender.NodeKindLeaf {
+			return allFaceIdx
+		}
+		return nil
+	}
+	walkCtx.NodeKind = func(id int) bsprender.NodeKind {
+		if id < walkCtx.NumNodes {
+			return bsprender.NodeKindInterior
+		}
+		leafIdx := id - walkCtx.NumNodes
+		if leafIdx < 0 || leafIdx >= bm.TotalLeaves() {
+			return bsprender.NodeKindEmpty
+		}
+		if bm.Leaf(leafIdx).Contents == bspfile.ContentsSolid {
+			return bsprender.NodeKindEmpty
+		}
+		return bsprender.NodeKindLeaf
+	}
+	const bigF = float32(1e6)
+	walkCtx.NodeBBox = func(id int) (mins, maxs [3]float32) {
+		return [3]float32{-bigF, -bigF, -bigF}, [3]float32{bigF, bigF, bigF}
+	}
+
+	checker := makeCheckerTex(16)
+	var cm render.ColorMap
+	for light := 0; light < render.ColorMapRows; light++ {
+		for src := 0; src < render.ColorMapCols; src++ {
+			cm[light][src] = byte(src)
+		}
+	}
+	camOrigin := [3]float32{5, 5, 20}
+	const fovX = 90.0
+
+	var surfaces bsprender.SurfaceList
+	frameCount := 0
+	runner.Pre2DDraw = func(fb *render.FrameBuffer, viewOrigin, viewAngles [3]float32) error {
+		frame := frameCount
+		frameCount++
+		// Slow yaw spin so the canvas shows visible motion.
+		viewAngles = [3]float32{0, float32(frame % 360), 0}
+		viewOrigin = camOrigin
+
+		// Clear to background palette index 0x10 (sky-like).
+		for i := range fb.Pixels {
+			fb.Pixels[i] = 0x10
+		}
+
+		rd := &render.RefDef{
+			VRect:      render.VRect{Width: fb.Width, Height: fb.Height},
+			ViewAngles: viewAngles,
+			ViewOrigin: viewOrigin,
+			FovX:       fovX,
+			FovY:       fovX,
+		}
+		view := rd.SetupView()
+		frustum := rd.BuildFrustum()
+		stampFrame := int32(frame + 1)
+
+		for n := 0; n < bm.NumNodes(); n++ {
+			bm.SetNodeVisFrame(n, stampFrame)
+		}
+		for l := 0; l < bm.TotalLeaves(); l++ {
+			bm.Leaf(l).VisFrame = stampFrame
+		}
+
+		surfaces.Reset()
+		if err := bsprender.WalkWorld(walkCtx, 0, rd.ViewOrigin, frustum, stampFrame, &surfaces); err != nil {
+			return fmt.Errorf("WalkWorld: %w", err)
+		}
+		for i := 0; i < surfaces.Len(); i++ {
+			ref := surfaces.Refs[i]
+			fv, err := bsprender.NewBrushFaceVerts(bm, ref.FaceIdx)
+			if err != nil {
+				continue
+			}
+			verts, err := bsprender.TransformFace(view, fb, fovX, fv)
+			if err != nil {
+				continue
+			}
+			_ = render.FillTexturedPolygon(fb, checker, &cm, 0, verts)
+		}
+		return nil
+	}
+	return nil
+}
+
+// makeCheckerTex returns an NxN palette-indexed checker.
+func makeCheckerTex(n int) *render.Pic {
+	pixels := make([]byte, n*n)
+	for y := 0; y < n; y++ {
+		for x := 0; x < n; x++ {
+			tile := ((x / 4) + (y / 4)) & 3
+			var idx byte
+			switch tile {
+			case 0:
+				idx = 0
+			case 1:
+				idx = 15
+			case 2:
+				idx = 31
+			default:
+				idx = 47
+			}
+			pixels[y*n+x] = idx
+		}
+	}
+	return &render.Pic{Width: n, Height: n, Pixels: pixels}
+}
+
+// syntheticAssets returns an in-memory fs.FS shaped like the standard
+// palette / colormap / conchars triple [assets.LoadStandard] expects.
+// Mirrors quake-tamago/main.go's syntheticAssets but inlined here so
+// the wasm binary stays self-contained.
+func syntheticAssets() fs.FS {
+	return memFS{
+		"gfx/palette.lmp":  makePaletteLump(),
+		"gfx/colormap.lmp": makeColorMapLump(),
+		"gfx/conchars.lmp": makeConcharsLump(),
+	}
+}
+
+func makePaletteLump() []byte {
+	buf := make([]byte, render.PaletteLumpSize)
+	for i := 0; i < 256; i++ {
+		buf[i*3+0] = byte(i)
+		buf[i*3+1] = byte(i ^ 0xFF)
+		buf[i*3+2] = byte(i << 1)
+	}
+	return buf
+}
+
+func makeColorMapLump() []byte {
+	buf := make([]byte, render.ColorMapRows*render.ColorMapCols)
+	for i := range buf {
+		buf[i] = byte(i)
+	}
+	return buf
+}
+
+func makeConcharsLump() []byte {
+	// 128x128 = 16384. Simple ASCII-grid fill so the console
+	// background isn't entirely black: alternating palette indices
+	// per cell. Real glyph data lands when the pak ships gfx/conchars.lmp.
+	buf := make([]byte, assets.ConCharsLumpSize)
+	for i := range buf {
+		buf[i] = 0
+	}
+	return buf
+}
+
+// memFS is a minimal in-memory fs.FS (signal-handling-free alternative
+// to testing/fstest.MapFS — kept consistent with quake-tamago's pattern
+// for stable, runtime-light asset bootstrap).
+type memFS map[string][]byte
+
+func (m memFS) Open(name string) (fs.File, error) {
+	data, ok := m[name]
+	if !ok {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	}
+	return &memFile{name: name, data: data}, nil
+}
+
+type memFile struct {
+	name string
+	data []byte
+	pos  int
+}
+
+func (f *memFile) Read(p []byte) (int, error) {
+	if f.pos >= len(f.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.data[f.pos:])
+	f.pos += n
+	return n, nil
+}
+
+func (f *memFile) Stat() (fs.FileInfo, error) {
+	return &memFileInfo{name: f.name, size: int64(len(f.data))}, nil
+}
+
+func (f *memFile) Close() error { return nil }
+
+type memFileInfo struct {
+	name string
+	size int64
+}
+
+func (i *memFileInfo) Name() string       { return i.name }
+func (i *memFileInfo) Size() int64        { return i.size }
+func (i *memFileInfo) Mode() fs.FileMode  { return 0o444 }
+func (i *memFileInfo) ModTime() time.Time { return time.Time{} }
+func (i *memFileInfo) IsDir() bool        { return false }
+func (i *memFileInfo) Sys() any           { return nil }
+
+// readerAt is a minimal byte-slice ReaderAt so bspfile.Open works
+// against the synthbsp byte buffer without pulling in bytes.NewReader
+// (avoids one extra dependency in the wasm payload).
+type readerAt struct {
+	data []byte
+	size int64
+}
+
+func newReaderAt(b []byte) *readerAt { return &readerAt{data: b, size: int64(len(b))} }
+
+func (r *readerAt) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 || off >= r.size {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// logf is fmt.Printf scoped to a QUAKE: prefix so browser-console
+// output stays grep-able against the tamago serial log format.
+func logf(format string, args ...any) {
+	fmt.Printf("QUAKE: "+format+"\n", args...)
+}
+
+// errLog forces compile-time use of errors (kept for fast future
+// wiring of error sentinels without re-importing).
+var _ = errors.New

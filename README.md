@@ -107,6 +107,23 @@ freely redistributable per id Software's grant and lands in-tree under
 via a probe env. CI gates always exercise the committed shareware pak
 so the reference oracle is reproducible.
 
+## Play in a browser (wasm)
+
+The engine ships a `GOOS=js GOARCH=wasm` build alongside the bare-metal
+TamaGo target. The `backend/wasm` adapter wires `backend.Backend` onto
+Canvas2D (framebuffer), DOM events (input, with Pointer Lock for
+mouse-look), and WebAudio (sound). Two top-level tasks drive it:
+
+```sh
+task build-wasm   # compiles cmd/quake-wasm -> cmd/quake-wasm/web/quake.wasm
+task serve-wasm   # binds localhost:8080 to cmd/quake-wasm/web/
+```
+
+then open `http://localhost:8080/` in any modern browser. `task wasm`
+chains both. The single-step build is large (~180 MB; the Go runtime
+ships the full stdlib in wasm builds); first-load is a one-shot
+cache.
+
 ## Provable test protocol (inherited)
 
 Every Quake phase inherits the four-gate protocol shipped with DOOM

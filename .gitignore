@@ -5,6 +5,8 @@
 *.go.gen
 engine/*.go
 !engine/.gitkeep
+# Browser wasm payload (regenerate via `task build-wasm`)
+cmd/quake-wasm/web/quake.wasm
 
 # Local oracle harvest scratch dirs
 oracle/scratch/
