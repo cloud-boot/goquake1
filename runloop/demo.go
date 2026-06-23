@@ -111,6 +111,19 @@ func (r *Runner) interruptDemoOnInput(snap backend.InputSnapshot) bool {
 	if len(snap.KeysDown) == 0 {
 		return false
 	}
+	// Don't kill the attract demo while the menu is active -- menu
+	// navigation (Up/Down/Enter/Esc/mouse-click) should leave the
+	// recorded demo running behind the overlay, exactly like vanilla
+	// Quake. The demo only halts when the player actually exits the
+	// menu into live play (the menu state-machine handles that
+	// transition via the demoActive predicate's StateMain/StateNone
+	// gate -- non-Main, non-None menu screens already pause the
+	// demo without clearing it). Clicking in the QEMU window with
+	// the title menu up used to clear r.Demo, freezing the visible
+	// scene behind a static menu; this gate prevents that.
+	if r.Menu != nil && r.Menu.Active() {
+		return false
+	}
 	r.Demo = nil
 	return true
 }

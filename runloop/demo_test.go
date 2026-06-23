@@ -135,6 +135,17 @@ func TestInterrupt_KeyDownClearsDemo(t *testing.T) {
 	}
 }
 
+func TestInterrupt_MenuActiveLeavesDemo(t *testing.T) {
+	d := &Demo{Reader: newDemoReader(t)}
+	r := &Runner{Demo: d, Menu: menu.New()} // menu boots at StateMain (active)
+	if r.interruptDemoOnInput(backend.InputSnapshot{KeysDown: []backend.KeyCode{backend.KeyMouse1}}) {
+		t.Errorf("interrupt fired while menu active, want skipped")
+	}
+	if r.Demo != d {
+		t.Errorf("demo cleared while menu active")
+	}
+}
+
 // ----- playDemoTick happy path ----------------------------------------------
 
 func TestPlayDemoTick_AdvancesAnglesAndCount(t *testing.T) {

@@ -207,7 +207,13 @@ func (m *Menu) Handle(key backend.KeyCode) (advance bool) {
 		m.moveCursor(-1)
 	case backend.KeyDown:
 		m.moveCursor(+1)
-	case backend.KeyEnter:
+	case backend.KeyEnter, backend.KeyMouse1:
+		// Mouse-click acts as Enter on the highlighted row, matching
+		// modern menu UX. Without this, clicking in the QEMU window
+		// drops a KeyMouse1 event that goes unhandled while the menu
+		// is open -- the user can navigate by arrows + Enter but the
+		// click itself appears inert. With this arm, the click
+		// activates the cursor row.
 		return m.activate()
 	}
 	return false
