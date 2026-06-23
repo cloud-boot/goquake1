@@ -105,11 +105,11 @@ tasks:
       - 'echo "build-wasmbox-client: wrote {{.WASMBOX_QUAKE_OUT}} ($(wc -c < "{{.WASMBOX_QUAKE_OUT}}") bytes)"'
 
   build-wasmbox-client-oci:
-    desc: Build cmd/quake-wasmbox with -tags no_embed_assets so wasm stays ~12 MB and assets are streamed from $OCI_REFERENCE (default http://{{.OCI_REGISTRY}}/v2/{{.OCI_TAG}}).
+    desc: Build cmd/quake-wasmbox with -tags no_embed_assets so wasm stays ~12 MB and assets are streamed from $OCI_REFERENCE (default http://{{.OCI_REGISTRY}}/{{.OCI_TAG}}). The /v2/ prefix is added by ociassets.Client at fetch time -- do NOT include it in the reference.
     cmds:
       - mkdir -p "{{.WASMBOX_DIR}}/clients/quake"
       - |
-        OCI_REFERENCE="${OCI_REFERENCE:-http://{{.OCI_REGISTRY}}/v2/{{.OCI_TAG}}}"
+        OCI_REFERENCE="${OCI_REFERENCE:-http://{{.OCI_REGISTRY}}/{{.OCI_TAG}}}"
         GOWORK=off GOOS=js GOARCH=wasm "{{.GO}}" build \
           -trimpath -tags no_embed_assets \
           -ldflags "-s -w -X main.OCIReference=$OCI_REFERENCE" \
@@ -136,14 +136,20 @@ tasks:
       - 'echo "oci-pack: wrote {{.OCI_OUT}} ($(du -sh "{{.OCI_OUT}}" | cut -f1)); next: task oci-registry-up + task oci-push"'
 
   oci-registry-up:
-    desc: Spin up a local OCI registry on :5000 via Docker (requires Docker; reusable, --rm removes on stop).
+    desc: 'Spin up a local OCI registry on :5000 via Docker (requires Docker; reusable, --rm removes on stop). CORS + Cross-Origin-Resource-Policy headers let the wasmbox quake worker fetch under COEP=require-corp.'
     cmds:
       - |
         if docker ps --format '{{`{{.Names}}`}}' | grep -q '^oci-registry$'; then
           echo "oci-registry already running"
         else
-          docker run -d -p 5000:5000 --rm --name oci-registry registry:2
-          echo "oci-registry: up on http://localhost:5000"
+          docker run -d -p 5000:5000 --rm --name oci-registry \
+            -e 'REGISTRY_HTTP_HEADERS_Access-Control-Allow-Origin=["*"]' \
+            -e 'REGISTRY_HTTP_HEADERS_Access-Control-Allow-Methods=[HEAD, GET, OPTIONS]' \
+            -e 'REGISTRY_HTTP_HEADERS_Access-Control-Allow-Headers=[Accept, Authorization, Content-Type]' \
+            -e 'REGISTRY_HTTP_HEADERS_Access-Control-Expose-Headers=[Docker-Content-Digest, Content-Length]' \
+            -e 'REGISTRY_HTTP_HEADERS_Cross-Origin-Resource-Policy=[cross-origin]' \
+            registry:2
+          echo "oci-registry: up on http://localhost:5000 (CORS + CORP enabled for wasmbox cross-origin fetch)"
         fi
 
   oci-registry-down:
@@ -166,6 +172,6 @@ tasks:
       - task: oci-push
       - task: build-wasmbox-client-oci
         vars:
-          OCI_REFERENCE: 'http://{{.OCI_REGISTRY}}/v2/{{.OCI_TAG}}'
+          OCI_REFERENCE: 'http://{{.OCI_REGISTRY}}/{{.OCI_TAG}}'
       - 'echo "demo-wasmbox-oci: starting wasmbox; open http://localhost:8080/ -> spawn quake"'
       - task -d "{{.WASMBOX_DIR}}" serve
