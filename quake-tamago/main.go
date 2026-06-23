@@ -86,6 +86,7 @@ import (
 	"github.com/go-quake1/engine/bsprender"
 	"github.com/go-quake1/engine/client"
 	"github.com/go-quake1/engine/demo"
+	"github.com/go-quake1/engine/embedmusic"
 	"github.com/go-quake1/engine/embedpak"
 	enginehost "github.com/go-quake1/engine/host"
 	"github.com/go-quake1/engine/mathlib"
@@ -669,20 +670,34 @@ func run() error {
 	//          per (track, loopTrack) pair so a shareware pak (which
 	//          omits the music/ assets) stays boot-clean instead of
 	//          spamming the QEMU serial stream on every signon.
-	if pakFS != nil {
-		runner.MusicOpen = func(track int) ([]byte, bool) {
-			if track <= 0 {
-				return nil, false
+	runner.MusicOpen = func(track int) ([]byte, bool) {
+		if track <= 0 {
+			return nil, false
+		}
+		// Canonical 2-digit zero-padded form: track01.ogg .. track99.ogg.
+		path := fmt.Sprintf("%s%02d%s", enginemusic.PathPrefix, track, enginemusic.PathSuffix)
+		// Try the pak first (user can override embedded tracks by
+		// shipping music/trackXX.ogg inside pak0).
+		if pakFS != nil {
+			if blob, ok := tryReadPakFile(pakFS, path); ok && len(blob) > 64 {
+				return blob, true
 			}
-			// Canonical 2-digit zero-padded form: track01.ogg .. track99.ogg.
-			path := fmt.Sprintf("%s%02d%s", enginemusic.PathPrefix, track, enginemusic.PathSuffix)
-			return tryReadPakFile(pakFS, path)
 		}
-		runner.MusicDecoder = enginemusic.NewVorbisDecoder
-		runner.MusicVolume = enginemusic.DefaultVolume
-		runner.MusicMissingLog = func(track int) {
-			fmt.Printf("QUAKE: music track%02d.ogg missing -- silent\n", track)
+		// Fall back to the embedded id1/music/ tracks. The placeholder
+		// files committed to embedmusic/ are 12 bytes (oggvorbis will
+		// reject them, music.Streamer logs silent fallback); replacing
+		// them with real id1/music/trackXX.ogg from the Quake archive
+		// enables in-game music with no other change.
+		blob, err := embedmusic.MusicFS.ReadFile(fmt.Sprintf("track%02d.ogg", track))
+		if err != nil || len(blob) < 64 {
+			return nil, false
 		}
+		return blob, true
+	}
+	runner.MusicDecoder = enginemusic.NewVorbisDecoder
+	runner.MusicVolume = enginemusic.DefaultVolume
+	runner.MusicMissingLog = func(track int) {
+		fmt.Printf("QUAKE: music track%02d.ogg missing -- silent\n", track)
 	}
 
 	// 11d. Particle pool wiring. One 2048-slot pool per process; the

@@ -1,0 +1,15 @@
+# Ignore real OGG Vorbis music bytes. Placeholders are committed via
+# git add -f so the //go:embed directive compiles on a fresh checkout.
+# Drop real id1/music/track02..11.ogg from the Quake archive into this
+# directory and rebuild to get music playback.
+*.ogg
+!track02.ogg
+!track03.ogg
+!track04.ogg
+!track05.ogg
+!track06.ogg
+!track07.ogg
+!track08.ogg
+!track09.ogg
+!track10.ogg
+!track11.ogg
