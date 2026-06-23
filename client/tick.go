@@ -81,7 +81,8 @@ const tickOutBufSize = 64
 //
 // OUTBOUND BUILD (skipped when state.Connection != [StateConnected]):
 //
-//   - angles := ApplyMouseMove(viewAngles, MouseDX, MouseDY, Sensitivity)
+//   - angles := ApplyMouseMove(viewAngles, MouseDX, MouseDY,
+//                               Sensitivity, Speeds.MouseYaw, Speeds.MousePitch)
 //   - angles  = AdjustAngles(angles, Buttons, Speeds, Dt)
 //   - cmd    := BaseMove(Buttons, Speeds, Dt)
 //   - cmd.ViewAngles = angles
@@ -192,7 +193,15 @@ func Tick(
 		return out, nil
 	}
 
-	angles := ApplyMouseMove(viewAngles, in.MouseDX, in.MouseDY, in.Sensitivity)
+	// MouseYaw / MousePitch come off the per-tic InputSpeeds bundle so
+	// the player's m_yaw / m_pitch cvar values flow through without
+	// reaching into a global -- the runloop seeds DefaultInputSpeeds()
+	// (MouseYaw=MousePitch=0.022) at startup, an in-game menu binding
+	// would re-publish a new bundle on change.
+	angles := ApplyMouseMove(
+		viewAngles, in.MouseDX, in.MouseDY,
+		in.Sensitivity, in.Speeds.MouseYaw, in.Speeds.MousePitch,
+	)
 	// in.Buttons is a *MovementButtons -- pass through verbatim so
 	// KeyState's impulse drain (inside AdjustAngles + BaseMove) lands
 	// on the caller's persistent kbutton state, not a stack copy.

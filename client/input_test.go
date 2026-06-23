@@ -102,9 +102,22 @@ func TestDefaultInputSpeeds(t *testing.T) {
 		Forward: 200, Back: 200, Side: 350, Up: 200,
 		Yaw: 140, Pitch: 150,
 		AngleSpeedKey: 1.5, MoveSpeedKey: 2.0,
+		MouseYaw: 0.022, MousePitch: 0.022,
 	}
 	if s != want {
 		t.Errorf("cvar default drift:\n got  %+v\n want %+v", s, want)
+	}
+}
+
+// TestDefaultMouseYawPitchConstants pins the upstream m_yaw / m_pitch
+// cvar defaults (NQ/cl_main.c) so a future stylistic refactor of the
+// exported constants can't silently drift the on-screen sensitivity.
+func TestDefaultMouseYawPitchConstants(t *testing.T) {
+	if DefaultMouseYaw != 0.022 {
+		t.Errorf("DefaultMouseYaw drift: got %v want 0.022", DefaultMouseYaw)
+	}
+	if DefaultMousePitch != 0.022 {
+		t.Errorf("DefaultMousePitch drift: got %v want 0.022", DefaultMousePitch)
 	}
 }
 
@@ -231,10 +244,12 @@ func TestBaseMove_ViewAnglesUntouched(t *testing.T) {
 
 func TestApplyMouseMove_YawNegativeOnRight(t *testing.T) {
 	// dx=100, sens=3, m_yaw=0.022 -> yaw -= 0.022 * 3 * 100 = -6.6
+	// Tolerance covers AngleMod's 360/65536 (~0.0055 deg) fixed-point
+	// step on top of float32 round-off.
 	angles := [3]float32{0, 50, 0}
-	out := ApplyMouseMove(angles, 100, 0, 3)
+	out := ApplyMouseMove(angles, 100, 0, 3, DefaultMouseYaw, DefaultMousePitch)
 	want := float32(50 - 0.022*3*100)
-	if !approxEq(out[mathlib.Yaw], want, 1e-4) {
+	if !approxEq(out[mathlib.Yaw], want, 0.01) {
 		t.Errorf("yaw on dx=100: got %v want %v", out[mathlib.Yaw], want)
 	}
 	if out[mathlib.Pitch] != 0 || out[mathlib.Roll] != 0 {
@@ -247,7 +262,7 @@ func TestApplyMouseMove_PitchIncreasesOnDyPositive(t *testing.T) {
 	// (i.e. view tilts DOWN -- "non-inverted" look). Spec said "decreases";
 	// matches the C source instead. dy=10, sens=3 -> +0.022*3*10 = +0.66
 	angles := [3]float32{0, 0, 0}
-	out := ApplyMouseMove(angles, 0, 10, 3)
+	out := ApplyMouseMove(angles, 0, 10, 3, DefaultMouseYaw, DefaultMousePitch)
 	want := float32(0.022 * 3 * 10)
 	if !approxEq(out[mathlib.Pitch], want, 1e-4) {
 		t.Errorf("pitch on dy=10: got %v want %v", out[mathlib.Pitch], want)
@@ -255,25 +270,102 @@ func TestApplyMouseMove_PitchIncreasesOnDyPositive(t *testing.T) {
 }
 
 func TestApplyMouseMove_PitchClampHigh(t *testing.T) {
-	// dy huge positive: pitch must clamp at +90.
-	out := ApplyMouseMove([3]float32{}, 0, 1e6, 3)
-	if out[mathlib.Pitch] != 90 {
-		t.Errorf("pitch upper clamp: got %v want 90", out[mathlib.Pitch])
+	// dy huge positive: pitch must clamp at +89 (one degree inside
+	// the upstream cl_maxpitch=+90 hard limit so the view never hits
+	// the AngleVectors gimbal-lock singularity).
+	out := ApplyMouseMove([3]float32{}, 0, 1e6, 3, DefaultMouseYaw, DefaultMousePitch)
+	if out[mathlib.Pitch] != 89 {
+		t.Errorf("pitch upper clamp: got %v want 89", out[mathlib.Pitch])
 	}
 }
 
 func TestApplyMouseMove_PitchClampLow(t *testing.T) {
-	out := ApplyMouseMove([3]float32{}, 0, -1e6, 3)
-	if out[mathlib.Pitch] != -90 {
-		t.Errorf("pitch lower clamp: got %v want -90", out[mathlib.Pitch])
+	out := ApplyMouseMove([3]float32{}, 0, -1e6, 3, DefaultMouseYaw, DefaultMousePitch)
+	if out[mathlib.Pitch] != -89 {
+		t.Errorf("pitch lower clamp: got %v want -89", out[mathlib.Pitch])
 	}
 }
 
 func TestApplyMouseMove_RollUntouched(t *testing.T) {
 	in := [3]float32{0, 0, 17}
-	out := ApplyMouseMove(in, 100, 100, 3)
+	out := ApplyMouseMove(in, 100, 100, 3, DefaultMouseYaw, DefaultMousePitch)
 	if out[mathlib.Roll] != 17 {
 		t.Errorf("roll mutated: got %v want 17", out[mathlib.Roll])
+	}
+}
+
+// TestApplyMouseMove_YawDefaultSensitivity asserts the per-pixel
+// yaw delta at the runloop's default Sensitivity=1: dx=100 must
+// rotate yaw by exactly m_yaw*100 = 2.2 deg in the "yaw decreases"
+// direction (Q1 sign convention; mouse-right turns the view right
+// because yaw grows CCW). Anchors the canonical wiring contract
+// between [backend.InputSnapshot.MouseDX] and the on-screen view.
+func TestApplyMouseMove_YawDefaultSensitivity(t *testing.T) {
+	const start float32 = 50
+	out := ApplyMouseMove([3]float32{0, start, 0}, 100, 0, 1, DefaultMouseYaw, DefaultMousePitch)
+	// 50 - 0.022*100 = 47.8; AngleMod's 360/65536 (~0.0055 deg)
+	// fixed-point quantisation lands the result at 47.79602. The
+	// tolerance covers that step plus float32 round-off.
+	const want float32 = 47.8
+	if !approxEq(out[mathlib.Yaw], want, 0.01) {
+		t.Errorf("yaw on dx=100 sens=1: got %v want %v (start=%v, m_yaw=0.022)",
+			out[mathlib.Yaw], want, start)
+	}
+}
+
+// TestApplyMouseMove_MYawConfigurable proves the m_yaw multiplier
+// is honoured: doubling it doubles the yaw delta for the same dx.
+func TestApplyMouseMove_MYawConfigurable(t *testing.T) {
+	const start float32 = 50
+	out := ApplyMouseMove([3]float32{0, start, 0}, 100, 0, 1, 0.044, DefaultMousePitch)
+	// dx=100, sens=1, mYaw=0.044 -> yaw -= 4.4 -> 45.6
+	const want float32 = 45.6
+	if !approxEq(out[mathlib.Yaw], want, 0.01) {
+		t.Errorf("yaw with mYaw=0.044: got %v want %v", out[mathlib.Yaw], want)
+	}
+}
+
+// TestApplyMouseMove_MPitchConfigurable proves the m_pitch
+// multiplier is honoured: setting it negative produces "inverted
+// look" (mouse-down looks UP), the upstream toggle.
+func TestApplyMouseMove_MPitchConfigurable(t *testing.T) {
+	out := ApplyMouseMove([3]float32{0, 0, 0}, 0, 10, 3, DefaultMouseYaw, -0.022)
+	// dy=+10, sens=3, mPitch=-0.022 -> pitch += -0.66 -> -0.66
+	const want float32 = -0.66
+	if !approxEq(out[mathlib.Pitch], want, 1e-4) {
+		t.Errorf("pitch with mPitch=-0.022 (inverted look): got %v want %v",
+			out[mathlib.Pitch], want)
+	}
+}
+
+// TestApplyMouseMove_MYawZeroDisablesYaw proves the upstream
+// "cvar zeroed -> axis disabled" behaviour: mYaw=0 must leave yaw
+// untouched regardless of dx.
+func TestApplyMouseMove_MYawZeroDisablesYaw(t *testing.T) {
+	const start float32 = 42
+	out := ApplyMouseMove([3]float32{0, start, 0}, 9999, 0, 5, 0, DefaultMousePitch)
+	// AngleMod wraps the unchanged value; 42 stays 42 (within
+	// AngleMod's ~0.0055-deg quantisation step).
+	if !approxEq(out[mathlib.Yaw], start, 0.01) {
+		t.Errorf("yaw moved with mYaw=0: got %v want ~%v", out[mathlib.Yaw], start)
+	}
+}
+
+// TestApplyMouseMove_YawWraps proves the [mathlib.AngleMod] wrap
+// fires on prolonged mouse-left drift: starting at yaw=1, a large
+// negative-effective dx (mouse-left, yaw INCREASES) crosses 360
+// and lands back near 0 instead of growing unboundedly.
+func TestApplyMouseMove_YawWraps(t *testing.T) {
+	// dx=-20000, sens=1: yaw += 0.022*20000 = +440 -> 441 (start=1).
+	// AngleMod(441) = 81 (440 - 360).
+	out := ApplyMouseMove([3]float32{0, 1, 0}, -20000, 0, 1, DefaultMouseYaw, DefaultMousePitch)
+	if out[mathlib.Yaw] < 0 || out[mathlib.Yaw] >= 360 {
+		t.Errorf("yaw not wrapped into [0,360): got %v", out[mathlib.Yaw])
+	}
+	// AngleMod uses the tyrquake fixed-point trick; allow a 1-step
+	// (360/65536 ~= 0.0055 deg) jitter against the naive want=81.
+	if !approxEq(out[mathlib.Yaw], 81, 0.05) {
+		t.Errorf("yaw wrap landing: got %v want ~81", out[mathlib.Yaw])
 	}
 }
 

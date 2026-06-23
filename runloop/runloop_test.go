@@ -882,3 +882,82 @@ func TestRunFrame_MovementButtonsFeedClcMove(t *testing.T) {
 		t.Fatalf("clc_move forwardmove = %d; want > 0 (KeyW should produce forward motion)", forwardMove)
 	}
 }
+
+// TestRunFrame_MouseDeltaFeedsViewAngles is the end-to-end proof that
+// a virtio-input mouse-rel delta (the value the per-tic
+// [backend.Backend.PollInput] snapshot carries in MouseDX / MouseDY)
+// flows through the full per-tic chain --
+//
+//	PollInput  -> snap.MouseDX / MouseDY
+//	         -> client.TickInput.MouseDX / MouseDY (Sensitivity=1)
+//	         -> client.Tick -> ApplyMouseMove
+//	         -> r.ViewAngles (pitch / yaw)
+//
+// -- and lands on r.ViewAngles with the canonical m_yaw / m_pitch =
+// 0.022 deg/px scaling. With Sensitivity=1, dx=100 must rotate yaw
+// by exactly 100 * 0.022 = 2.2 deg in the "decreases" direction
+// (Q1 sign convention; mouse-right turns view right because yaw
+// grows CCW), and dy=50 must rotate pitch by +50 * 0.022 = +1.1 deg
+// (non-inverted look; mouse-down looks down).
+//
+// Anchors the wiring contract that makes virtio-mouse drive the
+// in-game player view. Pre-fix the runloop's TickInput hardcoded
+// MouseDX/MouseDY to 0 and the snapshot delta was dropped on the
+// floor; this test guards against a regression of that drop.
+func TestRunFrame_MouseDeltaFeedsViewAngles(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	rec.Input = backend.InputSnapshot{
+		MouseDX: 100,
+		MouseDY: 50,
+	}
+	r, _ := newRunner(t, rec)
+	clientSide, _ := server.NewLoopbackConn()
+	r.Conn = clientSide
+	r.Client.Connection = client.StateConnected
+
+	// Seed a non-zero starting yaw so AngleMod's [0,360) wrap is a
+	// no-op for both the start and the post-tick value (start=50,
+	// expected end=47.8).
+	r.ViewAngles = [3]float32{0, 50, 0}
+
+	if err := r.RunFrame(1.0/60.0, 1.0); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+
+	// yaw: 50 - 0.022*100 = 47.8 (AdjustAngles' arrow-key path is a
+	// no-op with no Left/Right held, so this is purely the mouse
+	// contribution). Tolerance covers AngleMod's 360/65536
+	// (~0.0055 deg) fixed-point step on top of float32 round-off.
+	const wantYaw float32 = 47.8
+	gotYaw := r.ViewAngles[1]
+	if abs32(gotYaw-wantYaw) > 0.01 {
+		t.Errorf("ViewAngles[YAW]: got %v want %v (start=50, dx=100, m_yaw=0.022)",
+			gotYaw, wantYaw)
+	}
+
+	// pitch: 0 + 0.022*50 = +1.1 (mouse-down looks down). No AngleMod
+	// on pitch (clamp-only) so 1e-3 tolerance suffices.
+	const wantPitch float32 = 1.1
+	gotPitch := r.ViewAngles[0]
+	if abs32(gotPitch-wantPitch) > 1e-3 {
+		t.Errorf("ViewAngles[PITCH]: got %v want %v (start=0, dy=50, m_pitch=0.022)",
+			gotPitch, wantPitch)
+	}
+
+	// Roll is the rotational axis around the look direction; mouse
+	// must not touch it (Q1 has no mouse-driven roll).
+	if r.ViewAngles[2] != 0 {
+		t.Errorf("ViewAngles[ROLL]: got %v want 0 (mouse must not touch roll)",
+			r.ViewAngles[2])
+	}
+}
+
+// abs32 is the |x| helper for float32 (Go's math.Abs is float64).
+// Kept package-local to the runloop tests rather than promoted; the
+// numeric-tolerance check sites are all here.
+func abs32(x float32) float32 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
