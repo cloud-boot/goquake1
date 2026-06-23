@@ -1,0 +1,361 @@
+// Copyright (c) 1996-1997 Id Software, Inc.
+// Copyright (c) 2026 the go-quake1/engine authors.
+// SPDX-License-Identifier: BSD-3-Clause
+
+//go:build js && wasm
+
+// quake-wasmbox is the wasmbox-external-client entry point for the
+// Go-native Quake engine. It is a sibling of cmd/quake-wasm: same
+// engine wiring, same synthbsp fallback, same loopback host -- but the
+// presentation surface is a wasmbox-protocol SharedArrayBuffer + the
+// `{type:"commit"}` postMessage rather than a DOM canvas.
+//
+// The wasm runs inside a Web Worker. The wasmbox compositor (on the
+// main thread) owns the desktop canvas + stacking + focus + input
+// routing; our backend.Backend talks to it via the step-B wire protocol
+// documented at github.com/wasmdesk/wasmbox/docs/protocol.md.
+package main
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"time"
+
+	"github.com/go-quake1/engine/assets"
+	"github.com/go-quake1/engine/backend/wasmbox"
+	"github.com/go-quake1/engine/bspfile"
+	"github.com/go-quake1/engine/bspfile/synthbsp"
+	"github.com/go-quake1/engine/bsprender"
+	"github.com/go-quake1/engine/client"
+	"github.com/go-quake1/engine/embedpak"
+	"github.com/go-quake1/engine/model"
+	"github.com/go-quake1/engine/render"
+	"github.com/go-quake1/engine/runloop"
+	engineserver "github.com/go-quake1/engine/server"
+	"github.com/go-quake1/engine/vfs"
+)
+
+// fbWidth / fbHeight match the vanilla DOS Quake framebuffer so the
+// software rasterizer's per-pixel work stays affordable in a wasm
+// runtime. The wasmbox compositor blits the surface 1:1 to the
+// negotiated window (no scaling on commit; the user can resize the
+// desktop canvas if they want bigger pixels).
+const (
+	fbWidth  = 320
+	fbHeight = 240
+)
+
+// stubHost satisfies [runloop.HostFramer] for the first bring-up. The
+// real id-Software game-server tick lands in a follow-up batch; for now
+// the loop just processes input + paints the world walk.
+type stubHost struct{}
+
+func (stubHost) Frame(_ float32) error { return nil }
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Println("QUAKE: FAIL", err)
+		// Block on an empty channel so the JS-side wasm instance stays
+		// alive long enough for the console message to flush + so DOM
+		// event handlers retain their js.Func references.
+		<-make(chan struct{})
+		return
+	}
+	fmt.Println("QUAKE: exited cleanly")
+}
+
+// run is main's testability seam. It returns errors instead of halting
+// so the worker console carries the failure reason; main then blocks
+// on receipt.
+func run() error {
+	// 1. Handshake with the wasmbox compositor + build the backend.
+	//    NewClient allocates the SAB, posts hello, waits for welcome,
+	//    then installs the long-lived input listener + audio sink.
+	be, err := wasmbox.NewClient("quake (wasm)", fbWidth, fbHeight)
+	if err != nil {
+		return fmt.Errorf("wasmbox.NewClient: %w", err)
+	}
+	logf("backend up -- wasmbox surface=%dx%d", fbWidth, fbHeight)
+
+	// 2. Try the embedded pak. The placeholder ships empty (12 bytes)
+	//    so embedpak.OpenAsFS returns ErrEmbedPakEmpty -- we fall
+	//    through to the synthbsp + synthetic-asset path.
+	pakFS, pakErr := embedpak.OpenAsFS()
+	if pakErr != nil {
+		logf("embedpak.OpenAsFS: %v -- using synthetic assets + synthbsp", pakErr)
+	}
+
+	// 3. Build the asset VFS.
+	v := vfs.New()
+	v.Add(syntheticAssets())
+	if pakFS != nil {
+		v.Add(pakFS)
+	}
+
+	// 4. Loopback client/server pair.
+	cli, _ := engineserver.NewLoopbackConn()
+	clientState := client.NewState()
+
+	// 5. Runner via the standard SetupOpts path.
+	runner, err := runloop.NewRunnerFromVFS(runloop.SetupOpts{
+		VFS:            v,
+		Host:           stubHost{},
+		Client:         clientState,
+		Conn:           cli,
+		Backend:        be,
+		BackgroundIdx:  0x20,
+		NotifyLifetime: 3,
+		MaxNotifyRows:  4,
+	})
+	if err != nil {
+		return fmt.Errorf("NewRunnerFromVFS: %w", err)
+	}
+	runner.Console.Print("PURE-GO QUAKE 1 -- wasmbox bring-up\n")
+	runner.Console.Print("backend/wasmbox: SAB + protocol commits\n")
+	logf("runner up -- console seeded, entering RunUntilQuit")
+
+	// 6. Pre2DDraw walks a synthbsp scene so the surface paints actual
+	//    3D pixels.
+	if err := setupSynthRenderer(runner); err != nil {
+		logf("setupSynthRenderer skipped: %v -- 2D-only fallback", err)
+	}
+
+	return runner.RunUntilQuit()
+}
+
+// setupSynthRenderer wires a Pre2DDraw closure that paints the synthbsp
+// BuildWithFaces scene.
+func setupSynthRenderer(runner *runloop.Runner) error {
+	bspBytes, size, err := synthbsp.BuildWithFaces()
+	if err != nil {
+		return fmt.Errorf("synthbsp.BuildWithFaces: %w", err)
+	}
+	file, err := bspfile.Open(newReaderAt(bspBytes), size)
+	if err != nil {
+		return fmt.Errorf("bspfile.Open: %w", err)
+	}
+	bm, err := model.LoadBrush(file, 0)
+	if err != nil {
+		return fmt.Errorf("model.LoadBrush: %w", err)
+	}
+	faces, err := file.Faces()
+	if err != nil {
+		return fmt.Errorf("file.Faces: %w", err)
+	}
+
+	walkCtx := bsprender.NewWalkContext(bm)
+	allFaceIdx := make([]int, len(faces))
+	for i := range allFaceIdx {
+		allFaceIdx[i] = i
+	}
+	walkCtx.LeafFaces = func(id int) []int {
+		if walkCtx.NodeKind(id) == bsprender.NodeKindLeaf {
+			return allFaceIdx
+		}
+		return nil
+	}
+	walkCtx.NodeKind = func(id int) bsprender.NodeKind {
+		if id < walkCtx.NumNodes {
+			return bsprender.NodeKindInterior
+		}
+		leafIdx := id - walkCtx.NumNodes
+		if leafIdx < 0 || leafIdx >= bm.TotalLeaves() {
+			return bsprender.NodeKindEmpty
+		}
+		if bm.Leaf(leafIdx).Contents == bspfile.ContentsSolid {
+			return bsprender.NodeKindEmpty
+		}
+		return bsprender.NodeKindLeaf
+	}
+	const bigF = float32(1e6)
+	walkCtx.NodeBBox = func(id int) (mins, maxs [3]float32) {
+		return [3]float32{-bigF, -bigF, -bigF}, [3]float32{bigF, bigF, bigF}
+	}
+
+	checker := makeCheckerTex(16)
+	var cm render.ColorMap
+	for light := 0; light < render.ColorMapRows; light++ {
+		for src := 0; src < render.ColorMapCols; src++ {
+			cm[light][src] = byte(src)
+		}
+	}
+	camOrigin := [3]float32{5, 5, 20}
+	const fovX = 90.0
+
+	var surfaces bsprender.SurfaceList
+	frameCount := 0
+	runner.Pre2DDraw = func(fb *render.FrameBuffer, viewOrigin, viewAngles [3]float32) error {
+		frame := frameCount
+		frameCount++
+		viewAngles = [3]float32{0, float32(frame % 360), 0}
+		viewOrigin = camOrigin
+
+		for i := range fb.Pixels {
+			fb.Pixels[i] = 0x10
+		}
+
+		rd := &render.RefDef{
+			VRect:      render.VRect{Width: fb.Width, Height: fb.Height},
+			ViewAngles: viewAngles,
+			ViewOrigin: viewOrigin,
+			FovX:       fovX,
+			FovY:       fovX,
+		}
+		view := rd.SetupView()
+		frustum := rd.BuildFrustum()
+		stampFrame := int32(frame + 1)
+
+		for n := 0; n < bm.NumNodes(); n++ {
+			bm.SetNodeVisFrame(n, stampFrame)
+		}
+		for l := 0; l < bm.TotalLeaves(); l++ {
+			bm.Leaf(l).VisFrame = stampFrame
+		}
+
+		surfaces.Reset()
+		if err := bsprender.WalkWorld(walkCtx, 0, rd.ViewOrigin, frustum, stampFrame, &surfaces); err != nil {
+			return fmt.Errorf("WalkWorld: %w", err)
+		}
+		for i := 0; i < surfaces.Len(); i++ {
+			ref := surfaces.Refs[i]
+			fv, err := bsprender.NewBrushFaceVerts(bm, ref.FaceIdx)
+			if err != nil {
+				continue
+			}
+			verts, err := bsprender.TransformFace(view, fb, fovX, fv)
+			if err != nil {
+				continue
+			}
+			_ = render.FillTexturedPolygon(fb, checker, &cm, 0, verts)
+		}
+		return nil
+	}
+	return nil
+}
+
+func makeCheckerTex(n int) *render.Pic {
+	pixels := make([]byte, n*n)
+	for y := 0; y < n; y++ {
+		for x := 0; x < n; x++ {
+			tile := ((x / 4) + (y / 4)) & 3
+			var idx byte
+			switch tile {
+			case 0:
+				idx = 0
+			case 1:
+				idx = 15
+			case 2:
+				idx = 31
+			default:
+				idx = 47
+			}
+			pixels[y*n+x] = idx
+		}
+	}
+	return &render.Pic{Width: n, Height: n, Pixels: pixels}
+}
+
+func syntheticAssets() fs.FS {
+	return memFS{
+		"gfx/palette.lmp":  makePaletteLump(),
+		"gfx/colormap.lmp": makeColorMapLump(),
+		"gfx/conchars.lmp": makeConcharsLump(),
+	}
+}
+
+func makePaletteLump() []byte {
+	buf := make([]byte, render.PaletteLumpSize)
+	for i := 0; i < 256; i++ {
+		buf[i*3+0] = byte(i)
+		buf[i*3+1] = byte(i ^ 0xFF)
+		buf[i*3+2] = byte(i << 1)
+	}
+	return buf
+}
+
+func makeColorMapLump() []byte {
+	buf := make([]byte, render.ColorMapRows*render.ColorMapCols)
+	for i := range buf {
+		buf[i] = byte(i)
+	}
+	return buf
+}
+
+func makeConcharsLump() []byte {
+	buf := make([]byte, assets.ConCharsLumpSize)
+	for i := range buf {
+		buf[i] = 0
+	}
+	return buf
+}
+
+type memFS map[string][]byte
+
+func (m memFS) Open(name string) (fs.File, error) {
+	data, ok := m[name]
+	if !ok {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	}
+	return &memFile{name: name, data: data}, nil
+}
+
+type memFile struct {
+	name string
+	data []byte
+	pos  int
+}
+
+func (f *memFile) Read(p []byte) (int, error) {
+	if f.pos >= len(f.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.data[f.pos:])
+	f.pos += n
+	return n, nil
+}
+
+func (f *memFile) Stat() (fs.FileInfo, error) {
+	return &memFileInfo{name: f.name, size: int64(len(f.data))}, nil
+}
+
+func (f *memFile) Close() error { return nil }
+
+type memFileInfo struct {
+	name string
+	size int64
+}
+
+func (i *memFileInfo) Name() string       { return i.name }
+func (i *memFileInfo) Size() int64        { return i.size }
+func (i *memFileInfo) Mode() fs.FileMode  { return 0o444 }
+func (i *memFileInfo) ModTime() time.Time { return time.Time{} }
+func (i *memFileInfo) IsDir() bool        { return false }
+func (i *memFileInfo) Sys() any           { return nil }
+
+type readerAt struct {
+	data []byte
+	size int64
+}
+
+func newReaderAt(b []byte) *readerAt { return &readerAt{data: b, size: int64(len(b))} }
+
+func (r *readerAt) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 || off >= r.size {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// logf is fmt.Printf scoped to a QUAKE: prefix so worker-console output
+// stays grep-able.
+func logf(format string, args ...any) {
+	fmt.Printf("QUAKE: "+format+"\n", args...)
+}
+
+var _ = errors.New

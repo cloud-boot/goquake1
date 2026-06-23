@@ -87,6 +87,43 @@ jobs:
           done
           if [ "$fail" -ne 0 ]; then exit 1; fi
 
+  wasm-build:
+    name: build (js/wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+
+      - run: go version
+
+      - name: build backend/wasm (js/wasm)
+        env:
+          GOOS: js
+          GOARCH: wasm
+        run: go build ./backend/wasm/
+
+      - name: build backend/wasmbox (js/wasm)
+        env:
+          GOOS: js
+          GOARCH: wasm
+        run: go build ./backend/wasmbox/
+
+      - name: build cmd/quake-wasm (js/wasm)
+        env:
+          GOOS: js
+          GOARCH: wasm
+        run: go build -o /tmp/quake-wasm.wasm ./cmd/quake-wasm/
+
+      - name: build cmd/quake-wasmbox (js/wasm)
+        env:
+          GOOS: js
+          GOARCH: wasm
+        run: go build -o /tmp/quake-wasmbox.wasm ./cmd/quake-wasmbox/
+
   test-arm64:
     name: test (arm64, native)
     runs-on: ubuntu-24.04-arm
