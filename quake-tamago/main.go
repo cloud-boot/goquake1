@@ -85,6 +85,7 @@ import (
 	"github.com/go-quake1/engine/bspfile/synthbsp"
 	"github.com/go-quake1/engine/bsprender"
 	"github.com/go-quake1/engine/client"
+	"github.com/go-quake1/engine/demo"
 	"github.com/go-quake1/engine/embedpak"
 	enginehost "github.com/go-quake1/engine/host"
 	"github.com/go-quake1/engine/mathlib"
@@ -837,8 +838,68 @@ func run() error {
 	fmt.Printf("QUAKE: menu state=%s cursor=%d (boot lands on the main menu, world pass frozen until player picks Skill)\n",
 		runner.Menu.State, runner.Menu.CursorIndex)
 
+	// 12d. Wire the attract-loop demo. demo1.dem is the vanilla
+	//      cold-boot teaser ("you can't quit, you can only quit later"
+	//      narration tour through E1M1); when the pak ships it the
+	//      runloop plays it under the title menu + restarts on EOF so
+	//      the player sees motion behind the overlay. Any KeyDown
+	//      event halts the demo (vanilla "any key drops you out of the
+	//      attract loop"). With no pak (placeholder build) the demo
+	//      slot is left nil + the runloop falls back to the menu-only
+	//      title screen.
+	if pakFS != nil {
+		if d := loadAttractDemo(pakFS, "demo1.dem"); d != nil {
+			d.PlayerOpts = demo.PlayerOpts{
+				Protocol:       protocol.VersionNQ,
+				TickDelta:      1.0 / 20.0,
+				SkipUnknownSvc: true,
+			}
+			d.OnFrame = logDemoFrame
+			runner.Demo = d
+			fmt.Printf("QUAKE: attract-loop demo wired -- source=%q\n", "demo1.dem")
+		} else {
+			fmt.Printf("QUAKE: attract-loop demo skipped -- demo1.dem not in pak\n")
+		}
+	} else {
+		fmt.Printf("QUAKE: attract-loop demo skipped -- no pak available\n")
+	}
+
 	fmt.Printf("QUAKE: entering RunUntilQuit (realHost=%v)\n", realHost != nil)
 	return runner.RunUntilQuit()
+}
+
+// loadAttractDemo opens name inside pakFS + builds a [runloop.Demo]
+// with a Restart closure that re-opens the same entry on io.EOF (so
+// the attract loop runs forever in the background). Returns nil when
+// the entry is missing OR malformed -- the runloop's nil-Demo path
+// degrades gracefully to a static title screen.
+func loadAttractDemo(pakFS fs.FS, name string) *runloop.Demo {
+	open := func() (*demo.Reader, error) {
+		data, ok := tryReadPakFile(pakFS, name)
+		if !ok {
+			return nil, fmt.Errorf("attract demo %q not found in pak", name)
+		}
+		return demo.NewReader(bytes.NewReader(data))
+	}
+	rd, err := open()
+	if err != nil {
+		return nil
+	}
+	return &runloop.Demo{
+		Reader:  rd,
+		Restart: open,
+	}
+}
+
+// logDemoFrame is the [runloop.Demo.OnFrame] callback the embed wires
+// so the QEMU serial trace surfaces actual per-tic demo progression
+// without flooding the log (printed every 60 tics, ~once per second
+// at the 20-Hz default tic rate). Headless validation runs grep for
+// "QUAKE: demo playback frame" to prove the attract loop is alive.
+func logDemoFrame(frame int, angles [3]float32) {
+	if frame%60 == 0 {
+		fmt.Printf("QUAKE: demo playback frame %d viewAngles=%v\n", frame, angles)
+	}
 }
 
 // setupRenderer loads the BSP, builds the mark/walk contexts +

@@ -155,6 +155,19 @@ type Runner struct {
 	// MenuAssets is the WAD-pic bundle Menu.Draw paints with. nil
 	// falls back to the text-only path inside [menu.Menu.Draw].
 	MenuAssets *menu.Assets
+
+	// Demo is the optional attract-loop demo-playback state. When
+	// non-nil (and the menu is at the title screen) [Runner.RunFrame]
+	// substitutes a [demo.PlayTick] call for the live host.Frame so
+	// the recorded stream drives the client state per-tic. Any
+	// KeyDown event halts the demo (vanilla "any key drops you out
+	// of the attract loop"); on io.EOF the optional Restart closure
+	// re-opens the source for the next loop. See [Demo] for the
+	// full lifecycle.
+	//
+	// nil = no demo. The runner falls back to the normal host.Frame
+	// + client.Tick path verbatim.
+	Demo *Demo
 }
 
 // Sentinel errors returned by [Runner.RunFrame] before any work runs.
@@ -233,6 +246,15 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		return err
 	}
 
+	// 1a) Attract-loop demo interrupt. Any KeyDown event on the
+	//     incoming snapshot halts an in-flight demo playback (the
+	//     vanilla "any key drops you out of the attract loop"
+	//     behaviour). The check fires BEFORE the menu dispatch so
+	//     the same Esc that opens the menu also stops the demo on
+	//     the same tic; the menu_state machine then sees an empty
+	//     demo slot + behaves normally.
+	r.interruptDemoOnInput(snap)
+
 	// 1b) Menu state machine. When the menu is up, every KeyDown
 	//     event is routed into Menu.Handle and CONSUMED before the
 	//     movement / trigger mappers run, so a key the menu took
@@ -283,13 +305,33 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		r.Screen.AnimateConsole(target)
 	}
 
-	// 3) Advance server simulation. Skipped while the menu is up:
-	//    the C upstream sets cl.paused / sv.paused when the menu
-	//    is open; the Go port pauses by short-circuiting the host
-	//    tic entirely, which keeps sv.time + all per-tic QC
-	//    progressions frozen until the player dismisses the menu.
+	// 3) Advance server simulation. Skipped in two cases:
+	//
+	//    a) the menu is up (the C upstream sets cl.paused / sv.paused
+	//       when the menu is open; the Go port pauses by short-
+	//       circuiting the host tic entirely, which keeps sv.time +
+	//       all per-tic QC progressions frozen until the player
+	//       dismisses the menu);
+	//    b) a demo is playing (the attract-loop path: the demo body
+	//       IS the server's per-tic broadcast snapshot, so running
+	//       the live server on top would race against the recorded
+	//       stream + corrupt the playback).
+	//
+	//    The demo path swaps host.Frame for a [demo.PlayTick] call
+	//    that decodes one recorded tic into the client state +
+	//    advances r.ViewAngles to the recorded camera; on io.EOF the
+	//    optional Restart closure re-opens the stream for the next
+	//    loop (vanilla attract-loop behaviour). When BOTH menu and
+	//    demo are active (title screen + attract loop) the demo path
+	//    wins so the player still sees motion under the overlay.
 	menuActive := r.Menu != nil && r.Menu.Active()
-	if !menuActive {
+	demoActive := r.demoActive()
+	switch {
+	case demoActive:
+		if err := r.playDemoTick(); err != nil {
+			return err
+		}
+	case !menuActive:
 		if err := r.Host.Frame(dt); err != nil {
 			return err
 		}
@@ -354,10 +396,14 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 	//
 	//    ViewAngles is the (pitch, yaw, roll) the client tick has
 	//    just refreshed from mouse + arrow-key input.
-	//    SKIPPED while the menu is up: the world pass would only
-	//    add CPU cost the menu is going to overdraw anyway. The
-	//    menu's own Draw fires in step 5b below.
-	if !menuActive && r.Pre2DDraw != nil {
+	//    SKIPPED while the menu is up UNLESS a demo is playing
+	//    underneath (the attract-loop path: the recorded stream's
+	//    camera is visible behind the semi-opaque menu overlay, so
+	//    the world pass must run to give the overlay something to
+	//    sit on). With no demo + the menu up the world pass would
+	//    only add CPU cost the menu is going to overdraw anyway.
+	//    The menu's own Draw fires in step 5b below.
+	if (!menuActive || demoActive) && r.Pre2DDraw != nil {
 		viewOrigin := viewOriginFromState(r.Client)
 		if err := r.Pre2DDraw(r.FrameBuffer, viewOrigin, r.ViewAngles); err != nil {
 			return err
