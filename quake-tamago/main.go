@@ -196,6 +196,47 @@ type stubHost struct{}
 // + sv_main land.
 func (stubHost) Frame(_ float32) error { return nil }
 
+// changelevelHostFramer wraps an [enginehost.Host] so the per-tic
+// [runloop.Runner.RunFrame] step also polls
+// [enginehost.Host.ConsumeChangelevel] post-Frame. On a positive
+// poll the wrapper logs the requested map slug + drives the
+// SpawnServer re-entry into the new map.
+//
+// Without this wrapper the QC `changelevel` builtin would flip
+// [enginehost.Host.PendingChangelevel] = true but nobody would act
+// on it; the next per-tic Frame would just re-run the same map
+// indefinitely, so the player can never progress past
+// trigger_changelevel volumes.
+//
+// SpawnServer failures (corrupt BSP for the requested map, missing
+// pak entry, etc.) are logged + the player stays on the current
+// map (the previous Server.Active state is preserved by the
+// in-place SpawnServer call). The Frame error itself is not
+// surfaced -- a bad changelevel must not kill the runloop.
+type changelevelHostFramer struct {
+	host *enginehost.Host
+}
+
+// Frame runs one host tic, then polls + acts on any pending
+// changelevel request. The Frame error is surfaced verbatim; the
+// post-Frame SpawnServer error (if any) is logged but not returned
+// so a bad map name can't kill the loop.
+func (c *changelevelHostFramer) Frame(dt float32) error {
+	if err := c.host.Frame(dt); err != nil {
+		return err
+	}
+	if pending, mapSlug := c.host.ConsumeChangelevel(); pending {
+		fmt.Printf("QUAKE: level change requested -- nextmap=%q\n", mapSlug)
+		if err := c.host.SpawnServer(mapSlug, c.host.Server.Protocol); err != nil {
+			fmt.Printf("QUAKE: changelevel SpawnServer(%q) failed: %v -- staying on previous map\n",
+				mapSlug, err)
+		} else {
+			fmt.Printf("QUAKE: changelevel SpawnServer(%q) ok -- now on new map\n", mapSlug)
+		}
+	}
+	return nil
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Printf("QUAKE: FAIL %v\n", err)
@@ -499,9 +540,17 @@ func run() error {
 	// 9b. Pick the HostFramer the runner drives per-tic. When the real
 	//     host built successfully it goes straight in; otherwise the
 	//     stub keeps RunFrame's host.Frame call infallible.
+	//
+	//     The real host is wrapped in a [changelevelHostFramer] so the
+	//     post-Frame poll of [enginehost.Host.ConsumeChangelevel] fires
+	//     each tic; on a positive poll the wrapper logs the transition
+	//     + drives a fresh SpawnServer into the requested map slug.
+	//     Without the wrapper the QC `changelevel` builtin would flip
+	//     the flag but nobody would act on it, and the player would
+	//     stay parked on the previous map forever.
 	var hostFramer runloop.HostFramer = stubHost{}
 	if realHost != nil {
-		hostFramer = realHost
+		hostFramer = &changelevelHostFramer{host: realHost}
 	}
 
 	// 10. Construct the Runner via NewRunnerFromVFS. The runner now
@@ -1954,9 +2003,15 @@ func registerSpawnTimeBuiltins(vm *progs.VM, h *enginehost.Host) error {
 	// the builtin returns. Indices in between (68/69/70/71/73/75/...)
 	// get stubbed too so the next undefined-slot won't surface as the
 	// progs.dat exercises further functions on subsequent ticks.
-	for _, idx := range []int{68, 69, 70, 71, 72, 73, 75, 76, 77, 78, 79} {
+	for _, idx := range []int{68, 69, 71, 72, 73, 75, 76, 77, 78, 79} {
 		vm.RegisterBuiltin(idx, noop)
 	}
+	// changelevel(string mapname) -- builtin #70. The QC `trigger_changelevel`
+	// touch fires this when the player walks through the level-exit
+	// volume. Wired against the host's PendingChangelevel/NextMap
+	// fields so the embedder's main loop can poll the request +
+	// re-spawn into the new map. See [enginehost.BuiltinChangeLevel].
+	vm.RegisterBuiltin(enginehost.BuiltinChangeLevelIdx, enginehost.BuiltinChangeLevel(h))
 	// ambientsound(pos, samp, vol, atten) -- builtin #74. The C upstream
 	// PF_ambientsound (pr_cmds.c) calls SV_StartSound at the supplied
 	// world position with a static channel. Wired here against the

@@ -158,6 +158,30 @@ type Host struct {
 	// in arrival order. Same shape as LastThinkErrorMsgs.
 	LastTouchErrorMsgs []string
 
+	// PendingChangelevel is set by the QC `changelevel(mapname)` builtin
+	// (= [BuiltinChangeLevel]) and polled by the embedder's main loop
+	// to know "the QC asked us to re-spawn into NextMap". The host
+	// itself does NOT re-spawn -- it has no way to know the embedder's
+	// post-SpawnServer wiring (sound pool, sound loader, OnArenaReady
+	// hook). The embedder reads + clears the flag, then drives the
+	// re-spawn via Host.SpawnServer + whatever per-map state it needs
+	// to refresh. tyrquake: pr_global_struct->nextmap + the
+	// SV_SaveSpawnparms + Host_Reconnect_f path that re-enters the
+	// new map at the top of host_frame.
+	//
+	// Reset semantics: the host never clears this on its own. The
+	// embedder MUST clear it after acting; otherwise the next Frame()
+	// will see it still set and the level-reload print log emits
+	// every tic. Frame() itself ignores the flag (= no behavioural
+	// change inside the host); the embedder polls it post-Frame.
+	PendingChangelevel bool
+
+	// NextMap is the bare map-slug the most recent `changelevel` QC
+	// call requested (the embedder's main loop combines it with the
+	// "maps/<slug>.bsp" expansion that SpawnServer does internally).
+	// Stable while PendingChangelevel is true; undefined otherwise.
+	NextMap string
+
 	// soundPool is the mixer pool installed via [Host.SetSoundPool].
 	// nil = audio path silent-no-ops (the runloop owns its own pool;
 	// the host needs a reference so the QC-driven StartSound builtin

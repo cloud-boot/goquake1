@@ -48,7 +48,9 @@ type PhysicsKeyResolver func(index int) Key
 //	MoveTypeFlyMissile  -> PhysicsToss (same kinematics, different aim)
 //	MoveTypeStep        -> silent skip (PhysicsStep not yet implemented)
 //	MoveTypeWalk        -> silent skip (PhysicsWalk not yet implemented)
-//	MoveTypePush        -> silent skip (needs PushMove integration)
+//	MoveTypePush        -> PhysicsPusher (integrates velocity * dt +
+//	                                      RunThink; rider-clipping
+//	                                      deferred -- see docstring)
 //	MoveTypeAngleClip / MoveTypeAngleNoClip / unknown -> silent skip
 //
 // SPEC DEVIATION from the C upstream: the C version routes
@@ -198,6 +200,10 @@ func RunPhysics(
 			}
 		case server.MoveTypeWalk:
 			if _, err := PhysicsWalk(ent, ev, key, cmdAt(i), params, ctx); err != nil {
+				return err
+			}
+		case server.MoveTypePush:
+			if _, err := PhysicsPusher(ent, ev, key, ctx); err != nil {
 				return err
 			}
 		default:
