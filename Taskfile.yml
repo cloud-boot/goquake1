@@ -152,14 +152,11 @@ tasks:
       - docker rm -f oci-registry 2>/dev/null || true
 
   oci-push:
-    desc: Push the packed image layout at {{.OCI_OUT}} to {{.OCI_REGISTRY}}/{{.OCI_TAG}} via `oras` (oras must be in PATH; `brew install oras` if missing).
+    desc: Push the packed image layout at {{.OCI_OUT}} to {{.OCI_REGISTRY}}/{{.OCI_TAG}} via the bundled pure-Go pusher (no external CLI).
+    env:
+      GOWORK: "off"
     cmds:
-      - |
-        if ! command -v oras >/dev/null 2>&1; then
-          echo "oras not found; install with: brew install oras" >&2
-          exit 1
-        fi
-      - 'oras push "{{.OCI_REGISTRY}}/{{.OCI_TAG}}" --manifest-file "{{.OCI_OUT}}/manifest.json"'
+      - '"{{.GO}}" run ./cmd/oci-push-quake/ -in "{{.OCI_OUT}}" -ref "{{.OCI_REGISTRY}}/{{.OCI_TAG}}"'
 
   demo-wasmbox-oci:
     desc: One-shot OCI demo -- pack pak+music, spin up local registry, push, build OCI client, start wasmbox. Requires Docker + oras CLI.

@@ -12,15 +12,20 @@ import (
 // Media types used by this package. We keep them grouped in one place
 // so the CLI packer + the runtime client agree on the wire vocabulary.
 const (
-	// MediaTypeManifest is what we set on the manifest body itself.
-	// The Quake-specific suffix lets registries / browser dev-tools
-	// differentiate a quake-assets manifest from a generic OCI image
-	// manifest even though the schema is OCI v1-compatible.
-	MediaTypeManifest = "application/vnd.go-quake1.assets.v1+json"
+	// MediaTypeManifest is the standard OCI image-manifest media type.
+	// distribution:2 validates this against an internal allowlist and
+	// rejects manifests whose mediaType it doesn't recognise (custom
+	// "application/vnd.go-quake1.assets.v1+json" was returned as
+	// MANIFEST_INVALID). The Quake-specific identity is now carried
+	// in the manifest's annotations + the config blob's mediaType,
+	// both of which the registry passes through verbatim.
+	MediaTypeManifest = "application/vnd.oci.image.manifest.v1+json"
 
 	// MediaTypeConfig is the descriptor.mediaType for the config blob
 	// (a tiny JSON object that records architecture-independent
-	// metadata; we mostly carry "created" + a "files" sidecar).
+	// metadata; we mostly carry "created" + a "files" sidecar). The
+	// vendor-specific suffix is fine here -- config mediaTypes are
+	// free-form per the OCI image-spec.
 	MediaTypeConfig = "application/vnd.go-quake1.config.v1+json"
 
 	// MediaTypeLayerPak is the descriptor.mediaType for the pak0

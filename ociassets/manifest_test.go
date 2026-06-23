@@ -12,7 +12,7 @@ import (
 func TestDecodeManifest_Ok(t *testing.T) {
 	body := []byte(`{
 	"schemaVersion": 2,
-	"mediaType": "application/vnd.go-quake1.assets.v1+json",
+	"mediaType": "application/vnd.oci.image.manifest.v1+json",
 	"config": {"mediaType": "application/vnd.go-quake1.config.v1+json", "digest": "sha256:abc", "size": 5},
 	"layers": [
 		{"mediaType": "application/vnd.go-quake1.pak.v1", "digest": "sha256:def", "size": 10}
