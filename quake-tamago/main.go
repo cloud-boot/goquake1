@@ -1184,6 +1184,19 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			for _, msg := range realHost.LastThinkErrorMsgs {
 				fmt.Printf("QUAKE: think error -- %s\n", msg)
 			}
+			// Touch-trigger walk counters: per-tic count of QC
+			// .touch dispatches the post-RunPhysics SV_TouchLinks-
+			// equivalent walk fired, plus any per-dispatch error
+			// the walker swallowed. A non-zero "touches" count the
+			// moment the demo orbit grazes an item proves item
+			// pickup is wired end-to-end (item_*_touch invoked ->
+			// QC writes self.ammo_*/.health on the player + calls
+			// setorigin(-8000) to remove the item).
+			fmt.Printf("QUAKE: touches tic %d -- %d dispatched, %d errored\n",
+				frame, realHost.LastTriggerTouches, realHost.LastTouchErrors)
+			for _, msg := range realHost.LastTouchErrorMsgs {
+				fmt.Printf("QUAKE: touch error -- %s\n", msg)
+			}
 			if p := realHost.Progs(); p != nil {
 				base := realHost.Static.MaxClients + 1
 				scheduled := 0
@@ -1892,7 +1905,7 @@ func registerSpawnTimeBuiltins(vm *progs.VM, h *enginehost.Host) error {
 	// v_up. Overwriting it with a no-op here would silently break
 	// W_FireShotgun's aim basis -- every traceline (src, src +
 	// v_forward * 2048, ...) would collapse to a zero-length ray.
-	vm.RegisterBuiltin(progs.BuiltinSetOrigin, noop)
+	vm.RegisterBuiltin(progs.BuiltinSetOrigin, builtinSetOrigin(h))
 	vm.RegisterBuiltin(progs.BuiltinSetModel, builtinSetModel(h))
 	vm.RegisterBuiltin(progs.BuiltinSetSize, noop)
 	vm.RegisterBuiltin(progs.BuiltinBreak, noop)
@@ -2583,6 +2596,54 @@ func builtinFindRadius(h *enginehost.Host) progs.Builtin {
 			headPtr = arena.MakePointer(headSlot, 0)
 		}
 		return vm.SetGlobalInt(progs.OfsReturn, headPtr)
+	}
+}
+
+// builtinSetOrigin returns a Builtin closure that implements the
+// QuakeC setorigin(entity, vector) built-in (tyrquake's PF_setorigin
+// at builtin slot 2). Reads the entity-pointer from OFS_PARM0 + the
+// vector from OFS_PARM1, writes the new origin onto the edict's
+// entvars, then re-links the area-tree entry so any subsequent
+// AreaQuery sees the new bounds.
+//
+// Why a real impl instead of the historical no-op: the item-pickup
+// chain depends on it. The QuakeC items.qc body of every
+// item_*_touch handler ends with
+//
+//	setmodel(self, "");
+//	setorigin(self, '-8000 -8000 -8000');
+//
+// Without re-linking on setorigin, the trigger's area-tree entry
+// stays at its pickup position and the player's next-tic
+// TouchTriggers walk re-fires the same item (= infinite ammo loop
+// + spammed pickup sound).
+//
+// Tolerated no-ops (one-line warning + return nil; same crash-safety
+// contract as the other host-bound builtins):
+//
+//   - h or h.Server nil                  -> no-op
+//   - VM arena unwired                   -> no-op
+//   - entity-pointer doesn't resolve     -> warn + return nil
+//   - host.SetOrigin handles entvars /
+//     area-tree absent cases silently    -> no extra branching here.
+func builtinSetOrigin(h *enginehost.Host) progs.Builtin {
+	return func(vm *progs.VM) error {
+		if h == nil || h.Server == nil {
+			return nil
+		}
+		arena := vm.Arena()
+		if arena == nil {
+			return nil
+		}
+		entPtr, _ := vm.GlobalInt(progs.OfsParm0)
+		origin, _ := vm.GlobalVector(progs.OfsParm1)
+		ent, _, err := arena.ResolvePointer(entPtr)
+		if err != nil {
+			fmt.Printf("QUAKE: setorigin(ptr=%d, %v): ResolvePointer: %v\n", entPtr, origin, err)
+			return nil
+		}
+		h.SetOrigin(ent, origin)
+		return nil
 	}
 }
 

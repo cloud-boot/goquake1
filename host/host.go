@@ -138,6 +138,26 @@ type Host struct {
 	// spawn time" from "per-tic gameplay sound triggers".
 	LastAmbientsStarted int
 
+	// LastTriggerTouches is the count of QC `.touch` functions the
+	// most recent [Host.Frame] call dispatched via [Host.TouchTriggers]
+	// (the SV_TouchLinks-equivalent walk that runs once per client
+	// edict after RunPhysics). Reset to zero at the top of every Frame.
+	// Exposed for bring-up instrumentation -- a non-zero value the
+	// moment the demo camera grazes an item proves the QC `.touch`
+	// dispatch chain (= item pickup) is wired end-to-end.
+	LastTriggerTouches int
+
+	// LastTouchErrors is the count of touch dispatches the most recent
+	// [Host.Frame] call's TouchTriggers walk swallowed (logged +
+	// continued rather than aborting the frame). A trigger whose QC
+	// touch function calls an unstubbed builtin surfaces here.
+	LastTouchErrors int
+
+	// LastTouchErrorMsgs accumulates the first 8 unique error strings
+	// the most recent [Host.Frame] call's TouchTriggers walk swallowed,
+	// in arrival order. Same shape as LastThinkErrorMsgs.
+	LastTouchErrorMsgs []string
+
 	// soundPool is the mixer pool installed via [Host.SetSoundPool].
 	// nil = audio path silent-no-ops (the runloop owns its own pool;
 	// the host needs a reference so the QC-driven StartSound builtin
@@ -526,6 +546,35 @@ func (h *Host) Frame(dt float32) error {
 		h.findProgs(),
 	); err != nil {
 		return err
+	}
+
+	// SV_TouchLinks-equivalent: per-client per-tic walk the area
+	// tree for SOLID_TRIGGER edicts whose absbounds overlap the
+	// player edict, dispatching each trigger's QC `.touch` function
+	// with self=trigger, other=player. This is the half of the
+	// upstream SV_Physics_Client that delivers item pickup (the
+	// item_*_touch QC functions write self.ammo_* / self.health onto
+	// the player, then setmodel("") + setorigin(item, -8000) to
+	// remove the item).
+	//
+	// Runs AFTER RunPhysics so the player edict's post-walk position
+	// is what the trigger query sees (matches the upstream's
+	// SV_LinkEdict (which calls SV_TouchLinks internally) firing
+	// per per-MOVETYPE handler at the end of its move integration).
+	//
+	// Walks only client slots [1, MaxClients]: NPCs / monsters /
+	// movers don't fire trigger touches in vanilla Quake -- only
+	// the player does (the upstream wires SV_LinkEdict's
+	// SV_TouchLinks call for every MOVETYPE_WALK move, and only
+	// clients use MOVETYPE_WALK). The Go port preserves the same
+	// shape by iterating client slots directly.
+	h.ResetTouchCounters()
+	for slot := 1; slot <= h.Static.MaxClients && slot < len(h.Server.Edicts); slot++ {
+		c := h.Static.Clients[slot-1]
+		if c == nil || !c.Active || c.Edict == nil {
+			continue
+		}
+		h.TouchTriggers(slot, hostKeyAt(slot))
 	}
 
 	// Per-client svc_clientdata compose+encode. Runs BEFORE
