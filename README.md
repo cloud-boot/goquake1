@@ -124,6 +124,47 @@ chains both. The single-step build is large (~180 MB; the Go runtime
 ships the full stdlib in wasm builds); first-load is a one-shot
 cache.
 
+## Streaming assets from an OCI registry
+
+The default wasm build embeds `embedpak/empty.pak` + the music
+tracks, so the binary balloons to ~180 MB the moment a real
+shareware pak is dropped in. For browser distribution that's
+wasteful — every page load re-fetches the whole thing. Build
+with `-tags no_embed_assets` instead and the wasm payload stays
+~11 MB; the pak + music tracks ship as individual layers in an
+OCI Distribution v2 registry (any registry that speaks the
+[OCI spec][oci-spec]: Distribution v2, ghcr.io, harbor,
+self-hosted, …) and the wasm fetches them on demand the first
+time a file is `Open`'d, with an IndexedDB write-through cache so
+reloads in the same browser skip the network round-trip.
+
+[oci-spec]: https://github.com/opencontainers/distribution-spec
+
+```sh
+# 1. Pack the local pak + music into an OCI image-layout dir.
+go run ./cmd/oci-pack-quake --out _oci --ref quake-assets:latest
+
+# 2. Push the layout to any registry. oras [1] is the easy path:
+oras push localhost:5000/quake-assets:latest \
+  --manifest-config /dev/null:application/vnd.go-quake1.config.v1+json \
+  $(find _oci/blobs/sha256 -type f)
+
+# 3. Build the slim wasm with the registry URL baked in. The
+#    -X main.OCIReference linker flag is what tells the binary
+#    which registry to hit at boot.
+OCI_REFERENCE=http://localhost:5000/quake-assets:latest task build-wasm-oci
+
+# 4. Serve the wasm + open in a browser.
+task serve-wasm
+```
+
+[1]: https://oras.land
+
+The runtime falls back to the embedded pak (and from there to the
+synthetic-asset bootstrap) on any OCI failure, so an unreachable
+registry never aborts the boot — it just degrades to the local
+default. See `engine/ociassets/` for the package + tests.
+
 ## Provable test protocol (inherited)
 
 Every Quake phase inherits the four-gate protocol shipped with DOOM

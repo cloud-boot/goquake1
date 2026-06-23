@@ -14,9 +14,10 @@
 // Layout: track02.ogg through track11.ogg, mirroring vanilla Quake's
 // CDA track numbering (track 1 is the data track on the original CD;
 // music starts at track 2).
+//
+// Build with -tags no_embed_assets to strip the embed directive
+// (the wasm OCI-streaming build does that, since shipping ~84 MB of
+// music in the payload defeats the purpose of streaming). The
+// exported MusicFS keeps the same type either way -- callers see an
+// empty embed.FS instead of the embedded tracks.
 package embedmusic
-
-import "embed"
-
-//go:embed track02.ogg track03.ogg track04.ogg track05.ogg track06.ogg track07.ogg track08.ogg track09.ogg track10.ogg track11.ogg
-var MusicFS embed.FS

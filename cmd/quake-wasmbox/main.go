@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -31,11 +32,18 @@ import (
 	"github.com/go-quake1/engine/client"
 	"github.com/go-quake1/engine/embedpak"
 	"github.com/go-quake1/engine/model"
+	"github.com/go-quake1/engine/ociassets"
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/runloop"
 	engineserver "github.com/go-quake1/engine/server"
 	"github.com/go-quake1/engine/vfs"
 )
+
+// OCIReference is the wasmbox-build twin of cmd/quake-wasm's
+// OCIReference. Same plumbing: set at link time to stream pak +
+// music from an OCI registry instead of relying on the embedded
+// placeholders.
+var OCIReference = ""
 
 // fbWidth / fbHeight match the vanilla DOS Quake framebuffer so the
 // software rasterizer's per-pixel work stays affordable in a wasm
@@ -79,15 +87,32 @@ func run() error {
 	}
 	logf("backend up -- wasmbox surface=%dx%d", fbWidth, fbHeight)
 
-	// 2. Try the embedded pak. The placeholder ships empty (12 bytes)
-	//    so embedpak.OpenAsFS returns ErrEmbedPakEmpty -- we fall
-	//    through to the synthbsp + synthetic-asset path.
-	pakFS, pakErr := embedpak.OpenAsFS()
-	if pakErr != nil {
-		logf("embedpak.OpenAsFS: %v -- using synthetic assets + synthbsp", pakErr)
+	// 2. OCI streaming first (when -ldflags '-X main.OCIReference=...'
+	//    has been set at build time). See cmd/quake-wasm/main.go for
+	//    the rationale -- same fall-through semantics here.
+	var pakFS fs.FS
+	if OCIReference != "" {
+		fsys, err := openOCIAssets(OCIReference)
+		if err != nil {
+			logf("ociassets: %v -- falling back to embedpak", err)
+		} else {
+			pakFS = fsys
+			logf("ociassets: streaming pak + music from %s", OCIReference)
+		}
 	}
 
-	// 3. Build the asset VFS.
+	// 3. Embedded pak fallback (placeholder = 12 bytes -> error
+	//    -> drop through to the synthetic-asset path).
+	if pakFS == nil {
+		fsys, pakErr := embedpak.OpenAsFS()
+		if pakErr != nil {
+			logf("embedpak.OpenAsFS: %v -- using synthetic assets + synthbsp", pakErr)
+		} else {
+			pakFS = fsys
+		}
+	}
+
+	// 4. Build the asset VFS.
 	v := vfs.New()
 	v.Add(syntheticAssets())
 	if pakFS != nil {
@@ -356,6 +381,18 @@ func (r *readerAt) ReadAt(p []byte, off int64) (int, error) {
 // stays grep-able.
 func logf(format string, args ...any) {
 	fmt.Printf("QUAKE: "+format+"\n", args...)
+}
+
+// openOCIAssets mirrors cmd/quake-wasm/main.go's helper: parse the
+// linker-baked reference, build the client, fetch the manifest, return
+// an fs.FS that streams the layers on demand.
+func openOCIAssets(reference string) (fs.FS, error) {
+	ref, err := ociassets.ParseReference(reference)
+	if err != nil {
+		return nil, fmt.Errorf("parse %q: %w", reference, err)
+	}
+	client := ociassets.NewClient(ref.Origin)
+	return ociassets.NewFSFromManifest(context.Background(), client, ref.Repo, ref.Tag)
 }
 
 var _ = errors.New

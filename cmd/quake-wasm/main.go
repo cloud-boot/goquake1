@@ -28,6 +28,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -43,11 +44,22 @@ import (
 	"github.com/go-quake1/engine/client"
 	"github.com/go-quake1/engine/embedpak"
 	"github.com/go-quake1/engine/model"
+	"github.com/go-quake1/engine/ociassets"
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/runloop"
 	engineserver "github.com/go-quake1/engine/server"
 	"github.com/go-quake1/engine/vfs"
 )
+
+// OCIReference, when non-empty, points the wasm payload at an OCI
+// Distribution v2 endpoint to fetch pak0.pak + the music tracks on
+// demand instead of embedding them. Set at link time:
+//
+//	go build -ldflags "-X main.OCIReference=http://localhost:8080/v2-mock/quake-assets:latest" ./cmd/quake-wasm
+//
+// The empty default keeps the existing embed path live so unflagged
+// builds keep working.
+var OCIReference = ""
 
 // fbWidth / fbHeight match the vanilla DOS Quake framebuffer so the
 // software rasterizer's per-pixel work stays affordable in a wasm
@@ -96,17 +108,39 @@ func run() error {
 	}
 	logf("backend up -- canvas=#quake size=%dx%d", fbWidth, fbHeight)
 
-	// 2. Try the embedded pak. The placeholder ships empty (12 bytes)
-	//    so embedpak.OpenAsFS returns ErrEmbedPakEmpty -- we fall
-	//    through to the synthbsp + synthetic-asset path. The hook is
-	//    kept here so a future build that embeds real pak0 picks it
-	//    up with no code change.
-	pakFS, pakErr := embedpak.OpenAsFS()
-	if pakErr != nil {
-		logf("embedpak.OpenAsFS: %v -- using synthetic assets + synthbsp", pakErr)
+	// 2. Try the OCI registry FIRST when an OCIReference has been
+	//    baked in via -ldflags. Streaming the pak + music tracks on
+	//    demand keeps the wasm payload tiny (~10 MB) -- the alternative
+	//    is embedding 264 MB of game data into the binary. On any
+	//    failure (no reference set, registry unreachable, manifest
+	//    parse error) we silently fall back to the embedpak path.
+	var pakFS fs.FS
+	if OCIReference != "" {
+		fsys, err := openOCIAssets(OCIReference)
+		if err != nil {
+			logf("ociassets: %v -- falling back to embedpak", err)
+		} else {
+			pakFS = fsys
+			logf("ociassets: streaming pak + music from %s", OCIReference)
+		}
 	}
 
-	// 3. Build the asset VFS: synthetic fallback first, real pak last
+	// 3. Embedded pak fallback. The placeholder ships empty (12 bytes)
+	//    so embedpak.OpenAsFS returns ErrEmbedPakEmpty when no real
+	//    assets are baked in -- we then fall through to the synthbsp +
+	//    synthetic-asset path. The hook is kept here so a build that
+	//    drops a real pak0 in embedpak/empty.pak picks it up with no
+	//    code change.
+	if pakFS == nil {
+		fsys, pakErr := embedpak.OpenAsFS()
+		if pakErr != nil {
+			logf("embedpak.OpenAsFS: %v -- using synthetic assets + synthbsp", pakErr)
+		} else {
+			pakFS = fsys
+		}
+	}
+
+	// 4. Build the asset VFS: synthetic fallback first, real pak last
 	//    (vfs.Add prepends, so the LAST Add wins).
 	v := vfs.New()
 	v.Add(syntheticAssets())
@@ -407,6 +441,20 @@ func (r *readerAt) ReadAt(p []byte, off int64) (int, error) {
 // output stays grep-able against the tamago serial log format.
 func logf(format string, args ...any) {
 	fmt.Printf("QUAKE: "+format+"\n", args...)
+}
+
+// openOCIAssets parses the linker-injected reference, builds an OCI
+// client over it, fetches the manifest, and returns an fs.FS that
+// streams the layers on demand. The error wrapper carries enough
+// context for the browser console to point a developer at the
+// failing reference.
+func openOCIAssets(reference string) (fs.FS, error) {
+	ref, err := ociassets.ParseReference(reference)
+	if err != nil {
+		return nil, fmt.Errorf("parse %q: %w", reference, err)
+	}
+	client := ociassets.NewClient(ref.Origin)
+	return ociassets.NewFSFromManifest(context.Background(), client, ref.Repo, ref.Tag)
 }
 
 // errLog forces compile-time use of errors (kept for fast future
