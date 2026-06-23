@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/go-quake1/engine/assets"
+	"github.com/go-quake1/engine/backend"
 	"github.com/go-quake1/engine/backend/wasm"
 	"github.com/go-quake1/engine/bspfile"
 	"github.com/go-quake1/engine/bspfile/synthbsp"
@@ -188,7 +189,88 @@ func run() error {
 		status.Set("textContent", fmt.Sprintf("running -- %dx%d canvas, loopback host", fbWidth, fbHeight))
 	}
 
-	return runner.RunUntilQuit()
+	// 8. Drive the per-tic loop ourselves so the JS event loop has a
+	//    chance to deliver paint / input ticks between frames. Calling
+	//    runner.RunUntilQuit on the main thread would park us in a
+	//    blocking `for {}` whose only JS interaction (js.CopyBytesToJS
+	//    in PresentFrame) does NOT yield back to the browser scheduler
+	//    -- the page would stay locked on the wasm goroutine forever
+	//    and the canvas would never repaint. Sleeping zero seconds per
+	//    tic parks the Go runtime via a timer goroutine, which the Go
+	//    wasm scheduler implements as setTimeout(0); that releases the
+	//    JS thread long enough to drain rAF + flush ImageData puts.
+	//
+	//    The shape mirrors runloop.RunUntilQuit's body verbatim (we
+	//    can't reuse it as a library because that helper hard-codes
+	//    the blocking loop) -- minus the explicit dt clamp, which the
+	//    runner's MinFrameTime fallback handles inside RunFrame.
+	return runUntilQuitYielding(runner)
+}
+
+// runUntilQuitYielding is the GOOS=js cmd-side equivalent of
+// runloop.RunUntilQuit: drives one RunFrame per iteration, plus a
+// time.Sleep(0) per tic so the Go scheduler hands the JS event loop
+// back to the browser between frames. Without the yield the browser
+// never repaints + never delivers input + Playwright's getImageData
+// returns the unflushed initial canvas state (alpha 0), even though
+// PresentFrame is running every tic on the wasm side.
+//
+// Quit-detection mirrors RunUntilQuit's quitObserver wrapper: we read
+// the QuitRequested flag off the per-tic snapshot the runner's
+// Backend.PollInput returned. The runner re-uses the same Backend so
+// the observer hook is the cheapest way to spot the exit signal
+// without changing the runloop's contract.
+func runUntilQuitYielding(r *runloop.Runner) error {
+	original := r.Backend
+	defer func() { r.Backend = original }()
+	obs := &quitObserver{Backend: original}
+	r.Backend = obs
+
+	lastNow := original.Now()
+	dt := runloop.MinFrameTime
+	for {
+		nowSec := original.Now()
+		if err := r.RunFrame(dt, float32(nowSec)); err != nil {
+			return err
+		}
+		if obs.quitRequested {
+			return nil
+		}
+		nextDt := float32(nowSec - lastNow)
+		if nextDt < runloop.MinFrameTime {
+			nextDt = runloop.MinFrameTime
+		}
+		lastNow = nowSec
+		dt = nextDt
+		// Cooperative yield: parks the goroutine on a Go-managed timer,
+		// which the wasm runtime backs with setTimeout(0) -- that's the
+		// hook the JS event loop needs to drain rAF + ImageData paints.
+		// MUST be > 0 -- time.Sleep early-returns for any duration <= 0
+		// without parking the goroutine, so a zero-Sleep would NOT yield
+		// + the page would stay locked exactly like the unmodified
+		// runloop.RunUntilQuit. 1 ms is short enough that frame rate
+		// stays at the browser-rAF cap (~60 Hz) yet long enough to
+		// trigger the actual gopark + setTimeout(0) round-trip.
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// quitObserver wraps a backend so we can observe QuitRequested
+// snapshots as they flow past PollInput -- runloop.RunUntilQuit does
+// the same dance internally but its wrapper type is unexported so we
+// repeat it here. Everything else passes through verbatim via the
+// embedded backend.Backend interface.
+type quitObserver struct {
+	backend.Backend
+	quitRequested bool
+}
+
+func (q *quitObserver) PollInput() (backend.InputSnapshot, error) {
+	snap, err := q.Backend.PollInput()
+	if snap.QuitRequested {
+		q.quitRequested = true
+	}
+	return snap, err
 }
 
 // setupSynthRenderer wires a Pre2DDraw closure that paints the
@@ -250,19 +332,40 @@ func setupSynthRenderer(runner *runloop.Runner) error {
 			cm[light][src] = byte(src)
 		}
 	}
+	// Camera anchored 20 units above the synth-bsp floor (which lives
+	// at Z=0 spanning [0,10] x [0,10]); pitch=80 looks down at the
+	// floor with a steep enough angle that yaw rotation is visible
+	// (gimbal-safe stand-off from straight-down 90 degrees). At
+	// fovX=90 the 10-unit-wide floor occupies the central ~25% of the
+	// 320x240 canvas; the remaining pixels show the clear-color sky
+	// fill below, so the painted frame is guaranteed to carry a mix
+	// of distinct palette indices (checker fg + clear bg) instead of
+	// the uniform clear color we had before. The original pitch=0
+	// horizon shot pointed the camera through the side of the floor
+	// + missed every face entirely; that produced the all-clear-color
+	// canvas the L2/L3 bring-up reports flagged.
 	camOrigin := [3]float32{5, 5, 20}
-	const fovX = 90.0
+	const (
+		fovX     = 90.0
+		camPitch = 80.0
+	)
 
 	var surfaces bsprender.SurfaceList
 	frameCount := 0
 	runner.Pre2DDraw = func(fb *render.FrameBuffer, viewOrigin, viewAngles [3]float32) error {
 		frame := frameCount
 		frameCount++
-		// Slow yaw spin so the canvas shows visible motion.
-		viewAngles = [3]float32{0, float32(frame % 360), 0}
+		// Slow yaw spin so the canvas shows visible motion; pitch is
+		// fixed so we keep looking down at the floor regardless of
+		// the per-tic viewAngles state the runloop hands us (the stub
+		// host can't drive a real player edict that would refresh
+		// these for us).
+		viewAngles = [3]float32{camPitch, float32(frame % 360), 0}
 		viewOrigin = camOrigin
 
-		// Clear to background palette index 0x10 (sky-like).
+		// Clear to background palette index 0x10 (sky-like). Compose2D
+		// downstream sees Runner.Pre2DDraw != nil and sets
+		// SkipBackgroundFill so this clear survives into PresentFrame.
 		for i := range fb.Pixels {
 			fb.Pixels[i] = 0x10
 		}
@@ -343,10 +446,68 @@ func syntheticAssets() fs.FS {
 
 func makePaletteLump() []byte {
 	buf := make([]byte, render.PaletteLumpSize)
+	// Sweep an HSV-ish rainbow across the 256 palette slots so the
+	// rendered scene paints in visually distinct colours -- the
+	// previous (i, i^0xFF, i<<1) ramp collapsed every checker tile +
+	// the clear fill into near-identical greens, which the Playwright
+	// verification could not tell apart. The new layout dedicates
+	// idx 0x10 (sky fill) to a neutral mid-blue and idx 0x00 / 0x0F /
+	// 0x1F / 0x2F (the checker face tiles, see makeCheckerTex) to
+	// four well-separated hues so the rasterized triangle stands out
+	// against the cleared background in headless screenshots AND
+	// to a human eyeballing the canvas.
 	for i := 0; i < 256; i++ {
-		buf[i*3+0] = byte(i)
-		buf[i*3+1] = byte(i ^ 0xFF)
-		buf[i*3+2] = byte(i << 1)
+		// 6-channel rainbow with a deterministic light-dark zigzag so
+		// neighbouring palette entries aren't visually identical.
+		base := byte(i)
+		switch i % 6 {
+		case 0:
+			buf[i*3+0] = base    // R-dominant
+			buf[i*3+1] = base / 4
+			buf[i*3+2] = base / 4
+		case 1:
+			buf[i*3+0] = base
+			buf[i*3+1] = base
+			buf[i*3+2] = base / 4
+		case 2:
+			buf[i*3+0] = base / 4
+			buf[i*3+1] = base
+			buf[i*3+2] = base / 4
+		case 3:
+			buf[i*3+0] = base / 4
+			buf[i*3+1] = base
+			buf[i*3+2] = base
+		case 4:
+			buf[i*3+0] = base / 4
+			buf[i*3+1] = base / 4
+			buf[i*3+2] = base
+		case 5:
+			buf[i*3+0] = base
+			buf[i*3+1] = base / 4
+			buf[i*3+2] = base
+		}
+	}
+	// Idx 0x10 is the Pre2DDraw clear (sky) -- pin it to a neutral
+	// mid-blue so it never collides with a face tile colour.
+	buf[0x10*3+0] = 48
+	buf[0x10*3+1] = 96
+	buf[0x10*3+2] = 176
+	// Pin the four checker-face tile indices (see makeCheckerTex)
+	// to bright, well-separated colours so the rendered face stands
+	// out against the sky. Without these pins the rainbow ramp lands
+	// the small indices (0/15/31/47) in the dark/black end of the
+	// spectrum + the rasterized triangle reads as black even though
+	// the rasterizer is doing its job.
+	for k, rgb := range [...][3]byte{
+		{255, 64, 64},   // idx 0  -> bright red
+		{255, 200, 32},  // idx 15 -> warm yellow
+		{32, 200, 255},  // idx 31 -> bright cyan
+		{200, 32, 200},  // idx 47 -> magenta
+	} {
+		i := []int{0, 15, 31, 47}[k]
+		buf[i*3+0] = rgb[0]
+		buf[i*3+1] = rgb[1]
+		buf[i*3+2] = rgb[2]
 	}
 	return buf
 }

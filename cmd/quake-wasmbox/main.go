@@ -206,17 +206,35 @@ func setupSynthRenderer(runner *runloop.Runner) error {
 			cm[light][src] = byte(src)
 		}
 	}
+	// Camera anchored 20 units above the synth-bsp floor (which lives
+	// at Z=0 spanning [0,10] x [0,10]); pitch=80 looks down at the
+	// floor with a steep enough angle that yaw rotation is visible
+	// (gimbal-safe stand-off from straight-down 90 degrees). See the
+	// twin comment in cmd/quake-wasm/main.go for the rationale -- the
+	// original pitch=0 horizon shot pointed the camera through the
+	// side of the floor + missed every face entirely, producing the
+	// uniform-clear-color surface the L2/L3 bring-up reports flagged.
 	camOrigin := [3]float32{5, 5, 20}
-	const fovX = 90.0
+	const (
+		fovX     = 90.0
+		camPitch = 80.0
+	)
 
 	var surfaces bsprender.SurfaceList
 	frameCount := 0
 	runner.Pre2DDraw = func(fb *render.FrameBuffer, viewOrigin, viewAngles [3]float32) error {
 		frame := frameCount
 		frameCount++
-		viewAngles = [3]float32{0, float32(frame % 360), 0}
+		// Slow yaw spin so the surface paints visible motion; pitch is
+		// fixed so we keep looking down at the floor regardless of the
+		// per-tic viewAngles state the runloop hands us (the stub host
+		// can't drive a real player edict that would refresh these).
+		viewAngles = [3]float32{camPitch, float32(frame % 360), 0}
 		viewOrigin = camOrigin
 
+		// Clear to background palette index 0x10 (sky-like). Compose2D
+		// downstream sees Runner.Pre2DDraw != nil and sets
+		// SkipBackgroundFill so this clear survives into PresentFrame.
 		for i := range fb.Pixels {
 			fb.Pixels[i] = 0x10
 		}
@@ -292,10 +310,58 @@ func syntheticAssets() fs.FS {
 
 func makePaletteLump() []byte {
 	buf := make([]byte, render.PaletteLumpSize)
+	// Sweep a 6-channel rainbow across the 256 palette slots so the
+	// rendered scene paints in visually distinct colours -- see the
+	// twin comment in cmd/quake-wasm/main.go for the rationale.
 	for i := 0; i < 256; i++ {
-		buf[i*3+0] = byte(i)
-		buf[i*3+1] = byte(i ^ 0xFF)
-		buf[i*3+2] = byte(i << 1)
+		base := byte(i)
+		switch i % 6 {
+		case 0:
+			buf[i*3+0] = base
+			buf[i*3+1] = base / 4
+			buf[i*3+2] = base / 4
+		case 1:
+			buf[i*3+0] = base
+			buf[i*3+1] = base
+			buf[i*3+2] = base / 4
+		case 2:
+			buf[i*3+0] = base / 4
+			buf[i*3+1] = base
+			buf[i*3+2] = base / 4
+		case 3:
+			buf[i*3+0] = base / 4
+			buf[i*3+1] = base
+			buf[i*3+2] = base
+		case 4:
+			buf[i*3+0] = base / 4
+			buf[i*3+1] = base / 4
+			buf[i*3+2] = base
+		case 5:
+			buf[i*3+0] = base
+			buf[i*3+1] = base / 4
+			buf[i*3+2] = base
+		}
+	}
+	// Idx 0x10 is the Pre2DDraw clear (sky) -- pin it to mid-blue so
+	// it never collides with a face tile colour.
+	buf[0x10*3+0] = 48
+	buf[0x10*3+1] = 96
+	buf[0x10*3+2] = 176
+	// Pin the four checker-face tile indices (see makeCheckerTex)
+	// to bright, well-separated colours so the rendered face stands
+	// out against the sky -- see the twin comment in
+	// cmd/quake-wasm/main.go for why the rainbow ramp alone leaves
+	// them too dark.
+	for k, rgb := range [...][3]byte{
+		{255, 64, 64},
+		{255, 200, 32},
+		{32, 200, 255},
+		{200, 32, 200},
+	} {
+		i := []int{0, 15, 31, 47}[k]
+		buf[i*3+0] = rgb[0]
+		buf[i*3+1] = rgb[1]
+		buf[i*3+2] = rgb[2]
 	}
 	return buf
 }
