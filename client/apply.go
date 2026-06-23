@@ -136,10 +136,15 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 	case DecodedCenterPrint:
 		applyCenterPrint(state, m, nowSec)
 		return nil
+	case DecodedIntermission:
+		applyIntermission(state, nowSec)
+		return nil
+	case DecodedFinale:
+		applyFinale(state, m, nowSec)
+		return nil
 	case DecodedNop,
 		DecodedPrint,
 		DecodedStuffText,
-		DecodedFinale,
 		DecodedCutscene,
 		DecodedSellScreen,
 		DecodedKilledMonster,
@@ -148,8 +153,9 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 		// Documented no-op arms:
 		//   - Nop:                       connection-alive heartbeat
 		//   - Print / StuffText:         renderer/UI + console concern
-		//   - Finale / Cutscene / SellScreen: UI-state transitions
-		//   - KilledMonster / FoundSecret:    gameplay sound triggers
+		//   - Cutscene / SellScreen:     UI-state transitions
+		//   - KilledMonster / FoundSecret: gameplay sound triggers
+		//     (the stat-bank tallies still arrive via svc_updatestat)
 		//   - Sound:                     sound mixer (separate layer)
 		return nil
 	}
@@ -338,6 +344,49 @@ func applyCenterPrint(state *State, m DecodedCenterPrint, nowSec float32) {
 		return
 	}
 	state.CenterPrintExpiry = nowSec + CenterPrintLifetime
+}
+
+// applyIntermission handles svc_intermission: flip the
+// [State.Intermission] flag, clear any [State.IntermissionText] (the
+// scoreboard variant has no caller-supplied text -- the renderer
+// composes it from the stat bank), and stamp IntermissionTime with
+// nowSec. The renderer reads the flag + the cached stat bank
+// (StatTotalSecrets / StatSecrets / StatTotalMonsters / StatMonsters
+// + Time) to lay out the end-of-level scoreboard.
+//
+// Active centerprint is suppressed (cleared) on entry so a "you got
+// the shotgun" banner doesn't bleed through the scoreboard overlay.
+// tyrquake: the scr_centertime_off = 0 reset inside CL_ParseStartSound's
+// svc_intermission arm.
+//
+// tyrquake: the svc_intermission case inside CL_ParseServerMessage
+// (NQ/cl_parse.c) that sets cl.intermission = 1 + cl.completed_time
+// = cl.time + scr_centertime_off = 0.
+func applyIntermission(state *State, nowSec float32) {
+	state.Intermission = true
+	state.IntermissionText = ""
+	state.IntermissionTime = nowSec
+	state.CenterPrintText = ""
+	state.CenterPrintExpiry = 0
+}
+
+// applyFinale handles svc_finale: flip the [State.Intermission] flag
+// AND stash the caller-supplied multi-line credits text in
+// [State.IntermissionText]. The renderer composes the centered-text
+// overlay from IntermissionText (one screen line per '\n'-delimited
+// substring); the per-map scoreboard from the stat bank is
+// suppressed when IntermissionText is non-empty.
+//
+// Active centerprint is suppressed on entry (same rationale as
+// applyIntermission). tyrquake: the svc_finale case inside
+// CL_ParseServerMessage that sets cl.intermission = 2 + copies the
+// payload into scr_centerstring.
+func applyFinale(state *State, m DecodedFinale, nowSec float32) {
+	state.Intermission = true
+	state.IntermissionText = m.Text
+	state.IntermissionTime = nowSec
+	state.CenterPrintText = ""
+	state.CenterPrintExpiry = 0
 }
 
 // applyUpdate handles svc_update: seed the entity's live state from

@@ -98,6 +98,28 @@ func EncodeSignonNum(buf *sizebuf.Buffer, signonStage int) error {
 	return msg.WriteByte(buf, signonStage)
 }
 
+// EncodeIntermission writes a single svc_intermission byte. The
+// client flips into intermission mode on receipt: the renderer
+// hides the in-game HUD and overlays the end-of-level scoreboard
+// (time taken + secrets found + monsters killed, sourced from the
+// per-client stat bank already pushed via svc_updatestat). tyrquake:
+// emitted by SV_SaveSpawnparms inside Host_FindMaxClients during a
+// changelevel + by PF_Intermission (a QC builtin) for trigger-driven
+// intermissions.
+//
+// No payload: the camera lock + text layout are driven entirely off
+// the client's cached stat bank + the most-recent info_intermission
+// entity origin (which the server still has to push separately via
+// svc_setangle + svc_setview in a follow-up batch; this commit
+// lands the wire opcode + HUD swap, the camera pose stays at the
+// player's last-known origin).
+func EncodeIntermission(buf *sizebuf.Buffer) error {
+	if buf == nil {
+		return ErrNilBuf
+	}
+	return msg.WriteByte(buf, protocol.SvcIntermission)
+}
+
 // EncodeFinale writes svc_finale + a centered NUL-terminated text
 // string. Shown at end-of-episode / end-of-level intermissions.
 // tyrquake: emitted by PF_Finale (a QC builtin).

@@ -235,6 +235,34 @@ const (
 	MaxClients        = 16
 )
 
+// MaxClStats is the per-client stat-bank cap (svc_updatestat indices
+// 0..MaxClStats-1 are wired to named slots; higher indices are
+// engine-extension space). tyrquake: NQ/quakedef.h MAX_CL_STATS.
+const MaxClStats = 32
+
+// STAT_* indices into the per-client stat bank that svc_updatestat
+// pushes (and that the intermission scoreboard reads).
+// tyrquake: NQ/quakedef.h STAT_* defines. The indices here mirror
+// the C upstream so SV_WriteClientdataToMessage + the intermission
+// screen + the status-bar HUD all agree on the slot numbering.
+const (
+	StatHealth        = 0  // STAT_HEALTH
+	StatFrags         = 1  // STAT_FRAGS
+	StatWeapon        = 2  // STAT_WEAPON (current weapon model index)
+	StatAmmo          = 3  // STAT_AMMO
+	StatArmor         = 4  // STAT_ARMOR
+	StatWeaponFrame   = 5  // STAT_WEAPONFRAME
+	StatShells        = 6  // STAT_SHELLS
+	StatNails         = 7  // STAT_NAILS
+	StatRockets       = 8  // STAT_ROCKETS
+	StatCells         = 9  // STAT_CELLS
+	StatActiveWeapon  = 10 // STAT_ACTIVEWEAPON
+	StatTotalSecrets  = 11 // STAT_TOTALSECRETS  -- server-wide total
+	StatTotalMonsters = 12 // STAT_TOTALMONSTERS -- server-wide total
+	StatSecrets       = 13 // STAT_SECRETS       -- player.found_secrets
+	StatMonsters      = 14 // STAT_MONSTERS      -- player.killed_monsters
+)
+
 // Server-info game-type bytes.
 const (
 	GameCoop       = 0

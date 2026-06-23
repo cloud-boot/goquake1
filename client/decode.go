@@ -75,8 +75,22 @@ type DecodedPrint struct{ Text string }
 // client will feed to Cbuf_AddText). tyrquake: svc_stufftext arm.
 type DecodedStuffText struct{ Text string }
 
+// DecodedIntermission is the empty-body svc_intermission marker.
+// On receipt the client hides the in-game HUD and switches the
+// renderer into intermission mode (end-of-level scoreboard:
+// time taken, secrets X/Y, monsters X/Y). The stats themselves are
+// pulled from the client's cached stat bank (svc_updatestat pushes
+// that landed before the intermission marker); no wire payload is
+// needed. tyrquake: svc_intermission arm + the intermission
+// rendering in screen.c.
+type DecodedIntermission struct{}
+
 // DecodedFinale carries the end-of-episode banner text. tyrquake:
-// svc_finale arm.
+// svc_finale arm. On receipt the client flips into the same
+// "intermission" mode DecodedIntermission triggers but with a
+// caller-supplied multi-line credits string in place of the
+// per-map scoreboard. The Apply arm stashes the text in
+// [State.IntermissionText] and sets [State.Intermission] = true.
 type DecodedFinale struct{ Text string }
 
 // DecodedCutscene carries the cutscene caption text. tyrquake:
@@ -229,6 +243,7 @@ func (DecodedSignonNum) isDecoded()     {}
 func (DecodedPrint) isDecoded()         {}
 func (DecodedStuffText) isDecoded()     {}
 func (DecodedFinale) isDecoded()        {}
+func (DecodedIntermission) isDecoded()  {}
 func (DecodedCutscene) isDecoded()      {}
 func (DecodedCenterPrint) isDecoded()   {}
 func (DecodedUpdateName) isDecoded()    {}
@@ -268,7 +283,7 @@ type SvcReader struct {
 //	svc_print, svc_stufftext, svc_serverinfo, svc_updatename,
 //	svc_updatefrags, svc_clientdata, svc_updatecolors, svc_particle,
 //	svc_spawnbaseline, svc_signonnum, svc_killedmonster,
-//	svc_foundsecret, svc_finale, svc_sellscreen, svc_cutscene,
+//	svc_foundsecret, svc_intermission, svc_finale, svc_sellscreen, svc_cutscene,
 //	svc_centerprint, svc_temp_entity, svc_update (the high-bit
 //	fast-update; cmd>=128).
 //
@@ -299,6 +314,8 @@ func (sr *SvcReader) Next(proto int) (Decoded, error) {
 		return DecodedKilledMonster{}, nil
 	case protocol.SvcFoundSecret:
 		return DecodedFoundSecret{}, nil
+	case protocol.SvcIntermission:
+		return DecodedIntermission{}, nil
 	case protocol.SvcSellScreen:
 		return DecodedSellScreen{}, nil
 	case protocol.SvcSetView:

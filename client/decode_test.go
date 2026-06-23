@@ -125,6 +125,23 @@ func TestNext_FoundSecret_Roundtrip(t *testing.T) {
 	}
 }
 
+// ------- DecodedIntermission -------------------------------------
+
+func TestNext_Intermission_Roundtrip(t *testing.T) {
+	buf := sizebuf.New(make([]byte, 8))
+	if err := server.EncodeIntermission(buf); err != nil {
+		t.Fatal(err)
+	}
+	sr := newReader(buf.Bytes())
+	v, err := sr.Next(protocol.VersionNQ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := v.(DecodedIntermission); !ok {
+		t.Errorf("type: got %T want DecodedIntermission", v)
+	}
+}
+
 // ------- DecodedSellScreen ---------------------------------------
 
 func TestNext_SellScreen_Roundtrip(t *testing.T) {
@@ -1082,7 +1099,7 @@ func TestDecodedMarkers(t *testing.T) {
 		DecodedFoundSecret{}, DecodedSellScreen{},
 		DecodedSetView{}, DecodedSignonNum{},
 		DecodedPrint{}, DecodedStuffText{},
-		DecodedFinale{}, DecodedCutscene{},
+		DecodedFinale{}, DecodedIntermission{}, DecodedCutscene{},
 		DecodedUpdateName{}, DecodedUpdateColors{},
 		DecodedUpdateFrags{}, DecodedUpdateStat{},
 		DecodedParticle{}, DecodedSound{},
@@ -1111,6 +1128,8 @@ func TestDecodedMarkers(t *testing.T) {
 		case DecodedStuffText:
 			v.isDecoded()
 		case DecodedFinale:
+			v.isDecoded()
+		case DecodedIntermission:
 			v.isDecoded()
 		case DecodedCutscene:
 			v.isDecoded()

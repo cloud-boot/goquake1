@@ -59,6 +59,7 @@ func TestApply_MsgTime_UpdatedOnEveryCall(t *testing.T) {
 		{"Print", DecodedPrint{Text: "hi"}},
 		{"StuffText", DecodedStuffText{Text: "echo hi"}},
 		{"Finale", DecodedFinale{Text: "the end"}},
+		{"Intermission", DecodedIntermission{}},
 		{"Cutscene", DecodedCutscene{Text: "..."}},
 		{"CenterPrint", DecodedCenterPrint{Text: "hi"}},
 		{"SellScreen", DecodedSellScreen{}},
@@ -774,7 +775,6 @@ func TestApply_DocumentedNoOps_DoNotMutate(t *testing.T) {
 	}{
 		{"Print", DecodedPrint{Text: "hi"}},
 		{"StuffText", DecodedStuffText{Text: "exec config.cfg"}},
-		{"Finale", DecodedFinale{Text: "Episode 1 complete"}},
 		{"Cutscene", DecodedCutscene{Text: "..."}},
 		{"SellScreen", DecodedSellScreen{}},
 		{"KilledMonster", DecodedKilledMonster{}},
@@ -983,5 +983,89 @@ func TestApply_CenterPrint_EmptyTextClearsExpiry(t *testing.T) {
 	}
 	if s.CenterPrintExpiry != 0 {
 		t.Errorf("CenterPrintExpiry = %v want 0 (empty text clears expiry)", s.CenterPrintExpiry)
+	}
+}
+
+// --- DecodedIntermission arm -------------------------------------------
+
+// svc_intermission flips State.Intermission true, leaves
+// IntermissionText empty (scoreboard mode), stamps IntermissionTime
+// with nowSec, AND clears any active centerprint banner.
+func TestApply_Intermission_FlipsFlag(t *testing.T) {
+	s := NewState()
+	s.CenterPrintText = "you got the shotgun"
+	s.CenterPrintExpiry = 99
+	if err := Apply(s, DecodedIntermission{}, 12.5); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !s.Intermission {
+		t.Error("Intermission: got false want true")
+	}
+	if s.IntermissionText != "" {
+		t.Errorf("IntermissionText: got %q want empty (scoreboard mode)", s.IntermissionText)
+	}
+	if s.IntermissionTime != 12.5 {
+		t.Errorf("IntermissionTime: got %v want 12.5", s.IntermissionTime)
+	}
+	if s.CenterPrintText != "" || s.CenterPrintExpiry != 0 {
+		t.Errorf("centerprint not cleared: text=%q expiry=%v",
+			s.CenterPrintText, s.CenterPrintExpiry)
+	}
+}
+
+// --- DecodedFinale arm ------------------------------------------------
+
+// svc_finale flips State.Intermission true AND stashes the
+// caller-supplied credits text. Centerprint is cleared too.
+func TestApply_Finale_StashesText(t *testing.T) {
+	s := NewState()
+	s.CenterPrintText = "stale"
+	s.CenterPrintExpiry = 9
+	const credits = "Episode 1 complete\n\nWell done, Ranger"
+	if err := Apply(s, DecodedFinale{Text: credits}, 30.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !s.Intermission {
+		t.Error("Intermission: got false want true")
+	}
+	if s.IntermissionText != credits {
+		t.Errorf("IntermissionText: got %q want %q", s.IntermissionText, credits)
+	}
+	if s.IntermissionTime != 30.0 {
+		t.Errorf("IntermissionTime: got %v want 30", s.IntermissionTime)
+	}
+	if s.CenterPrintText != "" || s.CenterPrintExpiry != 0 {
+		t.Errorf("centerprint not cleared: text=%q expiry=%v",
+			s.CenterPrintText, s.CenterPrintExpiry)
+	}
+}
+
+// Finale with empty text still flips Intermission. The renderer's
+// drawIntermission helper tolerates an empty IntermissionText (the
+// runloop's intermissionLines helper passes [""] in that case).
+func TestApply_Finale_EmptyText_StillFlipsFlag(t *testing.T) {
+	s := NewState()
+	if err := Apply(s, DecodedFinale{}, 1.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !s.Intermission {
+		t.Error("Intermission: got false want true")
+	}
+	if s.IntermissionText != "" {
+		t.Errorf("IntermissionText: got %q want empty", s.IntermissionText)
+	}
+}
+
+// Intermission cleared on Disconnect (covered indirectly via Clear).
+func TestApply_Intermission_ClearedOnDisconnect(t *testing.T) {
+	s := NewState()
+	s.Intermission = true
+	s.IntermissionText = "x"
+	s.IntermissionTime = 7
+	if err := Apply(s, DecodedDisconnect{}, 0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.Intermission || s.IntermissionText != "" || s.IntermissionTime != 0 {
+		t.Errorf("Disconnect did not clear intermission: %+v", s)
 	}
 }

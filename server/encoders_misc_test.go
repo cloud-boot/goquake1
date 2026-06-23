@@ -53,6 +53,34 @@ func TestEncodeNop_Overflow(t *testing.T) {
 	}
 }
 
+// --- EncodeIntermission --------------------------------------------
+
+func TestEncodeIntermission_HappyPath(t *testing.T) {
+	buf := sizebuf.New(make([]byte, 4))
+	if err := EncodeIntermission(buf); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 1 {
+		t.Errorf("wire size: got %d want 1", buf.Len())
+	}
+	if got := buf.Bytes()[0]; got != protocol.SvcIntermission {
+		t.Errorf("cmd byte: got %d want %d (SvcIntermission)", got, protocol.SvcIntermission)
+	}
+}
+
+func TestEncodeIntermission_NilBuf(t *testing.T) {
+	if err := EncodeIntermission(nil); !errors.Is(err, ErrNilBuf) {
+		t.Errorf("got %v want ErrNilBuf", err)
+	}
+}
+
+func TestEncodeIntermission_Overflow(t *testing.T) {
+	buf := sizebuf.New(make([]byte, 0))
+	if err := EncodeIntermission(buf); err == nil {
+		t.Error("expected overflow error on zero-cap buf")
+	}
+}
+
 // --- EncodeDisconnect ----------------------------------------------
 
 func TestEncodeDisconnect_HappyPath(t *testing.T) {

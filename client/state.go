@@ -301,6 +301,39 @@ type State struct {
 	// guard makes this equivalent to "no draw").
 	CenterPrintExpiry float32
 
+	// Intermission flips true on receipt of svc_intermission /
+	// svc_finale. The renderer hides the in-game HUD and overlays
+	// the end-of-level scoreboard (or the finale credits text)
+	// instead. The flag stays set until the next svc_serverinfo
+	// (= map change tearing the client back to first-spawn) clears
+	// it via [State.Clear].
+	//
+	// tyrquake: cl.intermission in NQ/client.h. The C upstream
+	// stores 1 (svc_intermission), 2 (svc_finale "end of episode"
+	// credits), or 3 (cutscene); the Go port collapses the kind
+	// distinction into IntermissionText (empty = scoreboard mode,
+	// non-empty = finale-style centered text block) since the only
+	// observable difference is "show stats" vs "show text".
+	Intermission bool
+
+	// IntermissionText is the multi-line credits payload from
+	// svc_finale (and the lone-line "end of cutscene" payload from
+	// svc_cutscene if that arm is ever wired). Empty means the
+	// intermission is the scoreboard-only end-of-level kind
+	// (svc_intermission) and the renderer composes its text from
+	// the cached stat bank (StatTotalSecrets / StatSecrets /
+	// StatTotalMonsters / StatMonsters + Time).
+	IntermissionText string
+
+	// IntermissionTime is the nowSec the [Apply] arm stamped when
+	// the intermission was triggered (the value passed to Apply).
+	// The renderer reads it to compute "time elapsed since
+	// intermission started" for the centered scoreboard's "time:
+	// MM:SS" line; the embedder's per-button advance-trigger logic
+	// reads it to enforce the "any button after IntermissionTime +
+	// 2s closes the intermission" rule. tyrquake: cl.completed_time.
+	IntermissionTime float32
+
 	// EmitBeam is the optional sink the [Apply] arm for the
 	// svc_temp_entity lightning family (TE_Lightning1 / TE_Lightning2 /
 	// TE_Lightning3 / TE_Beam) dispatches into. nil is a silent no-op

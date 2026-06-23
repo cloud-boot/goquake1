@@ -229,6 +229,26 @@ func (c *changelevelHostFramer) Frame(dt float32) error {
 	}
 	if pending, mapSlug := c.host.ConsumeChangelevel(); pending {
 		fmt.Printf("QUAKE: level change requested -- nextmap=%q\n", mapSlug)
+
+		// Push svc_intermission + the four end-of-level stat
+		// slots into the server's ReliableDatagram BEFORE
+		// re-spawning into the new map -- the SpawnServer call
+		// would otherwise clear the buffers. HarvestIntermissionStats
+		// pulls the per-map tally from QC named globals
+		// (total_secrets / found_secrets / total_monsters /
+		// killed_monsters); missing globals leave the existing
+		// stats untouched (= zero on first call). EmitIntermission
+		// is logged but its failure is not surfaced -- a bad write
+		// must not kill the loop.
+		c.host.HarvestIntermissionStats()
+		if err := c.host.EmitIntermission(); err != nil {
+			fmt.Printf("QUAKE: EmitIntermission failed: %v\n", err)
+		} else {
+			s := c.host.LastIntermissionStats
+			fmt.Printf("QUAKE: intermission active=1 (secrets=%d/%d monsters=%d/%d)\n",
+				s.FoundSecrets, s.TotalSecrets, s.KilledMonsters, s.TotalMonsters)
+		}
+
 		if err := c.host.SpawnServer(mapSlug, c.host.Server.Protocol); err != nil {
 			fmt.Printf("QUAKE: changelevel SpawnServer(%q) failed: %v -- staying on previous map\n",
 				mapSlug, err)

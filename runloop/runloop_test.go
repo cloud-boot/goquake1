@@ -1111,3 +1111,176 @@ func TestRunFrame_CenterPrintPlumbedFromClientState(t *testing.T) {
 			r.FrameBuffer.Pixels[y*r.FrameBuffer.Pitch+leftX])
 	}
 }
+
+// --- intermissionLines (state-bank-driven scoreboard text) ----------
+
+// nil client returns nil.
+func TestIntermissionLines_NilClientReturnsNil(t *testing.T) {
+	if got := intermissionLines(nil, 0); got != nil {
+		t.Errorf("got %v want nil", got)
+	}
+}
+
+// Client without Intermission flag returns nil.
+func TestIntermissionLines_NoIntermissionReturnsNil(t *testing.T) {
+	cs := client.NewState()
+	if got := intermissionLines(cs, 5); got != nil {
+		t.Errorf("got %v want nil", got)
+	}
+}
+
+// Scoreboard mode (IntermissionText empty): three rows composed from
+// stat bank + elapsed seconds.
+func TestIntermissionLines_ScoreboardMode(t *testing.T) {
+	cs := client.NewState()
+	cs.Intermission = true
+	cs.IntermissionTime = 10.0
+	cs.Stats[protocol.StatSecrets] = 2
+	cs.Stats[protocol.StatTotalSecrets] = 5
+	cs.Stats[protocol.StatMonsters] = 17
+	cs.Stats[protocol.StatTotalMonsters] = 20
+	// elapsed = 75 -> 1:15
+	lines := intermissionLines(cs, 85.0)
+	if len(lines) != 3 {
+		t.Fatalf("len(lines) = %d, want 3", len(lines))
+	}
+	if lines[0] != "TIME: 1:15" {
+		t.Errorf("lines[0] = %q want %q", lines[0], "TIME: 1:15")
+	}
+	if lines[1] != "SECRETS: 2 / 5" {
+		t.Errorf("lines[1] = %q want %q", lines[1], "SECRETS: 2 / 5")
+	}
+	if lines[2] != "MONSTERS: 17 / 20" {
+		t.Errorf("lines[2] = %q want %q", lines[2], "MONSTERS: 17 / 20")
+	}
+}
+
+// Negative elapsed (nowSec < IntermissionTime) clamps to 0 -- mirror
+// of tyrquake's max(0, completed_time) guard.
+func TestIntermissionLines_NegativeElapsedClampedToZero(t *testing.T) {
+	cs := client.NewState()
+	cs.Intermission = true
+	cs.IntermissionTime = 100.0
+	lines := intermissionLines(cs, 5.0) // earlier than IntermissionTime
+	if lines[0] != "TIME: 0:00" {
+		t.Errorf("lines[0] = %q want %q (negative elapsed must clamp)", lines[0], "TIME: 0:00")
+	}
+}
+
+// Finale mode (IntermissionText non-empty): one slice entry per
+// '\n'-separated substring.
+func TestIntermissionLines_FinaleSplitOnNewline(t *testing.T) {
+	cs := client.NewState()
+	cs.Intermission = true
+	cs.IntermissionText = "Episode 1\ncomplete\n\nWell done"
+	lines := intermissionLines(cs, 0)
+	want := []string{"Episode 1", "complete", "", "Well done"}
+	if len(lines) != len(want) {
+		t.Fatalf("len = %d want %d (lines=%v)", len(lines), len(want), lines)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("lines[%d] = %q want %q", i, lines[i], want[i])
+		}
+	}
+}
+
+// Finale mode with empty IntermissionText is NOT reached (the guard
+// would route through scoreboard mode); cover splitLines directly via
+// a single-line credit body.
+func TestIntermissionLines_FinaleSingleLine(t *testing.T) {
+	cs := client.NewState()
+	cs.Intermission = true
+	cs.IntermissionText = "THE END"
+	lines := intermissionLines(cs, 0)
+	if len(lines) != 1 || lines[0] != "THE END" {
+		t.Errorf("got %v want [THE END]", lines)
+	}
+}
+
+// --- itoa + pad2 helpers ---------------------------------------------
+
+func TestItoa(t *testing.T) {
+	cases := []struct {
+		in   int
+		want string
+	}{
+		{0, "0"},
+		{1, "1"},
+		{9, "9"},
+		{10, "10"},
+		{-1, "-1"},
+		{-1234567, "-1234567"},
+		{1234567890, "1234567890"},
+	}
+	for _, c := range cases {
+		if got := itoa(c.in); got != c.want {
+			t.Errorf("itoa(%d) = %q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestPad2(t *testing.T) {
+	cases := []struct {
+		in   int
+		want string
+	}{
+		{0, "00"},
+		{5, "05"},
+		{9, "09"},
+		{10, "10"},
+		{99, "99"},
+		{-3, "00"},
+		{100, "100"},
+	}
+	for _, c := range cases {
+		if got := pad2(c.in); got != c.want {
+			t.Errorf("pad2(%d) = %q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSplitLines_EmptyYieldsSingleEmpty(t *testing.T) {
+	got := splitLines("")
+	if len(got) != 1 || got[0] != "" {
+		t.Errorf("got %v want [\"\"]", got)
+	}
+}
+
+// --- RunFrame intermission plumbing ----------------------------------
+
+// RunFrame: when client.State.Intermission is true, the scoreboard
+// text block lands in the framebuffer (and the in-game centerprint
+// banner is suppressed).
+func TestRunFrame_IntermissionPlumbedFromClientState(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	r, _ := newRunner(t, rec)
+	r.Client.Intermission = true
+	r.Client.IntermissionTime = 0
+	r.Client.Stats[protocol.StatSecrets] = 0
+	r.Client.Stats[protocol.StatTotalSecrets] = 0
+	r.Client.Stats[protocol.StatMonsters] = 0
+	r.Client.Stats[protocol.StatTotalMonsters] = 0
+	pal := &render.Palette{}
+	r.Palette = pal
+
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	// With three default lines ["TIME: 0:01", "SECRETS: 0 / 0",
+	// "MONSTERS: 0 / 0"], the block is centered around fb.Height/2.
+	// We just assert SOME glyph (not background) lands inside the
+	// vertical band around the middle.
+	mid := r.FrameBuffer.Height / 2
+	row := r.FrameBuffer.Pixels[mid*r.FrameBuffer.Pitch : (mid+1)*r.FrameBuffer.Pitch]
+	hit := false
+	for _, p := range row {
+		if p != r.BackgroundIdx {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		t.Fatalf("RunFrame did not plumb intermission into FrameContext: middle row has no non-background pixel")
+	}
+}

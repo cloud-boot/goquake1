@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-quake1/engine/backend"
 	"github.com/go-quake1/engine/client"
+	"github.com/go-quake1/engine/protocol"
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/server"
 	"github.com/go-quake1/engine/sound"
@@ -321,6 +322,8 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		SkipBackgroundFill: r.Pre2DDraw != nil,
 		CenterPrintText:    r.Client.CenterPrintText,
 		CenterPrintExpiry:  r.Client.CenterPrintExpiry,
+		Intermission:       r.Client.Intermission,
+		IntermissionLines:  intermissionLines(r.Client, nowSec),
 	}
 	if err := render.ExpandFrame(r.FrameBuffer, r.RGBA, ctx); err != nil {
 		return err
@@ -381,6 +384,117 @@ func viewOriginFromState(cs *client.State) [3]float32 {
 		return [3]float32{}
 	}
 	return es.Origin
+}
+
+// intermissionLines composes the per-frame scoreboard line block for
+// the intermission overlay. Sourced from the client's cached
+// per-tic state:
+//
+//   - State.IntermissionText non-empty (svc_finale): one slice
+//     entry per '\n'-separated substring (the finale credits text
+//     the server pushed verbatim). The renderer draws each line
+//     centered.
+//
+//   - State.IntermissionText empty (svc_intermission, scoreboard
+//     mode): three rows computed from the stat bank +
+//     (nowSec - IntermissionTime):
+//
+//     "TIME: M:SS"               (mm:ss since intermission start)
+//     "SECRETS: X / Y"           (Stats[StatSecrets]  / Stats[StatTotalSecrets])
+//     "MONSTERS: X / Y"          (Stats[StatMonsters] / Stats[StatTotalMonsters])
+//
+// Returns nil when cs is nil OR cs.Intermission is false (the
+// renderer's drawIntermission helper is a no-op on a nil slice too,
+// so the guard is also a defensive double-check).
+//
+// tyrquake: the line-by-line text composition inside SCR_DrawIntermission /
+// Sbar_IntermissionOverlay; the C upstream renders each row as a
+// WAD pic for the label + DrawNumber for the digits. The Go port
+// uses plain conchars throughout (the WAD pics aren't loaded yet),
+// which keeps the helper free of any asset dependency.
+func intermissionLines(cs *client.State, nowSec float32) []string {
+	if cs == nil || !cs.Intermission {
+		return nil
+	}
+	if cs.IntermissionText != "" {
+		return splitLines(cs.IntermissionText)
+	}
+	elapsed := nowSec - cs.IntermissionTime
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	mins := int(elapsed) / 60
+	secs := int(elapsed) % 60
+	return []string{
+		formatTimeLine(mins, secs),
+		formatStatLine("SECRETS", cs.Stats[protocol.StatSecrets], cs.Stats[protocol.StatTotalSecrets]),
+		formatStatLine("MONSTERS", cs.Stats[protocol.StatMonsters], cs.Stats[protocol.StatTotalMonsters]),
+	}
+}
+
+// splitLines splits s on '\n' boundaries. An empty s yields a
+// single-element slice containing "" (matches strings.Split's
+// behaviour); the renderer's drawIntermission tolerates empty rows
+// by drawing nothing for that row's character loop.
+func splitLines(s string) []string {
+	if s == "" {
+		return []string{""}
+	}
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	out = append(out, s[start:])
+	return out
+}
+
+// formatTimeLine formats the "TIME: M:SS" row.
+func formatTimeLine(mins, secs int) string {
+	return "TIME: " + itoa(mins) + ":" + pad2(secs)
+}
+
+// formatStatLine formats a "LABEL: X / Y" row.
+func formatStatLine(label string, x, y int32) string {
+	return label + ": " + itoa(int(x)) + " / " + itoa(int(y))
+}
+
+// itoa is a strconv-free integer-to-string helper. Negative values
+// are prefixed with '-'; zero yields "0".
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}
+
+// pad2 zero-pads a non-negative int to at least 2 digits.
+func pad2(n int) string {
+	if n < 0 {
+		n = 0
+	}
+	if n < 10 {
+		return "0" + itoa(n)
+	}
+	return itoa(n)
 }
 
 // UpdateButtonsFromSnapshot translates the per-frame raw key events in

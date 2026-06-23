@@ -182,6 +182,16 @@ type Host struct {
 	// Stable while PendingChangelevel is true; undefined otherwise.
 	NextMap string
 
+	// LastIntermissionStats is the cumulative per-map progression
+	// tally [Host.EmitIntermission] pushes to every client as
+	// svc_updatestat slots ahead of the svc_intermission marker.
+	// Embedders populate it (typically from named-global QC reads of
+	// `total_secrets` / `found_secrets` / `total_monsters` /
+	// `killed_monsters`) before calling EmitIntermission; the
+	// zero value is a tolerated fallback (the scoreboard renders
+	// "SECRETS: 0 / 0" / "MONSTERS: 0 / 0" instead of garbage).
+	LastIntermissionStats IntermissionStats
+
 	// soundPool is the mixer pool installed via [Host.SetSoundPool].
 	// nil = audio path silent-no-ops (the runloop owns its own pool;
 	// the host needs a reference so the QC-driven StartSound builtin
