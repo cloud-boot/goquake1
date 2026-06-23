@@ -288,6 +288,46 @@ func TestNext_Cutscene_Roundtrip(t *testing.T) {
 	}
 }
 
+func TestNext_CenterPrint_Roundtrip(t *testing.T) {
+	const want = "you got the shotgun"
+	buf := sizebuf.New(make([]byte, 64))
+	if err := server.EncodeCenterPrint(buf, want); err != nil {
+		t.Fatal(err)
+	}
+	sr := newReader(buf.Bytes())
+	v, err := sr.Next(protocol.VersionNQ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.(DecodedCenterPrint).Text != want {
+		t.Errorf("text: got %q want %q", v.(DecodedCenterPrint).Text, want)
+	}
+}
+
+func TestNext_CenterPrint_Truncated(t *testing.T) {
+	// Cmd byte only -- ReadString hits EOF immediately.
+	sr := newReader([]byte{protocol.SvcCenterPrint})
+	if _, err := sr.Next(protocol.VersionNQ); !errors.Is(err, ErrCorruptMessage) {
+		t.Errorf("err: got %v want ErrCorruptMessage", err)
+	}
+}
+
+func TestNext_CenterPrint_Empty(t *testing.T) {
+	// Empty string body (lone NUL after the cmd byte).
+	buf := sizebuf.New(make([]byte, 4))
+	if err := server.EncodeCenterPrint(buf, ""); err != nil {
+		t.Fatal(err)
+	}
+	sr := newReader(buf.Bytes())
+	v, err := sr.Next(protocol.VersionNQ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.(DecodedCenterPrint).Text != "" {
+		t.Errorf("text: got %q want empty", v.(DecodedCenterPrint).Text)
+	}
+}
+
 // Each of the four "byte + string" opcodes shares the same body
 // path; one truncation test is enough to cover the bad branch.
 func TestNext_Print_Truncated(t *testing.T) {

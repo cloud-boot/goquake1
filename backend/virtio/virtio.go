@@ -268,6 +268,7 @@ func (b *Backend) Now() float64 {
 //	KEY_A          =  30   → KeyA
 //	KEY_S          =  31   → KeyS
 //	KEY_D          =  32   → KeyD
+//	KEY_GRAVE      =  41   → KeyTilde   (US `~` key, scancode 0x29)
 //	KEY_LEFTSHIFT  =  42   → KeyShift
 //	KEY_SPACE      =  57   → KeySpace
 //	KEY_W          =  17   → KeyW
@@ -293,6 +294,8 @@ func mapKey(code uint16) (backend.KeyCode, bool) {
 		return backend.KeyS, true
 	case 32:
 		return backend.KeyD, true
+	case 41:
+		return backend.KeyTilde, true
 	case 42:
 		return backend.KeyShift, true
 	case 57:

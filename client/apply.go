@@ -133,6 +133,9 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 	case DecodedTempEntity:
 		applyTempEntity(state, m)
 		return nil
+	case DecodedCenterPrint:
+		applyCenterPrint(state, m, nowSec)
+		return nil
 	case DecodedNop,
 		DecodedPrint,
 		DecodedStuffText,
@@ -317,6 +320,24 @@ func applyTempEntity(state *State, m DecodedTempEntity) {
 		return
 	}
 	state.EmitTempEntity(int(m.Kind), m.Origin)
+}
+
+// applyCenterPrint handles svc_centerprint: stash the text on State +
+// stamp the per-frame expiry [CenterPrintLifetime] seconds in the
+// future. Empty text clears the active centerprint immediately (matches
+// upstream SCR_CenterPrint, which sets scr_centertime_off = 0 on an
+// empty string so the renderer's fade-out runs the next frame).
+//
+// tyrquake: SCR_CenterPrint in screen.c -- copies the string into
+// scr_centerstring + seeds scr_centertime_off = scr_centertime->value
+// (default 2.0).
+func applyCenterPrint(state *State, m DecodedCenterPrint, nowSec float32) {
+	state.CenterPrintText = m.Text
+	if m.Text == "" {
+		state.CenterPrintExpiry = 0
+		return
+	}
+	state.CenterPrintExpiry = nowSec + CenterPrintLifetime
 }
 
 // applyUpdate handles svc_update: seed the entity's live state from

@@ -32,6 +32,11 @@ const (
 	KeyDown
 	KeyLeft
 	KeyRight
+	// KeyTilde is the US backtick / tilde key (KEY_GRAVE on Linux,
+	// scancode 41 / 0x29). Bound to "toggle the developer console
+	// drop-down" by the runloop. tyrquake: K_BACKQUOTE in keys.h,
+	// the Con_ToggleConsole_f binding lives in console.c.
+	KeyTilde
 )
 
 // InputSnapshot is one frame's worth of input events. Backends fill

@@ -60,6 +60,7 @@ func TestApply_MsgTime_UpdatedOnEveryCall(t *testing.T) {
 		{"StuffText", DecodedStuffText{Text: "echo hi"}},
 		{"Finale", DecodedFinale{Text: "the end"}},
 		{"Cutscene", DecodedCutscene{Text: "..."}},
+		{"CenterPrint", DecodedCenterPrint{Text: "hi"}},
 		{"SellScreen", DecodedSellScreen{}},
 		{"KilledMonster", DecodedKilledMonster{}},
 		{"FoundSecret", DecodedFoundSecret{}},
@@ -944,5 +945,43 @@ func TestApplyBadStateErr_IsAndUnwrap(t *testing.T) {
 	otherSentinel := errors.New("unrelated")
 	if errors.Is(w, otherSentinel) {
 		t.Error("Is(unrelated): true; want false")
+	}
+}
+
+// --- DecodedCenterPrint --------------------------------------------------
+
+func TestApply_CenterPrint_SetsTextAndExpiry(t *testing.T) {
+	s := NewState()
+	const now float32 = 7.5
+	const text = "you got the shotgun"
+	if err := Apply(s, DecodedCenterPrint{Text: text}, now); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.CenterPrintText != text {
+		t.Errorf("CenterPrintText = %q want %q", s.CenterPrintText, text)
+	}
+	wantExpiry := now + CenterPrintLifetime
+	if s.CenterPrintExpiry != wantExpiry {
+		t.Errorf("CenterPrintExpiry = %v want %v", s.CenterPrintExpiry, wantExpiry)
+	}
+	if s.MsgTime != now {
+		t.Errorf("MsgTime = %v want %v", s.MsgTime, now)
+	}
+}
+
+func TestApply_CenterPrint_EmptyTextClearsExpiry(t *testing.T) {
+	s := NewState()
+	// Pre-seed an active centerprint so we can verify the empty arm
+	// clears it.
+	s.CenterPrintText = "stale"
+	s.CenterPrintExpiry = 42
+	if err := Apply(s, DecodedCenterPrint{Text: ""}, 3.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.CenterPrintText != "" {
+		t.Errorf("CenterPrintText = %q want empty", s.CenterPrintText)
+	}
+	if s.CenterPrintExpiry != 0 {
+		t.Errorf("CenterPrintExpiry = %v want 0 (empty text clears expiry)", s.CenterPrintExpiry)
 	}
 }

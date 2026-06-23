@@ -349,6 +349,7 @@ func TestPollInput_AllKeyCodes(t *testing.T) {
 		{30, backend.KeyA, true},
 		{31, backend.KeyS, true},
 		{32, backend.KeyD, true},
+		{41, backend.KeyTilde, true},
 		{42, backend.KeyShift, true},
 		{57, backend.KeySpace, true},
 		{103, backend.KeyUp, true},

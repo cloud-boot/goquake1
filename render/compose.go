@@ -39,6 +39,19 @@ type FrameContext struct {
 	// overlay the 2D layers (console + notify) on top WITHOUT
 	// wiping the 3D pixels first.
 	SkipBackgroundFill bool
+
+	// CenterPrintText is the optional banner string Compose2D draws
+	// horizontally-centered at y = fb.Height * 2 / 5 (the upstream
+	// SCR_CheckDrawCenterString anchor point: roughly 40% of screen
+	// height). Empty string = no draw. tyrquake: scr_centerstring.
+	CenterPrintText string
+
+	// CenterPrintExpiry is the wall-clock (in Now's units) at which
+	// the centerprint stops being drawn. When Now >= CenterPrintExpiry
+	// the centerprint is treated as expired (no draw), matching
+	// upstream's scr_centertime_off countdown. Zero = no active
+	// centerprint (a freshly-zeroed FrameContext draws nothing).
+	CenterPrintExpiry float32
 }
 
 var (
@@ -54,6 +67,8 @@ var (
 //     when ctx.SkipBackgroundFill is true).
 //  2. If the console is open (Screen.ConCurrent > 0): DrawConsole.
 //  3. DrawNotify the recent-rows overlay.
+//  4. If CenterPrintText is non-empty AND Now < CenterPrintExpiry,
+//     DrawCenteredString the banner at y = fb.Height * 2 / 5.
 //
 // Returns:
 //
@@ -99,6 +114,23 @@ func Compose2D(fb *FrameBuffer, ctx FrameContext) error {
 		ctx.Now, ctx.NotifyLifetime, ctx.MaxNotifyRows,
 	); err != nil {
 		return err
+	}
+
+	// Centerprint overlay. Drawn on top of console + notify so the
+	// banner stays visible during a drop-down. Active iff the text is
+	// non-empty AND the expiry is in the future (matches tyrquake's
+	// scr_centertime_off > 0 guard in SCR_CheckDrawCenterString).
+	if ctx.CenterPrintText != "" && ctx.Now < ctx.CenterPrintExpiry {
+		// Anchor at 40% of screen height; horizontally centered on
+		// CenterX (cached on Screen so the per-pixel hot loops don't
+		// divide). tyrquake's SCR_DrawCenterString uses
+		// vid.height * 0.35 for single-line messages; we round up to
+		// 2/5 to keep the integer division clean and still hit the
+		// upstream anchor band.
+		y := fb.Height * 2 / 5
+		if err := DrawCenteredString(fb, ctx.Chars, ctx.Screen.CenterX, y, ctx.CenterPrintText); err != nil {
+			return err
+		}
 	}
 
 	return nil

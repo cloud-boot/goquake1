@@ -1010,3 +1010,104 @@ func abs32(x float32) float32 {
 	}
 	return x
 }
+
+// ----- Console tilde toggle + animate --------------------------------
+
+// TestRunFrame_KeyTildeTogglesConsoleOpen verifies the down-edge of
+// KeyTilde flips r.ConsoleOpen. A second down-edge flips it back.
+func TestRunFrame_KeyTildeTogglesConsoleOpen(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	rec.Input = backend.InputSnapshot{KeysDown: []backend.KeyCode{backend.KeyTilde}}
+	r, _ := newRunner(t, rec)
+	if r.ConsoleOpen {
+		t.Fatalf("ConsoleOpen = true on fresh runner; want false")
+	}
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	if !r.ConsoleOpen {
+		t.Fatalf("ConsoleOpen = false after KeyTilde down; want true")
+	}
+	// Second down-edge -> closes.
+	if err := r.RunFrame(0.05, 2); err != nil {
+		t.Fatalf("RunFrame 2: %v", err)
+	}
+	if r.ConsoleOpen {
+		t.Fatalf("ConsoleOpen still true after second KeyTilde down; want false")
+	}
+}
+
+// TestRunFrame_KeyTildeUpDoesNotToggle proves the up-edge alone does
+// NOT flip ConsoleOpen (matches Con_ToggleConsole_f bound on press only).
+func TestRunFrame_KeyTildeUpDoesNotToggle(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	rec.Input = backend.InputSnapshot{KeysUp: []backend.KeyCode{backend.KeyTilde}}
+	r, _ := newRunner(t, rec)
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	if r.ConsoleOpen {
+		t.Fatalf("ConsoleOpen = true after KeyTilde up-only; want false (up-edge is a no-op)")
+	}
+}
+
+// TestRunFrame_ConsoleAnimatesTowardConLinesWhenOpen drives ConsoleOpen=true
+// through one RunFrame and verifies Screen.ConCurrent advanced by exactly
+// ScrollSpeed pixels toward ConLines.
+func TestRunFrame_ConsoleAnimatesTowardConLinesWhenOpen(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	r, _ := newRunner(t, rec)
+	// Force a known ScrollSpeed so the assertion is exact.
+	r.Screen.ScrollSpeed = 4
+	r.Screen.ConCurrent = 0
+	r.ConsoleOpen = true
+
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	if r.Screen.ConCurrent != 4 {
+		t.Fatalf("Screen.ConCurrent = %d after one tick; want 4 (ScrollSpeed)", r.Screen.ConCurrent)
+	}
+}
+
+// TestRunFrame_ConsoleAnimatesTowardZeroWhenClosed: ConsoleOpen=false +
+// pre-opened ConCurrent must retreat toward 0 by ScrollSpeed.
+func TestRunFrame_ConsoleAnimatesTowardZeroWhenClosed(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	r, _ := newRunner(t, rec)
+	r.Screen.ScrollSpeed = 4
+	r.Screen.ConCurrent = 20
+	r.ConsoleOpen = false
+
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	if r.Screen.ConCurrent != 16 {
+		t.Fatalf("Screen.ConCurrent = %d; want 16 (20 - ScrollSpeed)", r.Screen.ConCurrent)
+	}
+}
+
+// TestRunFrame_CenterPrintPlumbedFromClientState verifies that a
+// pre-seeded client.State CenterPrintText / CenterPrintExpiry flows
+// into the renderer + lands on the framebuffer at the 40% anchor.
+func TestRunFrame_CenterPrintPlumbedFromClientState(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	r, _ := newRunner(t, rec)
+	// nowSec passed to RunFrame = 1; expiry well beyond.
+	r.Client.CenterPrintText = "X"
+	r.Client.CenterPrintExpiry = 100
+	// Palette needed so ExpandFrame doesn't trip nil-palette guard.
+	pal := &render.Palette{}
+	r.Palette = pal
+
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	// 'X' glyph at the 40% anchor in the renderer-composed framebuffer.
+	y := r.FrameBuffer.Height * 2 / 5
+	leftX := r.Screen.CenterX - render.CharWidth/2
+	if r.FrameBuffer.Pixels[y*r.FrameBuffer.Pitch+leftX] != 0x68 {
+		t.Fatalf("centerprint glyph pixel = %#x want 0x68 ('X' fill); RunFrame did not plumb centerprint into FrameContext",
+			r.FrameBuffer.Pixels[y*r.FrameBuffer.Pitch+leftX])
+	}
+}

@@ -72,6 +72,15 @@ type Runner struct {
 	Speeds     client.InputSpeeds
 	ViewAngles [3]float32
 
+	// ConsoleOpen tracks whether the developer console drop-down is
+	// currently armed (true) or closed (false). Toggled on the down-
+	// edge of [backend.KeyTilde] by [RunFrame]. The per-frame
+	// AnimateConsole call lerps Screen.ConCurrent toward
+	// Screen.ConLines when open / 0 when closed at ScrollSpeed
+	// pixels per tick. tyrquake: the boolean Con_ToggleConsole_f
+	// flips, surfaced through key_dest = key_console / key_game.
+	ConsoleOpen bool
+
 	// Triggers tracks the held state of the on-wire trigger keys
 	// (mouse-fire = +attack, Enter = +jump). Translated to the
 	// [server.UserCmd.Buttons] bitmask in RunFrame and handed to
@@ -202,6 +211,30 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 	UpdateButtonsFromSnapshot(&r.Buttons, snap)
 	UpdateTriggersFromSnapshot(&r.Triggers, snap)
 
+	// 2b) Console toggle: down-edge of KeyTilde flips r.ConsoleOpen.
+	//     Up-edges are intentionally ignored (matches tyrquake's
+	//     Con_ToggleConsole_f, which is bound to the press half only;
+	//     the release half is a no-op so a held key doesn't oscillate).
+	for _, k := range snap.KeysDown {
+		if k == backend.KeyTilde {
+			r.ConsoleOpen = !r.ConsoleOpen
+		}
+	}
+
+	// 2c) Animate the console drop-down toward its target each tic.
+	//     Open target = Screen.ConLines; closed target = 0. Screen +
+	//     ConsoleOpen wiring is optional (tests that omit Screen rely
+	//     on the nil guard above; the per-tic animation is skipped
+	//     when Screen is nil because the renderer code path doesn't
+	//     run either).
+	if r.Screen != nil {
+		target := 0
+		if r.ConsoleOpen {
+			target = r.Screen.ConLines
+		}
+		r.Screen.AnimateConsole(target)
+	}
+
 	// 3) Advance server simulation.
 	if err := r.Host.Frame(dt); err != nil {
 		return err
@@ -286,6 +319,8 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		MaxNotifyRows:      r.MaxNotifyRows,
 		BackgroundIdx:      r.BackgroundIdx,
 		SkipBackgroundFill: r.Pre2DDraw != nil,
+		CenterPrintText:    r.Client.CenterPrintText,
+		CenterPrintExpiry:  r.Client.CenterPrintExpiry,
 	}
 	if err := render.ExpandFrame(r.FrameBuffer, r.RGBA, ctx); err != nil {
 		return err

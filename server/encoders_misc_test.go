@@ -202,6 +202,7 @@ func stringEncoders() []stringEncoder {
 		{"Finale", EncodeFinale, protocol.SvcFinale},
 		{"Cutscene", EncodeCutscene, protocol.SvcCutscene},
 		{"StuffText", EncodeStuffText, protocol.SvcStuffText},
+		{"CenterPrint", EncodeCenterPrint, protocol.SvcCenterPrint},
 	}
 }
 

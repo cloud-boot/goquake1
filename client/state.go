@@ -39,6 +39,12 @@ const (
 	NumPingTimes    = 16  // mirrors server.NumPingTimes
 )
 
+// CenterPrintLifetime is the wall-clock duration (in seconds) a
+// centerprint message stays on screen before fading out. tyrquake:
+// scr_centertime_off seeded to scr_centertime->value (default 2.0)
+// inside SCR_CenterPrint. The Go port hard-codes the same default.
+const CenterPrintLifetime float32 = 2.0
+
 // MaxClientMessage is the per-client transport buffer size. Same
 // numeric value as server.MaxMsgLen (1 << 18); duplicated here so
 // the client package stays decoupled from the server package.
@@ -274,6 +280,26 @@ type State struct {
 	// Signature: (kind = the TE_* sub-type byte, origin = the wire-
 	// reported world-space coord).
 	EmitTempEntity func(kind int, origin [3]float32)
+
+	// CenterPrintText is the latest svc_centerprint payload the
+	// renderer should overlay horizontally-centered near the top of
+	// the screen. tyrquake: scr_centerstring + scr_centertime_off in
+	// screen.c -- Quake renders it via SCR_CheckDrawCenterString and
+	// fades it out after [CenterPrintLifetime] seconds; the Go port
+	// stashes the string on State + the renderer reads + clears it
+	// when CenterPrintExpiry < now.
+	//
+	// Empty string = nothing to render. Non-empty + CenterPrintExpiry
+	// in the future = draw centered. CenterPrintExpiry <= current
+	// MsgTime = stale; renderer treats it as empty.
+	CenterPrintText string
+
+	// CenterPrintExpiry is the MsgTime at which the active centerprint
+	// stops being drawn. Set by the [Apply] arm for [DecodedCenterPrint]
+	// to nowSec + [CenterPrintLifetime]. Zero = no active centerprint
+	// (matches a freshly-zeroed State; the renderer's "expiry <= now"
+	// guard makes this equivalent to "no draw").
+	CenterPrintExpiry float32
 
 	// EmitBeam is the optional sink the [Apply] arm for the
 	// svc_temp_entity lightning family (TE_Lightning1 / TE_Lightning2 /

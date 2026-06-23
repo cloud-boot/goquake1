@@ -124,6 +124,21 @@ func EncodeCutscene(buf *sizebuf.Buffer, text string) error {
 	return msg.WriteString(buf, text)
 }
 
+// EncodeCenterPrint writes svc_centerprint + a NUL-terminated text
+// string. The client overlays it horizontally-centered near 40% of
+// the screen height (the "you got the shotgun" / intermission banner).
+// tyrquake: emitted by PF_centerprint (a QC builtin) + by SV_PrintToClient
+// for intermission text.
+func EncodeCenterPrint(buf *sizebuf.Buffer, text string) error {
+	if buf == nil {
+		return ErrNilBuf
+	}
+	if err := msg.WriteByte(buf, protocol.SvcCenterPrint); err != nil {
+		return err
+	}
+	return msg.WriteString(buf, text)
+}
+
 // EncodeStuffText writes svc_stufftext + a NUL-terminated string
 // the client interprets as console commands (e.g. "name BlubBlub\n"
 // to rename a player). tyrquake: SV_BroadcastCommand / per-builtin

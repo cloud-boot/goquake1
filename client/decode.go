@@ -83,6 +83,14 @@ type DecodedFinale struct{ Text string }
 // svc_cutscene arm.
 type DecodedCutscene struct{ Text string }
 
+// DecodedCenterPrint carries the svc_centerprint payload (the
+// "you got the shotgun" / intermission banner the server pushes
+// for the renderer to overlay horizontally-centered at ~40% of
+// screen height). tyrquake: svc_centerprint arm + SCR_CenterPrint
+// in screen.c. The Go port surfaces the text; the Apply arm
+// stamps the per-frame expiry into [State.CenterPrintExpiry].
+type DecodedCenterPrint struct{ Text string }
+
 // DecodedUpdateName carries a scoreboard-slot name change.
 // tyrquake: svc_updatename arm.
 type DecodedUpdateName struct {
@@ -222,6 +230,7 @@ func (DecodedPrint) isDecoded()         {}
 func (DecodedStuffText) isDecoded()     {}
 func (DecodedFinale) isDecoded()        {}
 func (DecodedCutscene) isDecoded()      {}
+func (DecodedCenterPrint) isDecoded()   {}
 func (DecodedUpdateName) isDecoded()    {}
 func (DecodedUpdateColors) isDecoded()  {}
 func (DecodedUpdateFrags) isDecoded()   {}
@@ -253,14 +262,15 @@ type SvcReader struct {
 //   - (nil, ErrCorruptMessage) when a supported opcode's body is
 //     truncated mid-read (the reader's Bad flag tripped)
 //
-// Supported opcodes (22):
+// Supported opcodes (23):
 //
 //	svc_nop, svc_disconnect, svc_updatestat, svc_setview, svc_sound,
 //	svc_print, svc_stufftext, svc_serverinfo, svc_updatename,
 //	svc_updatefrags, svc_clientdata, svc_updatecolors, svc_particle,
 //	svc_spawnbaseline, svc_signonnum, svc_killedmonster,
 //	svc_foundsecret, svc_finale, svc_sellscreen, svc_cutscene,
-//	svc_temp_entity, svc_update (the high-bit fast-update; cmd>=128).
+//	svc_centerprint, svc_temp_entity, svc_update (the high-bit
+//	fast-update; cmd>=128).
 //
 // The proto argument is the active protocol version (one of
 // protocol.Version*); it selects the per-protocol field widths in
@@ -303,6 +313,8 @@ func (sr *SvcReader) Next(proto int) (Decoded, error) {
 		return sr.decodeString(decodeKindFinale)
 	case protocol.SvcCutscene:
 		return sr.decodeString(decodeKindCutscene)
+	case protocol.SvcCenterPrint:
+		return sr.decodeString(decodeKindCenterPrint)
 	case protocol.SvcUpdateName:
 		return sr.decodeUpdateName()
 	case protocol.SvcUpdateColors:
@@ -339,6 +351,7 @@ const (
 	decodeKindStuff
 	decodeKindFinale
 	decodeKindCutscene
+	decodeKindCenterPrint
 )
 
 // decodeString reads a NUL-terminated string body and packs it into
@@ -355,8 +368,10 @@ func (sr *SvcReader) decodeString(kind stringKind) (Decoded, error) {
 		return DecodedStuffText{Text: s}, nil
 	case decodeKindFinale:
 		return DecodedFinale{Text: s}, nil
+	case decodeKindCutscene:
+		return DecodedCutscene{Text: s}, nil
 	}
-	return DecodedCutscene{Text: s}, nil
+	return DecodedCenterPrint{Text: s}, nil
 }
 
 // decodeSetView reads a short entityNum.
