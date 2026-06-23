@@ -88,6 +88,7 @@ import (
 	"github.com/go-quake1/engine/embedpak"
 	enginehost "github.com/go-quake1/engine/host"
 	"github.com/go-quake1/engine/mathlib"
+	"github.com/go-quake1/engine/menu"
 	"github.com/go-quake1/engine/mdl"
 	"github.com/go-quake1/engine/model"
 	"github.com/go-quake1/engine/progs"
@@ -817,6 +818,24 @@ func run() error {
 	if err := setupRenderer(runner, pakFS, realHost, playerSlot, aliasPrecache, aliasModels, aliasSkins, sbarAssets, particleRNG, tempSpritePool, explosionSprite, beamPool, boltModels, boltSkins); err != nil {
 		return fmt.Errorf("setupRenderer: %w", err)
 	}
+
+	// 12c. Wire the main menu. The engine boots into StateMain so the
+	//      first frame the QEMU display surfaces is the title plaque,
+	//      NOT the 3D scene -- matches the upstream cold-boot flow
+	//      (M_Menu_Main_f called from Host_InitLocal). The runloop
+	//      freezes the world pass while the menu is up + draws the
+	//      menu overlay into r.FrameBuffer in the Pre2DDraw slot;
+	//      pressing Enter on the skill picker transitions to
+	//      StateNone + the next tic kicks the host into per-tic
+	//      simulation. Esc-while-playing reopens the menu so a paused
+	//      runloop is one keystroke away at any time.
+	menuAssets, menuLoaded, menuTotal := loadMenuAssets(pakFS)
+	fmt.Printf("QUAKE: menu -- loaded %d/%d assets, dots=%d\n",
+		menuLoaded, menuTotal, len(menuAssets.MenuDots))
+	runner.Menu = menu.New()
+	runner.MenuAssets = menuAssets
+	fmt.Printf("QUAKE: menu state=%s cursor=%d (boot lands on the main menu, world pass frozen until player picks Skill)\n",
+		runner.Menu.State, runner.Menu.CursorIndex)
 
 	fmt.Printf("QUAKE: entering RunUntilQuit (realHost=%v)\n", realHost != nil)
 	return runner.RunUntilQuit()
@@ -3922,6 +3941,69 @@ func wadLumpName(name string) (string, bool) {
 		return "", false
 	}
 	return name[len(prefix) : len(name)-len(suffix)], true
+}
+
+// loadMenuAssets opens the menu pic lumps the [menu.Menu] overlay
+// paints with. Mirrors the loadSBarAssets shape: WAD-overlay-fronted
+// best-effort probe + verbose missing-asset logging so the QEMU serial
+// trace surfaces gaps without killing the boot.
+//
+// The lump set: qplaque (left-edge "QUAKE" plaque), ttl_main +
+// ttl_sgl (menu title banners), p_load / p_save / p_option (sub-menu
+// titles), mainmenu (top-level body pic), sp_menu (single-player
+// body pic), menudot1..6 (animated cursor strip). All live in
+// gfx.wad on the Quake Remastered pak; the overlay resolves
+// gfx/<name>.lmp transparently either way.
+//
+// Returns (assets, loaded, total). A nil pakFS skips the probe and
+// returns a zero bundle so the menu's text-fallback path keeps it
+// navigable.
+func loadMenuAssets(pakFS fs.FS) (*menu.Assets, int, int) {
+	if pakFS == nil {
+		return &menu.Assets{}, 0, 0
+	}
+	a := &menu.Assets{}
+	loaded, total := 0, 0
+	overlay := newWADOverlay(pakFS, "gfx.wad")
+
+	load := func(name string, dst **render.Pic) {
+		total++
+		blob, ok := tryReadPakFile(overlay, name)
+		if !ok {
+			fmt.Printf("QUAKE: menu asset %s missing -- text fallback\n", name)
+			return
+		}
+		pic, err := render.ParsePic(blob)
+		if err != nil {
+			fmt.Printf("QUAKE: menu asset %s ParsePic err: %v -- text fallback\n", name, err)
+			return
+		}
+		*dst = pic
+		loaded++
+	}
+
+	load("gfx/qplaque.lmp", &a.QPlaque)
+	load("gfx/ttl_main.lmp", &a.TitleMain)
+	load("gfx/ttl_sgl.lmp", &a.TitleSinglePlayer)
+	load("gfx/p_load.lmp", &a.TitleLoad)
+	load("gfx/p_save.lmp", &a.TitleSave)
+	load("gfx/p_option.lmp", &a.TitleOptions)
+	load("gfx/mainmenu.lmp", &a.MainMenu)
+	load("gfx/sp_menu.lmp", &a.SinglePlayerMenu)
+
+	// Animated cursor strip (6 frames).
+	a.MenuDots = make([]*render.Pic, 6)
+	for i := 0; i < 6; i++ {
+		load(fmt.Sprintf("gfx/menudot%d.lmp", i+1), &a.MenuDots[i])
+	}
+	// Drop trailing nils so menu.Draw's animation index stays valid.
+	end := len(a.MenuDots)
+	for end > 0 && a.MenuDots[end-1] == nil {
+		end--
+	}
+	a.MenuDots = a.MenuDots[:end]
+
+	return a, loaded, total
 }
 
 // loadSBarAssets opens the canonical sbar pic lumps out of pakFS via

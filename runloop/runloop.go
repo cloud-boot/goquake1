@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-quake1/engine/backend"
 	"github.com/go-quake1/engine/client"
+	"github.com/go-quake1/engine/menu"
 	"github.com/go-quake1/engine/protocol"
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/server"
@@ -130,6 +131,30 @@ type Runner struct {
 	// Errors propagate from RunFrame verbatim (the present /
 	// audio steps are skipped for that tic).
 	Pre2DDraw func(fb *render.FrameBuffer, viewOrigin [3]float32, viewAngles [3]float32) error
+
+	// Menu is the optional [menu.Menu] state machine the runloop
+	// drives ahead of the world pass. When Menu != nil AND
+	// Menu.Active() returns true the runloop:
+	//
+	//   - routes per-frame KeysDown events into Menu.Handle BEFORE
+	//     they reach the movement/trigger button mappers, so a key
+	//     consumed by the menu does not also drive the player edict;
+	//   - SKIPS the Host.Frame tic (the game world stays paused) +
+	//     the Pre2DDraw closure (no 3D BSP walk);
+	//   - calls Menu.Draw into fb in the Pre2DDraw slot so the menu
+	//     overlay is the only scene composed on top of the 2D layer.
+	//
+	// Esc-while-not-in-menu opens the menu (Menu.Open). The runloop
+	// then sets the frozen-world flag on the NEXT tic so the in-game
+	// pause is single-frame sharp.
+	//
+	// nil = previous behaviour (no menu; world pass + input run
+	// unconditionally).
+	Menu *menu.Menu
+
+	// MenuAssets is the WAD-pic bundle Menu.Draw paints with. nil
+	// falls back to the text-only path inside [menu.Menu.Draw].
+	MenuAssets *menu.Assets
 }
 
 // Sentinel errors returned by [Runner.RunFrame] before any work runs.
@@ -208,9 +233,31 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		return err
 	}
 
-	// 2) Translate the raw key events into the persistent button state.
-	UpdateButtonsFromSnapshot(&r.Buttons, snap)
-	UpdateTriggersFromSnapshot(&r.Triggers, snap)
+	// 1b) Menu state machine. When the menu is up, every KeyDown
+	//     event is routed into Menu.Handle and CONSUMED before the
+	//     movement / trigger mappers run, so a key the menu took
+	//     does not also drive the player edict (the C upstream
+	//     uses key_dest to multiplex; the Go port hardcodes the
+	//     menu-first split because the menu is the only mode
+	//     above the game today). Esc-pressed-while-not-in-menu
+	//     opens the menu; Esc-pressed-in-menu is dispatched into
+	//     Menu.Handle by the same loop and pops the screen back.
+	//
+	//     menuConsumed tracks whether the menu intercepted any
+	//     event this tic; downstream the runloop uses it to decide
+	//     whether to skip the host tick + the world pass.
+	menuConsumed := r.dispatchMenuInput(snap)
+
+	// 2) Translate the raw key events into the persistent button
+	//    state. Skipped when the menu consumed the inputs so a
+	//    held movement key from BEFORE the menu opened doesn't keep
+	//    driving the player. (The button slots already in
+	//    r.Buttons stay held until the user releases, matching
+	//    upstream behaviour.)
+	if !menuConsumed {
+		UpdateButtonsFromSnapshot(&r.Buttons, snap)
+		UpdateTriggersFromSnapshot(&r.Triggers, snap)
+	}
 
 	// 2b) Console toggle: down-edge of KeyTilde flips r.ConsoleOpen.
 	//     Up-edges are intentionally ignored (matches tyrquake's
@@ -236,9 +283,16 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		r.Screen.AnimateConsole(target)
 	}
 
-	// 3) Advance server simulation.
-	if err := r.Host.Frame(dt); err != nil {
-		return err
+	// 3) Advance server simulation. Skipped while the menu is up:
+	//    the C upstream sets cl.paused / sv.paused when the menu
+	//    is open; the Go port pauses by short-circuiting the host
+	//    tic entirely, which keeps sv.time + all per-tic QC
+	//    progressions frozen until the player dismisses the menu.
+	menuActive := r.Menu != nil && r.Menu.Active()
+	if !menuActive {
+		if err := r.Host.Frame(dt); err != nil {
+			return err
+		}
 	}
 
 	// 4) Client tick: drain inbound, send clc_move (post-signon only).
@@ -300,9 +354,22 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 	//
 	//    ViewAngles is the (pitch, yaw, roll) the client tick has
 	//    just refreshed from mouse + arrow-key input.
-	if r.Pre2DDraw != nil {
+	//    SKIPPED while the menu is up: the world pass would only
+	//    add CPU cost the menu is going to overdraw anyway. The
+	//    menu's own Draw fires in step 5b below.
+	if !menuActive && r.Pre2DDraw != nil {
 		viewOrigin := viewOriginFromState(r.Client)
 		if err := r.Pre2DDraw(r.FrameBuffer, viewOrigin, r.ViewAngles); err != nil {
+			return err
+		}
+	}
+
+	// 5b) Menu overlay. When the menu is up, Menu.Draw paints the
+	//     full-screen overlay into r.FrameBuffer; Compose2D's
+	//     background-fill is then skipped so the menu pixels
+	//     survive into the present.
+	if menuActive {
+		if err := r.Menu.Draw(r.FrameBuffer, r.Chars, r.MenuAssets, nowSec); err != nil {
 			return err
 		}
 	}
@@ -319,7 +386,7 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		NotifyLifetime:     r.NotifyLifetime,
 		MaxNotifyRows:      r.MaxNotifyRows,
 		BackgroundIdx:      r.BackgroundIdx,
-		SkipBackgroundFill: r.Pre2DDraw != nil,
+		SkipBackgroundFill: r.Pre2DDraw != nil || menuActive,
 		CenterPrintText:    r.Client.CenterPrintText,
 		CenterPrintExpiry:  r.Client.CenterPrintExpiry,
 		Intermission:       r.Client.Intermission,
@@ -626,6 +693,51 @@ func (t TriggerButtons) ActionButtons() uint8 {
 		b |= client.ButtonJump
 	}
 	return b
+}
+
+// dispatchMenuInput routes per-frame KeyDown events through the
+// optional [menu.Menu] state machine. Returns true when the menu
+// is currently active (which makes the caller short-circuit the
+// movement / trigger button mappers + the host tick + the world
+// pass for the rest of the tic).
+//
+// When the menu is NOT active, Esc-pressed-this-frame opens it
+// (Menu.Open) and the function returns true on that same tic so
+// the press isn't double-counted (the same Esc would otherwise hit
+// no movement slot but would still flow through to Tick as a
+// no-op + then a SECOND frame's Esc would immediately close the
+// menu the user just opened).
+//
+// Up-events are NOT routed into the menu: the menu's contract is
+// "fire on key press", matching upstream M_Keydown which is wired
+// to the down-half of the binding only. A nil [Runner.Menu] makes
+// the function a constant false return.
+func (r *Runner) dispatchMenuInput(snap backend.InputSnapshot) bool {
+	if r.Menu == nil {
+		return false
+	}
+	if !r.Menu.Active() {
+		// Out-of-menu: open on Esc press, but only when an Esc
+		// arrived this frame (don't treat the held state as a
+		// continuous "open" command).
+		for _, k := range snap.KeysDown {
+			if k == backend.KeyEscape {
+				r.Menu.Open()
+				return true
+			}
+		}
+		return false
+	}
+	// In-menu: every down-edge feeds Handle. We do NOT early-return
+	// after the first key so multi-key snapshots (rare in practice)
+	// stay deterministic in their dispatch order.
+	for _, k := range snap.KeysDown {
+		r.Menu.Handle(k)
+	}
+	// Still active means "menu owns the frame"; transition to
+	// StateNone (e.g. Skill confirm) makes the next tic unfreeze
+	// the world automatically.
+	return r.Menu.Active()
 }
 
 // UpdateTriggersFromSnapshot edge-applies snap.KeysDown / snap.KeysUp
