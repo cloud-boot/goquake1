@@ -675,7 +675,13 @@ func (m *Menu) drawCursor(fb *render.FrameBuffer, chars *render.Pic, assets *Ass
 		}
 		dot := assets.MenuDots[frame]
 		if dot != nil {
-			_ = render.DrawTransPic(fb, MenuCursorX, y, dot)
+			// Center the cursor pic vertically on the row's text
+			// baseline. The menudot1..6 pics are ~16-20 px tall
+			// while the conchars glyphs are 8 px; without this
+			// offset the cursor sits at the top of the cell and
+			// reads as "too low" relative to the text mid-line.
+			dy := (dot.Height - render.CharHeight) / 2
+			_ = render.DrawTransPic(fb, MenuCursorX, y-dy, dot)
 			return nil
 		}
 	}

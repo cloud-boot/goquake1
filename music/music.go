@@ -290,6 +290,15 @@ func (s *Streamer) NextSamples(buf []sound.StereoSample) int {
 			if s.decoder == nil {
 				return written
 			}
+		} else if n == 0 {
+			// Defensive: a buggy decoder that returns (0, nil) would
+			// spin this loop forever (no progress, no error, written
+			// stays < len(buf)). Treat it as end-of-stream so the
+			// runloop never freezes on a misbehaving Vorbis layer.
+			s.stopOrLoop()
+			if s.decoder == nil {
+				return written
+			}
 		}
 	}
 	return written

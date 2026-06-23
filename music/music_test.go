@@ -48,6 +48,35 @@ func (f *fakeDecoder) Channels() int   { return f.channels }
 // resolver + factory split honest in tests without standing up a
 // real OGG encoder.
 
+// stuckDecoder always returns (0, nil) -- a contract-violating decoder
+// that would freeze NextSamples without the defensive zero-progress
+// guard. The (0, nil) safeguard in NextSamples should treat this as
+// end-of-stream and bail out cleanly.
+type stuckDecoder struct{}
+
+func (stuckDecoder) Read(p []float32) (int, error) { return 0, nil }
+func (stuckDecoder) SampleRate() int               { return 22050 }
+func (stuckDecoder) Channels() int                 { return 2 }
+
+func TestNextSamples_ZeroProgressBreaksLoop(t *testing.T) {
+	open := func(track int) ([]byte, bool) { return []byte{1}, true }
+	factory := func([]byte) (Decoder, error) { return stuckDecoder{}, nil }
+	s, err := LoadTrack(open, factory, 7, 0, DefaultVolume)
+	if err != nil {
+		t.Fatalf("LoadTrack: %v", err)
+	}
+	buf := make([]sound.StereoSample, 32)
+	// Without the (0, nil) guard this NextSamples would never
+	// return. With the guard it bails to 0 written + stops cleanly.
+	got := s.NextSamples(buf)
+	if got != 0 {
+		t.Errorf("NextSamples = %d, want 0 on stuck decoder", got)
+	}
+	if !s.Stopped() {
+		t.Errorf("Stopped() = false, want true after stuck decoder bail")
+	}
+}
+
 // Test 1: LoadTrack happy path (single stereo decoder, no loop).
 
 func TestLoadTrack_HappyPath(t *testing.T) {
