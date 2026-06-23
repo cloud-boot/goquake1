@@ -174,3 +174,51 @@ func EncodeStuffText(buf *sizebuf.Buffer, text string) error {
 	}
 	return msg.WriteString(buf, text)
 }
+
+// ErrCDTrackRange is returned by EncodeCDTrack when track or loopTrack
+// is outside the unsigned-byte range the wire format encodes. The C
+// upstream silently truncates via the byte cast in MSG_WriteByte; the
+// Go port validates so a buggy caller surfaces loudly rather than
+// silently switching to the wrong track number.
+var ErrCDTrackRange = errors.New("server: cdtrack number outside [0, 255]")
+
+// EncodeCDTrack writes svc_cdtrack + two bytes: the active track and
+// the loop-back track. The client reads both, opens the matching
+// "music/trackXX.ogg" off the embedded pak (or any other registered
+// audio asset source), and streams the decoded PCM through the audio
+// mixer alongside the per-tic SFX.
+//
+// In id Software's original Q1, the two bytes selected a CD audio
+// track (the 1996 retail discs shipped 10 ambient/score tracks on
+// audio tracks 2..11 of the CD); the Go port replaces the CD-DA
+// dependency with .ogg files inside the pak, matching the convention
+// used by every modern source port (QuakeSpasm, FTEQW, vkQuake).
+// tyrquake: SV_SendServerinfo emits this right after the precache
+// lists -- the wire byte was reused 1:1 by the source-port community,
+// only the playback backend changed.
+//
+// track is the active music track (1 = title music, 2..11 = per-map
+// score from the retail soundtrack; 0 = silence). loopTrack is the
+// track the streamer falls back to once `track` reaches EOF (typically
+// equal to `track` for self-looping background score; 0 stops at EOF).
+//
+// Both byte ranges are validated against [0, 255]; out-of-range
+// returns [ErrCDTrackRange] without writing any bytes.
+func EncodeCDTrack(buf *sizebuf.Buffer, track, loopTrack int) error {
+	if buf == nil {
+		return ErrNilBuf
+	}
+	if track < 0 || track > 0xff {
+		return fmt.Errorf("%w: track=%d", ErrCDTrackRange, track)
+	}
+	if loopTrack < 0 || loopTrack > 0xff {
+		return fmt.Errorf("%w: loopTrack=%d", ErrCDTrackRange, loopTrack)
+	}
+	if err := msg.WriteByte(buf, protocol.SvcCDTrack); err != nil {
+		return err
+	}
+	if err := msg.WriteByte(buf, track); err != nil {
+		return err
+	}
+	return msg.WriteByte(buf, loopTrack)
+}

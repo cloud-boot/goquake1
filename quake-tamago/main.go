@@ -89,9 +89,10 @@ import (
 	"github.com/go-quake1/engine/embedpak"
 	enginehost "github.com/go-quake1/engine/host"
 	"github.com/go-quake1/engine/mathlib"
-	"github.com/go-quake1/engine/menu"
 	"github.com/go-quake1/engine/mdl"
+	"github.com/go-quake1/engine/menu"
 	"github.com/go-quake1/engine/model"
+	enginemusic "github.com/go-quake1/engine/music"
 	"github.com/go-quake1/engine/progs"
 	"github.com/go-quake1/engine/protocol"
 	"github.com/go-quake1/engine/render"
@@ -648,6 +649,34 @@ func run() error {
 		active := realHost.SoundPool().ActiveCount()
 		fmt.Printf("QUAKE: mixer pool unified host<->runner -- %d sounds precached (wire), %d samples loaded (mixer), %d channels already active (ambient tracks parked at spawn time)\n",
 			precached, mixerSamples, active)
+	}
+
+	// 11c-bis. Music driver wiring. Hand the runloop a pak-backed
+	//          resolver for the canonical "music/track%02d.ogg" path
+	//          + the pure-Go vorbis decoder factory. The svc_cdtrack
+	//          arm in the client's Apply layer writes the wire bytes
+	//          onto client.State.MusicTrack + MusicLoopTrack + bumps
+	//          State.MusicEpoch; the runloop's per-tic tickMusic
+	//          dispatch detects the epoch advance, opens the matching
+	//          OGG, and mixes the decoded PCM on top of the SFX
+	//          accumulator before QueueAudio. Missing tracks log ONCE
+	//          per (track, loopTrack) pair so a shareware pak (which
+	//          omits the music/ assets) stays boot-clean instead of
+	//          spamming the QEMU serial stream on every signon.
+	if pakFS != nil {
+		runner.MusicOpen = func(track int) ([]byte, bool) {
+			if track <= 0 {
+				return nil, false
+			}
+			// Canonical 2-digit zero-padded form: track01.ogg .. track99.ogg.
+			path := fmt.Sprintf("%s%02d%s", enginemusic.PathPrefix, track, enginemusic.PathSuffix)
+			return tryReadPakFile(pakFS, path)
+		}
+		runner.MusicDecoder = enginemusic.NewVorbisDecoder
+		runner.MusicVolume = enginemusic.DefaultVolume
+		runner.MusicMissingLog = func(track int) {
+			fmt.Printf("QUAKE: music track%02d.ogg missing -- silent\n", track)
+		}
 	}
 
 	// 11d. Particle pool wiring. One 2048-slot pool per process; the

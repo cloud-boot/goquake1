@@ -1069,3 +1069,87 @@ func TestApply_Intermission_ClearedOnDisconnect(t *testing.T) {
 		t.Errorf("Disconnect did not clear intermission: %+v", s)
 	}
 }
+
+// --- DecodedCDTrack arm ---------------------------------------------
+
+// Happy path: Apply writes (Track, LoopTrack) and bumps the epoch.
+func TestApply_CDTrack_HappyPath(t *testing.T) {
+	s := NewState()
+	if err := Apply(s, DecodedCDTrack{Track: 5, LoopTrack: 5}, 1.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.MusicTrack != 5 {
+		t.Errorf("MusicTrack: got %d want 5", s.MusicTrack)
+	}
+	if s.MusicLoopTrack != 5 {
+		t.Errorf("MusicLoopTrack: got %d want 5", s.MusicLoopTrack)
+	}
+	if s.MusicEpoch != 1 {
+		t.Errorf("MusicEpoch: got %d want 1", s.MusicEpoch)
+	}
+}
+
+// Repeated apply bumps the epoch each time (so a server retransmit
+// re-triggers the embedder's open path, mirroring the upstream
+// "BGM_PlayCDtrack restarts the stream" semantics).
+func TestApply_CDTrack_EpochBumpsOnEachCall(t *testing.T) {
+	s := NewState()
+	for i := uint64(1); i <= 4; i++ {
+		if err := Apply(s, DecodedCDTrack{Track: 5, LoopTrack: 5}, 1.0); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if s.MusicEpoch != i {
+			t.Errorf("after call %d: MusicEpoch=%d want %d", i, s.MusicEpoch, i)
+		}
+	}
+}
+
+// Distinct tracks land on distinct fields and bump the epoch.
+func TestApply_CDTrack_DistinctTracks(t *testing.T) {
+	s := NewState()
+	if err := Apply(s, DecodedCDTrack{Track: 7, LoopTrack: 11}, 0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.MusicTrack != 7 || s.MusicLoopTrack != 11 {
+		t.Errorf("(MusicTrack, MusicLoopTrack): got (%d, %d) want (7, 11)",
+			s.MusicTrack, s.MusicLoopTrack)
+	}
+}
+
+// Track 0 (silence) is wire-legal and lands as MusicTrack==0 + bumps
+// epoch so the embedder driver tears down the streamer.
+func TestApply_CDTrack_TrackZeroSilence(t *testing.T) {
+	s := NewState()
+	s.MusicTrack = 5
+	s.MusicLoopTrack = 5
+	s.MusicEpoch = 3
+	if err := Apply(s, DecodedCDTrack{Track: 0, LoopTrack: 0}, 0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.MusicTrack != 0 || s.MusicLoopTrack != 0 {
+		t.Errorf("silence: got (%d, %d) want (0, 0)", s.MusicTrack, s.MusicLoopTrack)
+	}
+	if s.MusicEpoch != 4 {
+		t.Errorf("MusicEpoch: got %d want 4", s.MusicEpoch)
+	}
+}
+
+// Clear preserves MusicEpoch (so the embedder's monotonic driver
+// counter doesn't regress on a map change) but resets the active
+// MusicTrack / MusicLoopTrack to 0.
+func TestApply_CDTrack_ClearPreservesEpochResetsTracks(t *testing.T) {
+	s := NewState()
+	if err := Apply(s, DecodedCDTrack{Track: 5, LoopTrack: 5}, 1.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	preEpoch := s.MusicEpoch
+	s.Clear()
+	if s.MusicEpoch != preEpoch {
+		t.Errorf("MusicEpoch after Clear: got %d want %d (preserved across wipe)",
+			s.MusicEpoch, preEpoch)
+	}
+	if s.MusicTrack != 0 || s.MusicLoopTrack != 0 {
+		t.Errorf("(MusicTrack, MusicLoopTrack) after Clear: got (%d, %d) want (0, 0)",
+			s.MusicTrack, s.MusicLoopTrack)
+	}
+}

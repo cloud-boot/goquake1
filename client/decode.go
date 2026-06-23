@@ -97,6 +97,27 @@ type DecodedFinale struct{ Text string }
 // svc_cutscene arm.
 type DecodedCutscene struct{ Text string }
 
+// DecodedCDTrack carries the (track, loopTrack) byte pair from
+// svc_cdtrack. The client opens "music/trackXX.ogg" (XX = Track
+// zero-padded to two digits) off the asset source and streams the
+// decoded PCM through the mixer alongside the per-tic SFX; on EOF the
+// streamer falls back to LoopTrack (typically == Track for self-loop;
+// 0 stops at EOF). Track == 0 silences any active music stream.
+//
+// In id Software's original Q1 the two bytes addressed an audio-CD
+// track index (the 1996 retail discs shipped 10 score tracks on
+// audio-CD tracks 2..11); every modern source port replaced the
+// CD-DA dependency with .ogg files keyed by the same wire byte, and
+// the Go port follows that convention.
+//
+// tyrquake: svc_cdtrack arm of CL_ParseServerMessage (the C upstream
+// writes the two bytes onto cl.cdtrack + cl.looptrack then calls
+// CDAudio_Play / BGM_PlayCDtrack to start the backend).
+type DecodedCDTrack struct {
+	Track     int // 0..255; 0 = silence
+	LoopTrack int // 0..255; track to switch to when Track reaches EOF
+}
+
 // DecodedCenterPrint carries the svc_centerprint payload (the
 // "you got the shotgun" / intermission banner the server pushes
 // for the renderer to overlay horizontally-centered at ~40% of
@@ -245,6 +266,7 @@ func (DecodedStuffText) isDecoded()     {}
 func (DecodedFinale) isDecoded()        {}
 func (DecodedIntermission) isDecoded()  {}
 func (DecodedCutscene) isDecoded()      {}
+func (DecodedCDTrack) isDecoded()       {}
 func (DecodedCenterPrint) isDecoded()   {}
 func (DecodedUpdateName) isDecoded()    {}
 func (DecodedUpdateColors) isDecoded()  {}
@@ -352,6 +374,8 @@ func (sr *SvcReader) Next(proto int) (Decoded, error) {
 		return sr.decodeClientData()
 	case protocol.SvcTempEntity:
 		return sr.decodeTempEntity()
+	case protocol.SvcCDTrack:
+		return sr.decodeCDTrack()
 	}
 	return nil, fmt.Errorf("%w: cmd=%d", ErrUnknownSvc, cmd)
 }
@@ -451,6 +475,21 @@ func (sr *SvcReader) decodeUpdateStat() (Decoded, error) {
 		return nil, ErrCorruptMessage
 	}
 	return DecodedUpdateStat{Stat: stat, Value: value}, nil
+}
+
+// decodeCDTrack reads the (track, loopTrack) byte pair from
+// svc_cdtrack. Both bytes are wire-unsigned; the upstream's MSG_ReadByte
+// returns an int in [0, 255], and the Go port preserves that range
+// (the decoder does NOT validate the values -- the active streamer
+// degrades gracefully when the named track is missing from the asset
+// source, so an arbitrary byte is acceptable on the wire).
+func (sr *SvcReader) decodeCDTrack() (Decoded, error) {
+	track := sr.R.ReadU8()
+	loopTrack := sr.R.ReadU8()
+	if sr.R.Bad() {
+		return nil, ErrCorruptMessage
+	}
+	return DecodedCDTrack{Track: track, LoopTrack: loopTrack}, nil
 }
 
 // decodeParticle reads the 11-byte svc_particle body (cmd byte

@@ -334,6 +334,48 @@ type State struct {
 	// 2s closes the intermission" rule. tyrquake: cl.completed_time.
 	IntermissionTime float32
 
+	// MusicTrack is the currently-selected music track index broadcast
+	// by the server via svc_cdtrack. The [Apply] arm for
+	// [DecodedCDTrack] writes both this field and MusicLoopTrack; the
+	// embedder's per-tic music driver polls them (see
+	// [State.MusicEpoch]) and (re-)opens the matching "music/trackXX.ogg"
+	// asset whenever the wire-broadcast track changes. 0 = silence;
+	// 1..255 = the per-map score index (1 = title music; the per-map
+	// indices follow the upstream Q1 retail soundtrack convention,
+	// where audio-CD tracks 2..11 corresponded to the 10 in-game
+	// score loops).
+	//
+	// tyrquake: cl.cdtrack in NQ/client.h, written by the svc_cdtrack
+	// arm of CL_ParseServerMessage. The Go port keeps the same wire
+	// shape and the same field name shape; only the playback backend
+	// changes (.ogg streamer instead of CD-DA hardware).
+	MusicTrack int
+
+	// MusicLoopTrack is the fallback track the music streamer switches
+	// to when MusicTrack reaches EOF. Wired by [DecodedCDTrack]'s
+	// Apply arm alongside MusicTrack. 0 = stop at EOF; non-zero =
+	// re-open and stream that track (typically == MusicTrack for a
+	// self-looping background score).
+	//
+	// tyrquake: cl.looptrack in NQ/client.h, written alongside cdtrack.
+	MusicLoopTrack int
+
+	// MusicEpoch is a monotonically-increasing counter the Apply arm
+	// for [DecodedCDTrack] bumps every time it writes a new
+	// (MusicTrack, MusicLoopTrack) pair. The embedder's per-tic music
+	// driver tracks the last value it observed and triggers a
+	// (re-)open whenever the epoch changes, which makes the
+	// "same wire byte arrives twice" case (a server retransmit of
+	// the same track) correctly idempotent: the epoch advances but
+	// the open path's caller can deduplicate by comparing
+	// (MusicTrack, MusicLoopTrack) themselves.
+	//
+	// Bumped even when the new pair is identical to the previous one
+	// so a server-side restart-the-music intent is preserved on the
+	// wire-driven hand-off; the receiving side decides what
+	// "epoch advanced but identical pair" means for its mixer.
+	MusicEpoch uint64
+
 	// EmitBeam is the optional sink the [Apply] arm for the
 	// svc_temp_entity lightning family (TE_Lightning1 / TE_Lightning2 /
 	// TE_Lightning3 / TE_Beam) dispatches into. nil is a silent no-op
@@ -389,6 +431,14 @@ func NewState() *State {
 func (s *State) Clear() {
 	buf := s.Message
 	buf.Clear()
+	// Preserve MusicEpoch across the wipe so the embedder's per-tic
+	// music driver keeps seeing strictly-increasing values; the
+	// per-map MusicTrack / MusicLoopTrack themselves SHOULD reset to
+	// 0 (a new map starts silent until the server emits svc_cdtrack),
+	// but the monotonic counter the driver compares against MUST NOT
+	// regress on a map change or a stale "track 0 already handled"
+	// observation would silently lose the next emission.
+	epoch := s.MusicEpoch
 	*s = State{
 		Connection: s.Connection,
 		Spawned:    s.Spawned,
@@ -396,6 +446,7 @@ func (s *State) Clear() {
 		Message:    buf,
 		Baselines:  make(map[int]EntityBaseline),
 		Entities:   make(map[int]EntityState),
+		MusicEpoch: epoch,
 	}
 }
 

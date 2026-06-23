@@ -300,3 +300,88 @@ func TestStringEncoders_Overflow(t *testing.T) {
 		})
 	}
 }
+
+// --- EncodeCDTrack --------------------------------------------------
+
+func TestEncodeCDTrack_HappyPath(t *testing.T) {
+	buf := sizebuf.New(make([]byte, 8))
+	if err := EncodeCDTrack(buf, 5, 7); err != nil {
+		t.Fatalf("err: got %v want nil", err)
+	}
+	got := buf.Bytes()
+	want := []byte{protocol.SvcCDTrack, 5, 7}
+	if len(got) != len(want) {
+		t.Fatalf("len: got %d want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("byte %d: got 0x%02x want 0x%02x", i, got[i], want[i])
+		}
+	}
+	// Sanity-decode via msg.Reader so the byte-stream parses back.
+	r := msg.NewReader(got)
+	if r.ReadU8() != protocol.SvcCDTrack {
+		t.Error("cmd byte mismatch on decode")
+	}
+	if r.ReadU8() != 5 {
+		t.Error("track byte mismatch")
+	}
+	if r.ReadU8() != 7 {
+		t.Error("loopTrack byte mismatch")
+	}
+}
+
+func TestEncodeCDTrack_TrackZero(t *testing.T) {
+	// Track == 0 is wire-legal (silence command).
+	buf := sizebuf.New(make([]byte, 4))
+	if err := EncodeCDTrack(buf, 0, 0); err != nil {
+		t.Fatalf("err: got %v want nil", err)
+	}
+}
+
+func TestEncodeCDTrack_NilBuf(t *testing.T) {
+	if err := EncodeCDTrack(nil, 1, 1); !errors.Is(err, ErrNilBuf) {
+		t.Errorf("err: got %v want ErrNilBuf", err)
+	}
+}
+
+func TestEncodeCDTrack_TrackOutOfRange(t *testing.T) {
+	for _, track := range []int{-1, 256, 999} {
+		buf := sizebuf.New(make([]byte, 4))
+		err := EncodeCDTrack(buf, track, 0)
+		if !errors.Is(err, ErrCDTrackRange) {
+			t.Errorf("track=%d: got %v want ErrCDTrackRange", track, err)
+		}
+	}
+}
+
+func TestEncodeCDTrack_LoopTrackOutOfRange(t *testing.T) {
+	for _, loop := range []int{-1, 256, 1024} {
+		buf := sizebuf.New(make([]byte, 4))
+		err := EncodeCDTrack(buf, 1, loop)
+		if !errors.Is(err, ErrCDTrackRange) {
+			t.Errorf("loopTrack=%d: got %v want ErrCDTrackRange", loop, err)
+		}
+	}
+}
+
+func TestEncodeCDTrack_OverflowOnCmdByte(t *testing.T) {
+	buf := sizebuf.New(make([]byte, 0))
+	if err := EncodeCDTrack(buf, 1, 1); err == nil {
+		t.Errorf("expected overflow at cmd byte, got nil")
+	}
+}
+
+func TestEncodeCDTrack_OverflowOnTrackByte(t *testing.T) {
+	buf := sizebuf.New(make([]byte, 1))
+	if err := EncodeCDTrack(buf, 1, 1); err == nil {
+		t.Errorf("expected overflow at track byte, got nil")
+	}
+}
+
+func TestEncodeCDTrack_OverflowOnLoopByte(t *testing.T) {
+	buf := sizebuf.New(make([]byte, 2))
+	if err := EncodeCDTrack(buf, 1, 1); err == nil {
+		t.Errorf("expected overflow at loop byte, got nil")
+	}
+}

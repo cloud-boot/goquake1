@@ -142,6 +142,9 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 	case DecodedFinale:
 		applyFinale(state, m, nowSec)
 		return nil
+	case DecodedCDTrack:
+		applyCDTrack(state, m)
+		return nil
 	case DecodedNop,
 		DecodedPrint,
 		DecodedStuffText,
@@ -387,6 +390,30 @@ func applyFinale(state *State, m DecodedFinale, nowSec float32) {
 	state.IntermissionTime = nowSec
 	state.CenterPrintText = ""
 	state.CenterPrintExpiry = 0
+}
+
+// applyCDTrack handles svc_cdtrack: write the (track, loopTrack) byte
+// pair onto [State.MusicTrack] + [State.MusicLoopTrack] and bump
+// [State.MusicEpoch] so the embedder's per-tic music driver detects
+// the change and (re-)opens the streamer.
+//
+// The epoch is bumped unconditionally, even when the new pair is
+// identical to the previous one: the server may legitimately
+// retransmit svc_cdtrack to force a music restart (e.g. after a save-
+// game load that ought to re-trigger the current track from the top),
+// and the embedder's driver is responsible for deciding whether to
+// re-arm the streamer or treat the redundant emission as a no-op by
+// comparing (MusicTrack, MusicLoopTrack) themselves.
+//
+// tyrquake: the svc_cdtrack arm of CL_ParseServerMessage (the C
+// upstream writes cl.cdtrack + cl.looptrack then immediately calls
+// BGM_PlayCDtrack -- the Go port splits the wire write from the
+// playback driver via the epoch counter so the music subsystem stays
+// out of the wire decoder).
+func applyCDTrack(state *State, m DecodedCDTrack) {
+	state.MusicTrack = m.Track
+	state.MusicLoopTrack = m.LoopTrack
+	state.MusicEpoch++
 }
 
 // applyUpdate handles svc_update: seed the entity's live state from

@@ -10,6 +10,7 @@ import (
 	"github.com/go-quake1/engine/backend"
 	"github.com/go-quake1/engine/client"
 	"github.com/go-quake1/engine/menu"
+	"github.com/go-quake1/engine/music"
 	"github.com/go-quake1/engine/protocol"
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/server"
@@ -168,6 +169,61 @@ type Runner struct {
 	// nil = no demo. The runner falls back to the normal host.Frame
 	// + client.Tick path verbatim.
 	Demo *Demo
+
+	// MusicOpen is the pak-agnostic asset resolver the music driver
+	// consults whenever the wire-received [client.State.MusicTrack]
+	// changes. The closure should return (blob, true) when
+	// "music/track%02d.ogg" exists in the asset source, (nil, false)
+	// otherwise.
+	//
+	// nil disables the music driver entirely; the audio pipeline
+	// still runs SFX through [sound.Paint] but no music is decoded.
+	// This keeps the runloop usable on builds whose pak omits the
+	// .ogg files (the typical shareware bring-up state).
+	MusicOpen music.OpenFunc
+
+	// MusicDecoder is the [music.DecoderFactory] the driver uses to
+	// parse the OGG/Vorbis blob into a streaming [music.Decoder].
+	// Production callers pass [music.NewVorbisDecoder]; tests pass
+	// a fake. nil + a non-nil MusicOpen surfaces as a degraded
+	// "skip the music driver entirely" path (same as nil MusicOpen);
+	// the runloop logs nothing in either case (the embedder owns
+	// the "music missing" log via the resolver-side closure if it
+	// wants one).
+	MusicDecoder music.DecoderFactory
+
+	// MusicVolume is the per-stream mix scale the driver passes to
+	// [music.LoadTrack]. Zero defaults to [music.DefaultVolume].
+	MusicVolume float32
+
+	// MusicMissingLog is the optional "music track XX missing" sink
+	// the driver fires ONCE per (MusicTrack, MusicLoopTrack) pair
+	// whose resolver returned (nil, false). Mirrors the
+	// vanilla-engine "QUAKE: missing music track XX -- silent"
+	// printf so QEMU-serial-stream-driven bring-up surfaces the
+	// missing-music state without leaking noise on every signon.
+	// nil = no log.
+	MusicMissingLog func(track int)
+
+	// musicStreamer is the active [music.Streamer], (re-)opened
+	// whenever the wire-broadcast (MusicTrack, MusicLoopTrack) pair
+	// changes. nil = no track is playing (either MusicTrack == 0 OR
+	// the resolver returned "track missing" + the driver degraded
+	// to silence for this signon).
+	musicStreamer *music.Streamer
+
+	// musicEpochSeen is the last [client.State.MusicEpoch] value the
+	// driver acted on. The per-tic music dispatch ignores any
+	// epoch < musicEpochSeen + 1, so a no-change tic is allocation-
+	// free.
+	musicEpochSeen uint64
+
+	// musicMissingLogged tracks (Track, LoopTrack) pairs the driver
+	// has already logged as missing so the log fires once per unique
+	// pair rather than every signon. Bounded by the wire byte
+	// range, so the worst case is 256*256 entries -- in practice the
+	// game uses < 16 distinct pairs across a full playthrough.
+	musicMissingLogged map[uint16]struct{}
 }
 
 // Sentinel errors returned by [Runner.RunFrame] before any work runs.
@@ -460,6 +516,14 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		if err := sound.Paint(r.SoundPool, r.MixBuffer, n); err != nil {
 			return err
 		}
+		// 8b) Music driver: poll the client's MusicEpoch, (re-)open
+		//     the streamer when the wire-broadcast track changes, and
+		//     mix the decoded PCM on TOP of the SFX accumulator. The
+		//     dispatch is a no-op when the embedder did not wire
+		//     MusicOpen / MusicDecoder, or when the track is silence
+		//     (MusicTrack == 0), or when no track epoch advance has
+		//     happened since the last poll.
+		r.tickMusic(r.MixBuffer[:n])
 		if err := r.Backend.QueueAudio(r.MixBuffer[:n]); err != nil {
 			if !errors.Is(err, backend.ErrUnsupported) {
 				return err
@@ -468,6 +532,103 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 	}
 
 	return nil
+}
+
+// tickMusic is the per-frame music driver. (Re-)opens the
+// [music.Streamer] whenever the wire-mirrored
+// (client.State.MusicTrack, client.State.MusicLoopTrack) pair changes,
+// and mixes the decoded PCM into out by ACCUMULATING into each frame
+// alongside the SFX already deposited there by [sound.Paint].
+//
+// No-ops when:
+//
+//   - r.MusicOpen is nil (embedder disabled the music driver),
+//   - r.MusicDecoder is nil (same),
+//   - r.Client is nil (defensive; RunFrame's preconditions already
+//     forbid this, but the helper stays safe to call standalone).
+//
+// On a track change to MusicTrack == 0 the driver releases the
+// streamer (silence). On a change to a missing track the driver logs
+// once via [Runner.MusicMissingLog] (when wired) and leaves the
+// streamer cleared.
+func (r *Runner) tickMusic(out []sound.StereoSample) {
+	if r.Client == nil {
+		return
+	}
+	if r.MusicOpen == nil || r.MusicDecoder == nil {
+		return
+	}
+	// Detect a track change via the monotonic epoch.
+	if r.Client.MusicEpoch != r.musicEpochSeen {
+		r.musicEpochSeen = r.Client.MusicEpoch
+		r.musicStreamer = nil
+		track := r.Client.MusicTrack
+		if track > 0 {
+			loop := r.Client.MusicLoopTrack
+			s, err := music.LoadTrack(r.MusicOpen, r.MusicDecoder, track, loop, r.MusicVolume)
+			switch {
+			case errors.Is(err, music.ErrTrackMissing):
+				r.logMusicMissingOnce(track, loop)
+			case err != nil:
+				// Decoder/factory failure: log under the same "missing"
+				// once-per-pair gate so a buggy blob doesn't spam the
+				// console. The embedder can distinguish the two via
+				// its own loader telemetry if it cares.
+				r.logMusicMissingOnce(track, loop)
+			default:
+				r.musicStreamer = s
+			}
+		}
+	}
+	if r.musicStreamer == nil || r.musicStreamer.Stopped() {
+		return
+	}
+	// Mix on TOP of the existing accumulator. The streamer overwrites
+	// its frames (it has no knowledge of the SFX already there); to
+	// preserve both, we mix into a scratch slice and add. The runloop
+	// allocates the scratch once per call (it's bounded by len(out) =
+	// MaxMixOutputFrames = 512 frames; a fixed 4 KB stack alloc).
+	var scratch [sound.MaxMixOutputFrames]sound.StereoSample
+	n := r.musicStreamer.NextSamples(scratch[:len(out)])
+	for i := 0; i < n; i++ {
+		out[i].L = saturatedAdd16(out[i].L, scratch[i].L)
+		out[i].R = saturatedAdd16(out[i].R, scratch[i].R)
+	}
+}
+
+// saturatedAdd16 sums two int16 samples without int16 wrap-around.
+// The mixer accumulator is int16 so a naive `a+b` overflows when
+// loud SFX overlap with loud music; the saturation keeps the worst-
+// case sum inside [-32768, 32767] (the audible result is the
+// familiar "clip" rather than the wrap-around "click").
+func saturatedAdd16(a, b int16) int16 {
+	sum := int32(a) + int32(b)
+	if sum > 32767 {
+		return 32767
+	}
+	if sum < -32768 {
+		return -32768
+	}
+	return int16(sum)
+}
+
+// logMusicMissingOnce dispatches the "music track XX missing" log
+// through the embedder's optional sink, but only the first time a
+// given (track, loopTrack) pair is observed. Idempotent on repeated
+// signon retransmits.
+func (r *Runner) logMusicMissingOnce(track, loopTrack int) {
+	if r.MusicMissingLog == nil {
+		return
+	}
+	if r.musicMissingLogged == nil {
+		r.musicMissingLogged = make(map[uint16]struct{})
+	}
+	key := uint16(track)<<8 | uint16(loopTrack&0xff)
+	if _, seen := r.musicMissingLogged[key]; seen {
+		return
+	}
+	r.musicMissingLogged[key] = struct{}{}
+	r.MusicMissingLog(track)
 }
 
 // viewOriginFromState returns the camera position the per-tic
