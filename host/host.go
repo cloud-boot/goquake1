@@ -215,6 +215,15 @@ type Host struct {
 	listenerSet    bool
 	listenerOrigin [3]float32
 	listenerRight  [3]float32
+
+	// SaveSkill is the active difficulty rung the most recent
+	// menu-driven skill confirm wrote. SaveSlot persists it into
+	// the save header; LoadSlot restores it. Defaults to 1 (Normal)
+	// to match the upstream `skill` cvar default.
+	//
+	// Exposed for the runloop's menu hook (it copies the post-confirm
+	// menu.SkillLevel into here via [Host.SetSkill]).
+	SaveSkill int
 }
 
 // ErrNilDep fires on a missing required NewHost dependency.

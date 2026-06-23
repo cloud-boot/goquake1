@@ -118,8 +118,29 @@ type Menu struct {
 
 	// SaveSlot is the last save-game slot the player highlighted in
 	// the load / save pickers. 0..MaxSaveSlots-1. Exposed for the
-	// load / save runloop hook (the hook is wired in a follow-up).
+	// load / save runloop hook (OnSave / OnLoad below).
 	SaveSlot int
+
+	// OnSave is the optional callback the menu fires when the player
+	// confirms a row in the StateSave picker. The callback receives
+	// the slot index (== SaveSlot post-bind); a non-nil error is
+	// stashed in LastError so the runloop can render it next tic.
+	//
+	// Wired by the embedder (typically a `func(i int) error {
+	// return host.SaveSlot(i) }` closure) once the host is alive.
+	// nil = the confirm is a slot-bind-only with no side effects.
+	OnSave func(slot int) error
+
+	// OnLoad mirrors OnSave for the StateLoad picker. The host's
+	// LoadSlot does a full server re-spawn so calling it from a
+	// menu confirm has visible side effects (the world replaces
+	// with the snapshot's map).
+	OnLoad func(slot int) error
+
+	// LastError is the most recent OnSave / OnLoad return value. nil
+	// means the last confirm succeeded (or no confirm ran). The
+	// runloop's per-tic Draw can read it to render an error overlay.
+	LastError error
 }
 
 // MaxSaveSlots is the number of save-game slots offered in the load
@@ -256,8 +277,29 @@ func (m *Menu) activate() bool {
 		m.CursorIndex = 0
 		return false
 	case StateLoad, StateSave:
-		// Bind the slot; pop to StateNewGame (the parent screen).
+		// Bind the slot, fire the embedder's save/load callback if
+		// one is wired, stash any error on LastError, and pop to
+		// the parent screen (or dismiss the menu on success so the
+		// player drops back into the game world post-load).
 		m.SaveSlot = m.CursorIndex
+		hook := m.OnSave
+		if m.State == StateLoad {
+			hook = m.OnLoad
+		}
+		var err error
+		if hook != nil {
+			err = hook(m.SaveSlot)
+		}
+		m.LastError = err
+		if err == nil && m.State == StateLoad && hook != nil {
+			// Successful load: drop into the freshly-restored world.
+			m.State = StateNone
+			m.CursorIndex = 0
+			return true
+		}
+		// Save (or load with no hook / load-with-error): pop back
+		// to the parent screen so the operator can pick another row
+		// or escape out.
 		m.State = StateNewGame
 		m.CursorIndex = 0
 		return false

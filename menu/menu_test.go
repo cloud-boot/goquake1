@@ -150,12 +150,17 @@ func TestHandleCursorZeroRowsNoop(t *testing.T) {
 
 func TestHandleIgnoresUnknownKeys(t *testing.T) {
 	m := &Menu{State: StateMain, CursorIndex: 2}
-	before := *m
+	beforeState := m.State
+	beforeCursor := m.CursorIndex
+	beforeSkill := m.SkillLevel
+	beforeSlot := m.SaveSlot
 	if adv := m.Handle(backend.KeyW); adv {
 		t.Errorf("KeyW advance=true unexpected")
 	}
-	if *m != before {
-		t.Errorf("unknown key mutated state: before=%+v after=%+v", before, *m)
+	if m.State != beforeState || m.CursorIndex != beforeCursor ||
+		m.SkillLevel != beforeSkill || m.SaveSlot != beforeSlot {
+		t.Errorf("unknown key mutated state: state=%v cursor=%d skill=%v slot=%d",
+			m.State, m.CursorIndex, m.SkillLevel, m.SaveSlot)
 	}
 }
 
