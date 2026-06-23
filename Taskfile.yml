@@ -128,6 +128,8 @@ tasks:
 
   oci-pack:
     desc: Pack local embedpak/empty.pak + embedmusic/*.ogg into an OCI image layout at {{.OCI_OUT}} (ready for `oras push`).
+    env:
+      GOWORK: "off"
     cmds:
       - 'rm -rf "{{.OCI_OUT}}"'
       - '"{{.GO}}" run ./cmd/oci-pack-quake/ -out "{{.OCI_OUT}}"'
