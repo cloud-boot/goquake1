@@ -65,6 +65,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"strings"
 	"time"
 
 	_ "github.com/go-virtio/validate/board"
@@ -747,12 +748,24 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	//     the BSP's own (id1) palette; the asset VFS now serves the
 	//     real gfx/palette.lmp out of the embedded pak, so the
 	//     destination RGBA the renderer emits is in true id1 colours.
-	miptexPics, loaded, total, err := loadMiptexPics(file)
+	miptexPics, miptexNames, loaded, total, err := loadMiptexPicsNamed(file)
 	if err != nil {
 		return fmt.Errorf("loadMiptexPics: %w", err)
 	}
 	fmt.Printf("QUAKE: loaded %d miptexes from BSP (total slots: %d, loaded: %d, null: %d)\n",
 		loaded, total, loaded, total-loaded)
+	// Census the special-surface population for the boot log so we
+	// can confirm sky + liquid dispatch will actually fire on this map.
+	var nSky, nTurb int
+	for _, n := range miptexNames {
+		switch {
+		case strings.HasPrefix(n, "sky"):
+			nSky++
+		case strings.HasPrefix(n, "*"):
+			nTurb++
+		}
+	}
+	fmt.Printf("QUAKE: miptex specials -- sky=%d liquid=%d\n", nSky, nTurb)
 
 	// 3. Identity colormap: every (light, src) -> src. Lighting is
 	//    full-bright in this MVP; the colormap reuse keeps the path
@@ -1287,10 +1300,24 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			}
 		}
 
-		// Rasterize each visible face via TransformFace + FillTexturedPolygon.
-		// Per-face texture pick: TexInfo.MiptexIdx -> miptexPics[idx].
+		// Rasterize each visible face. Per-face dispatch on the miptex
+		// name prefix:
+		//
+		//   "sky*" -> two-layer sky composite (FillSkyPolygon). The
+		//             cloud overlay scrolls 2x the dome, both wrap
+		//             modulo the texture half-width.
+		//   "**"   -> liquid (water/lava/slime) warp via
+		//             FillTurbulentPolygon. Per-pixel UV is offset
+		//             by an LUT-sampled sin amplitude (TurbScale=8
+		//             texels) keyed off the wall-clock so the surface
+		//             ripples frame-to-frame.
+		//   else   -> the stock affine FillTexturedPolygon path.
+		//
 		// Faces that resolve to a null miptex slot OR a synthetic BSP
-		// with no Textures lump fall back to the checker.
+		// with no Textures lump fall back to the checker + the plain
+		// textured path (the dispatch only fires for real miptex hits).
+		skyTimeSec := float32(realHost.Server.Time)
+		turbTimeSec := float32(realHost.Server.Time)
 		for i := 0; i < surfaces.Len(); i++ {
 			ref := surfaces.Refs[i]
 			fv, err := bsprender.NewBrushFaceVerts(bm, ref.FaceIdx)
@@ -1302,12 +1329,21 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				continue
 			}
 			tex := fallbackTex
+			var name string
 			if mtIdx, ok, _ := bm.FaceMipTexIdx(ref.FaceIdx); ok && mtIdx >= 0 && mtIdx < len(miptexPics) {
 				if p := miptexPics[mtIdx]; p != nil {
 					tex = p
+					name = miptexNames[mtIdx]
 				}
 			}
-			_ = render.FillTexturedPolygon(fb, tex, &cm, 0, verts)
+			switch {
+			case strings.HasPrefix(name, "sky"):
+				_ = render.FillSkyPolygon(fb, tex, verts, skyTimeSec)
+			case strings.HasPrefix(name, "*"):
+				_ = render.FillTurbulentPolygon(fb, tex, &cm, 0, verts, turbTimeSec)
+			default:
+				_ = render.FillTexturedPolygon(fb, tex, &cm, 0, verts)
+			}
 		}
 
 		// Alias-model pass. Iterate the wire-mirrored State.Entities
@@ -1501,12 +1537,30 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 // non-nil entries and total is the directory's slot count. A synthetic
 // BSP that lacks a textures lump returns ([], 0, 0, nil).
 func loadMiptexPics(file *bspfile.File) ([]*render.Pic, int, int, error) {
+	pics, names, loaded, total, err := loadMiptexPicsNamed(file)
+	_ = names // kept for the dispatch path below
+	return pics, loaded, total, err
+}
+
+// loadMiptexPicsNamed is the named-bearing variant. The parallel
+// `names` slice exposes the raw miptex name (16-byte slot, NUL-
+// trimmed) at each slot so the per-face dispatch can branch on the
+// upstream texture-name conventions:
+//
+//   - leading "sky"  -> two-layer sky composite (FillSkyPolygon)
+//   - leading "*"    -> sinusoidal water/lava warp (FillTurbulentPolygon)
+//   - everything else -> the stock affine FillTexturedPolygon path
+//
+// Empty string for missing / null slots (so the dispatch fall-through
+// to fallbackTex still works cleanly).
+func loadMiptexPicsNamed(file *bspfile.File) ([]*render.Pic, []string, int, int, error) {
 	mtl, err := file.Textures()
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("file.Textures: %w", err)
+		return nil, nil, 0, 0, fmt.Errorf("file.Textures: %w", err)
 	}
 	total := int(mtl.NumMipTex)
-	out := make([]*render.Pic, total)
+	pics := make([]*render.Pic, total)
+	names := make([]string, total)
 	loaded := 0
 	for i := 0; i < total; i++ {
 		mt, ok, err := mtl.MipTex(i)
@@ -1528,14 +1582,15 @@ func loadMiptexPics(file *bspfile.File) ([]*render.Pic, int, int, error) {
 		// copy keeps the renderer's invariants self-contained).
 		buf := make([]byte, len(px))
 		copy(buf, px)
-		out[i] = &render.Pic{
+		pics[i] = &render.Pic{
 			Width:  int(mt.Width),
 			Height: int(mt.Height),
 			Pixels: buf,
 		}
+		names[i] = mt.Name
 		loaded++
 	}
-	return out, loaded, total, nil
+	return pics, names, loaded, total, nil
 }
 
 // buildHost wires the embedded pak0 into a fully constructed
