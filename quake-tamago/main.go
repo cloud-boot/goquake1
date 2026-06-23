@@ -95,6 +95,7 @@ import (
 	enginemusic "github.com/go-quake1/engine/music"
 	"github.com/go-quake1/engine/progs"
 	"github.com/go-quake1/engine/protocol"
+	"github.com/go-quake1/engine/quake-tamago/concharsfont"
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/runloop"
 	engineserver "github.com/go-quake1/engine/server"
@@ -383,7 +384,12 @@ func run() error {
 	syn := syntheticAssets()
 	v.Add(syn) // fallback layer (prepended -> ends up last in probe order)
 	if pakFS != nil {
-		v.Add(pakFS) // real pak (prepended -> first in probe order)
+		// Wrap with wadOverlay so gfx/X.lmp probes fall through to
+		// gfx.wad inner lumps when the pak doesn't expose them as
+		// standalone files (Quake Remastered case for conchars.lmp,
+		// sbar.lmp, etc.). Non-gfx paths still resolve via the base
+		// pak unchanged.
+		v.Add(newWADOverlay(pakFS, "gfx.wad")) // real pak (prepended -> first in probe order)
 	}
 	reportLumpSources(v, pakFS, syn, []string{
 		"gfx/palette.lmp",
@@ -3672,14 +3678,28 @@ func makeColorMapLump() []byte {
 	return buf
 }
 
-// makeConcharsLump returns a 16384-byte synthetic 128x128 char sheet.
-// Each pixel = byte(i & 0xFF) so the glyph cells contain a gradient
-// of palette indices -- DrawCharacter treats non-zero as opaque, so
-// every glyph cell paints something onto the framebuffer.
+// makeConcharsLump returns a 16384-byte 128x128 char sheet built from
+// the inlined 8x8 ASCII bitmap font in
+// quake-tamago/concharsfont. Glyph cells contain real ASCII letter
+// shapes (palette index 0xDC on, 0 off in the lower bank; 0x67 on, 0
+// off in the upper "yellow" bank). DrawCharacter treats 0 as
+// transparent, so blank cells (space + non-printable codes) paint
+// nothing. This replaces the earlier synthetic fallback that filled
+// each cell with a single palette byte (= colored squares), which made
+// menu titles, console text, centerprint, and the intermission
+// scoreboard unreadable.
+//
+// The conchars sheet length is asserted against assets.ConCharsLumpSize
+// to keep the two constants in lock-step.
 func makeConcharsLump() []byte {
-	buf := make([]byte, assets.ConCharsLumpSize)
-	for i := range buf {
-		buf[i] = byte(i & 0xFF)
+	buf := concharsfont.Build(0xDC, 0x67)
+	if len(buf) != assets.ConCharsLumpSize {
+		// Build returns concharsfont.SheetSize (= 128*128 = 16384),
+		// matching ConCharsLumpSize by construction. The runtime
+		// guard is a paranoid sanity check so a mismatched constant
+		// surfaces as an obvious panic at boot rather than as silent
+		// downstream rendering corruption.
+		panic("concharsfont.Build size mismatch vs assets.ConCharsLumpSize")
 	}
 	return buf
 }
