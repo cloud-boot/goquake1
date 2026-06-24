@@ -57,6 +57,19 @@ func TestServe_AbsRootError(t *testing.T) {
 	}
 }
 
+func TestServe_FilepathAbsError(t *testing.T) {
+	muStartup.Lock()
+	defer muStartup.Unlock()
+	defer func(orig func(string) (string, error)) { filepathAbs = orig }(filepathAbs)
+	myErr := errors.New("abs boom")
+	filepathAbs = func(string) (string, error) { return "", myErr }
+
+	err := serve("127.0.0.1:0", t.TempDir(), false, io.Discard)
+	if err == nil || !errors.Is(err, myErr) {
+		t.Fatalf("serve(abs err): got %v want abs boom", err)
+	}
+}
+
 func TestServe_StatError(t *testing.T) {
 	muStartup.Lock()
 	defer muStartup.Unlock()
