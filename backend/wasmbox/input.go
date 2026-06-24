@@ -55,6 +55,9 @@ func (p *ProtocolInput) install(self js.Value) {
 		if !data.Truthy() {
 			return nil
 		}
+		if debugInput {
+			println("WASMBOX-MSG type=", data.Get("type").String())
+		}
 		typ := data.Get("type")
 		if !typ.Truthy() || typ.Type() != js.TypeString {
 			return nil
@@ -81,6 +84,9 @@ func (p *ProtocolInput) handleInput(event js.Value) {
 	button := jsInt(event.Get("button"))
 	x := jsInt(event.Get("x"))
 	y := jsInt(event.Get("y"))
+	if debugInput {
+		println("WASMBOX-INPUT:", kind, code, button)
+	}
 	out := DecodeInputEvent(&p.tracker, kind, code, button, x, y)
 	if len(out) == 0 {
 		return
@@ -130,3 +136,8 @@ func jsInt(v js.Value) int {
 	}
 	return v.Int()
 }
+
+// debugInput, when true, prints every decoded compositor input event to
+// the JS console so the browser-verification harness can confirm the
+// key/mouse stream actually reaches the wasm backend. Off by default.
+var debugInput = false
