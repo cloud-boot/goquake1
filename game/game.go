@@ -760,9 +760,8 @@ func (r *readerAt) ReadAt(p []byte, off int64) (int, error) {
 		return 0, errEOFReaderAt
 	}
 	n := copy(p, r.data[off:])
-	if int64(n)+off < r.size && n < len(p) {
-		return n, nil
-	}
+	// copy bounds n to min(len(p), size-off); a short copy therefore always
+	// means we hit the end of the data before filling p.
 	if n < len(p) {
 		return n, errEOFReaderAt
 	}
