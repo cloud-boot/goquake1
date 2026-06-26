@@ -599,6 +599,204 @@ func TestFrame_PropagatesRunClientCmdsError(t *testing.T) {
 	}
 }
 
+// boolToFloat is the inline 0/1 widen runClientCmds uses on each
+// button bit. Verified standalone so the table-of-bits cases below
+// don't have to re-prove the float encoding.
+func TestBoolToFloat(t *testing.T) {
+	if got := boolToFloat(true); got != 1 {
+		t.Errorf("boolToFloat(true) got %v want 1", got)
+	}
+	if got := boolToFloat(false); got != 0 {
+		t.Errorf("boolToFloat(false) got %v want 0", got)
+	}
+}
+
+// progsForButtons builds a Progs stub that mirrors progsForHost but
+// also declares button0 / button2 / impulse as EvFloat fields so the
+// runClientCmds button-propagation path has somewhere to land its
+// writes. Field offsets are unique + within the EntityFields=16
+// slot budget (16 floats * 4 bytes = 64 bytes per edict). v_angle
+// is added too so the existing pre-existing v_angle write lands
+// alongside the buttons.
+func progsForButtons() *progs.Progs {
+	strs := []byte{0}
+	classnameName := addStr(&strs, "classname")
+	originName := addStr(&strs, "origin")
+	movetypeName := addStr(&strs, "movetype")
+	solidName := addStr(&strs, "solid")
+	nextthinkName := addStr(&strs, "nextthink")
+	thinkName := addStr(&strs, "think")
+	vAngleName := addStr(&strs, "v_angle")
+	button0Name := addStr(&strs, "button0")
+	button2Name := addStr(&strs, "button2")
+	impulseName := addStr(&strs, "impulse")
+
+	return &progs.Progs{
+		Header:  progs.Header{EntityFields: 16},
+		Strings: strs,
+		FieldDefs: []progs.Def{
+			{Type: uint16(progs.EvString), Ofs: 1, SName: classnameName},
+			{Type: uint16(progs.EvVector), Ofs: 2, SName: originName},
+			{Type: uint16(progs.EvFloat), Ofs: 5, SName: movetypeName},
+			{Type: uint16(progs.EvFloat), Ofs: 6, SName: solidName},
+			{Type: uint16(progs.EvFloat), Ofs: 7, SName: nextthinkName},
+			{Type: uint16(progs.EvFunction), Ofs: 8, SName: thinkName},
+			{Type: uint16(progs.EvVector), Ofs: 9, SName: vAngleName},
+			{Type: uint16(progs.EvFloat), Ofs: 12, SName: button0Name},
+			{Type: uint16(progs.EvFloat), Ofs: 13, SName: button2Name},
+			{Type: uint16(progs.EvFloat), Ofs: 14, SName: impulseName},
+		},
+		Globals:    make([]byte, 64*4),
+		Statements: []progs.Statement{{Op: progs.OP_DONE}},
+		Functions:  []progs.Function{{FirstStatement: 0, SName: 0}},
+	}
+}
+
+// makeHostWithProgs is a makeHost variant that lets the caller swap
+// in a Progs with extra entvars fields (= progsForButtons here).
+func makeHostWithProgs(t *testing.T, bspBytes []byte, p *progs.Progs, maxClients int) *Host {
+	t.Helper()
+	vm := progs.NewVM(p)
+	cache := model.NewCache()
+	resolver := resolverFor(bspBytes)
+	h, err := NewHost(vm, cache, resolver, maxClients)
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	h.SetProgs(p)
+	return h
+}
+
+// runClientCmds writes self.button0 = 1 when Cmd.Buttons has the
+// ButtonAttack bit set. This is the missing link without which
+// every +attack on the client flips a wire bit the server reads but
+// the QC's W_Attack chain never sees -- so no shot fires.
+func TestRunClientCmds_PropagatesButtonAttackToButton0(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	p := progsForButtons()
+	h := makeHostWithProgs(t, bsp, p, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if _, _, err := h.ConnectLoopback(); err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	h.Static.Clients[0].Cmd.Buttons = server.ButtonAttack
+	if err := h.runClientCmds(); err != nil {
+		t.Fatalf("runClientCmds: %v", err)
+	}
+	ev, _ := progs.NewEntVars(p, h.Static.Clients[0].Edict)
+	got, err := ev.ReadFloat("button0")
+	if err != nil {
+		t.Fatalf("ReadFloat button0: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("button0 got %v want 1 (ButtonAttack bit set)", got)
+	}
+}
+
+// runClientCmds writes self.button0 = 0 when Cmd.Buttons does NOT
+// have the ButtonAttack bit set -- proves the release-edge case
+// (player let go of +attack mid-tic) is propagated.
+func TestRunClientCmds_PropagatesButtonAttackReleaseToButton0(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	p := progsForButtons()
+	h := makeHostWithProgs(t, bsp, p, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if _, _, err := h.ConnectLoopback(); err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	// Pre-seed the field to 1 so the test proves the write
+	// actually flips it down (not just that the default is 0).
+	ev, _ := progs.NewEntVars(p, h.Static.Clients[0].Edict)
+	_ = ev.WriteFloat("button0", 1)
+	h.Static.Clients[0].Cmd.Buttons = 0
+	if err := h.runClientCmds(); err != nil {
+		t.Fatalf("runClientCmds: %v", err)
+	}
+	got, err := ev.ReadFloat("button0")
+	if err != nil {
+		t.Fatalf("ReadFloat button0: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("button0 got %v want 0 (no ButtonAttack bit)", got)
+	}
+}
+
+// runClientCmds writes self.button2 = 1 when Cmd.Buttons has the
+// ButtonJump bit set.
+func TestRunClientCmds_PropagatesButtonJumpToButton2(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	p := progsForButtons()
+	h := makeHostWithProgs(t, bsp, p, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if _, _, err := h.ConnectLoopback(); err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	h.Static.Clients[0].Cmd.Buttons = server.ButtonJump
+	if err := h.runClientCmds(); err != nil {
+		t.Fatalf("runClientCmds: %v", err)
+	}
+	ev, _ := progs.NewEntVars(p, h.Static.Clients[0].Edict)
+	got, err := ev.ReadFloat("button2")
+	if err != nil {
+		t.Fatalf("ReadFloat button2: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("button2 got %v want 1 (ButtonJump bit set)", got)
+	}
+}
+
+// runClientCmds writes self.impulse = Cmd.Impulse (cast to float).
+// 27 is the upstream "+impulse 27" weapon-cycle code; the float
+// shape preserves the byte verbatim.
+func TestRunClientCmds_PropagatesImpulse(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	p := progsForButtons()
+	h := makeHostWithProgs(t, bsp, p, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if _, _, err := h.ConnectLoopback(); err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	h.Static.Clients[0].Cmd.Impulse = 27
+	if err := h.runClientCmds(); err != nil {
+		t.Fatalf("runClientCmds: %v", err)
+	}
+	ev, _ := progs.NewEntVars(p, h.Static.Clients[0].Edict)
+	got, err := ev.ReadFloat("impulse")
+	if err != nil {
+		t.Fatalf("ReadFloat impulse: %v", err)
+	}
+	if got != 27 {
+		t.Errorf("impulse got %v want 27", got)
+	}
+}
+
+// runClientCmds with progs that has no button0 / button2 / impulse
+// fields silently skips each write (test stubs with stripped progs).
+// progsForHost() lacks all three -- the call still succeeds.
+func TestRunClientCmds_MissingButtonFieldsAreSilentlySkipped(t *testing.T) {
+	bsp := buildHostBSP(t, `{ "classname" "worldspawn" }`, 1)
+	h, _ := makeHost(t, bsp, 1)
+	if err := h.SpawnServer("test", protocol.VersionNQ); err != nil {
+		t.Fatalf("SpawnServer: %v", err)
+	}
+	if _, _, err := h.ConnectLoopback(); err != nil {
+		t.Fatalf("ConnectLoopback: %v", err)
+	}
+	h.Static.Clients[0].Cmd.Buttons = server.ButtonAttack | server.ButtonJump
+	h.Static.Clients[0].Cmd.Impulse = 9
+	if err := h.runClientCmds(); err != nil {
+		t.Errorf("runClientCmds with no button fields: %v want nil", err)
+	}
+}
+
 // --- SpawnServer ----------------------------------------------------------
 
 func TestSpawnServer_HappyPath(t *testing.T) {

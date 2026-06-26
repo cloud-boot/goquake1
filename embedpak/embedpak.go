@@ -6,7 +6,6 @@ package embedpak
 
 import (
 	"bytes"
-	_ "embed"
 	"errors"
 	"io/fs"
 
@@ -14,15 +13,11 @@ import (
 	"github.com/go-quake1/engine/vfs"
 )
 
-// embeddedBytes is the build-time pak blob. The default file
-// embedpak/empty.pak is a 12-byte stub (valid PACK header, zero
-// directory entries) so the package always builds without requiring a
-// real shareware pak0.pak to be present on disk. Operators swap the
-// file in by overwriting empty.pak with id Software's freely
-// redistributable shareware archive.
-//
-//go:embed empty.pak
-var embeddedBytes []byte
+// embeddedBytes is the build-time pak blob. The definition lives in
+// embedded_default.go / embedded_none.go gated by the
+// `no_embed_assets` build tag so an OCI-streaming wasm build can
+// strip the (potentially 180 MB) blob from the binary while host /
+// tamago builds keep embedding it.
 
 // emptyPakSize is the size in bytes of the 12-byte placeholder
 // header (PACK magic + dirofs int32 + dirlen int32). Any blob this

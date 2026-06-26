@@ -39,6 +39,49 @@ type FrameContext struct {
 	// overlay the 2D layers (console + notify) on top WITHOUT
 	// wiping the 3D pixels first.
 	SkipBackgroundFill bool
+
+	// CenterPrintText is the optional banner string Compose2D draws
+	// horizontally-centered at y = fb.Height * 2 / 5 (the upstream
+	// SCR_CheckDrawCenterString anchor point: roughly 40% of screen
+	// height). Empty string = no draw. tyrquake: scr_centerstring.
+	CenterPrintText string
+
+	// CenterPrintExpiry is the wall-clock (in Now's units) at which
+	// the centerprint stops being drawn. When Now >= CenterPrintExpiry
+	// the centerprint is treated as expired (no draw), matching
+	// upstream's scr_centertime_off countdown. Zero = no active
+	// centerprint (a freshly-zeroed FrameContext draws nothing).
+	CenterPrintExpiry float32
+
+	// Intermission, when true, switches Compose2D into intermission
+	// mode: the centerprint banner is suppressed (intermission
+	// supersedes any active "you got the shotgun" overlay -- mirrors
+	// tyrquake's scr_centertime_off = 0 reset inside the
+	// svc_intermission arm), and IntermissionLines is drawn as a
+	// centered block of horizontally-centered text rows instead.
+	// The in-game status-bar HUD is suppressed too once that layer
+	// lands; the flag is plumbed now so callers wiring it from
+	// [client.State.Intermission] don't need a follow-up change.
+	//
+	// IntermissionLines is the per-line text block (top-to-bottom,
+	// each line drawn horizontally centered on Screen.CenterX).
+	// An empty slice + Intermission == true draws nothing
+	// intermission-side -- the renderer is tolerant of "Intermission
+	// flag flipped but the runloop has not composed the line block
+	// yet" so the next frame just renders the empty intermission
+	// screen.
+	//
+	// Vertical layout: the block is centered around y = fb.Height /
+	// 2; lines step by [CharHeight] pixels each. Out-of-frame rows
+	// are clipped per-character by [DrawCharacter].
+	//
+	// tyrquake: SCR_DrawIntermission + Sbar_IntermissionOverlay --
+	// the C upstream draws a "complete" header pic + per-stat rows
+	// (TIME / SECRETS / KILLS) inside the dimmed framebuffer. The
+	// Go port collapses that into one slice the runloop composes
+	// from the client's stat bank.
+	Intermission      bool
+	IntermissionLines []string
 }
 
 var (
@@ -54,6 +97,8 @@ var (
 //     when ctx.SkipBackgroundFill is true).
 //  2. If the console is open (Screen.ConCurrent > 0): DrawConsole.
 //  3. DrawNotify the recent-rows overlay.
+//  4. If CenterPrintText is non-empty AND Now < CenterPrintExpiry,
+//     DrawCenteredString the banner at y = fb.Height * 2 / 5.
 //
 // Returns:
 //
@@ -101,6 +146,63 @@ func Compose2D(fb *FrameBuffer, ctx FrameContext) error {
 		return err
 	}
 
+	// Intermission overlay supersedes the centerprint banner. When
+	// the intermission flag is set, draw the per-line scoreboard /
+	// finale text block centered vertically around fb.Height / 2.
+	// Centerprint is intentionally NOT drawn in this branch; the
+	// applyIntermission / applyFinale arms also clear the
+	// centerprint state, but the render side guards too in case a
+	// caller composes the FrameContext without going through the
+	// client.State plumbing.
+	if ctx.Intermission {
+		if err := drawIntermission(fb, ctx.Chars, ctx.Screen.CenterX, ctx.IntermissionLines); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Centerprint overlay. Drawn on top of console + notify so the
+	// banner stays visible during a drop-down. Active iff the text is
+	// non-empty AND the expiry is in the future (matches tyrquake's
+	// scr_centertime_off > 0 guard in SCR_CheckDrawCenterString).
+	if ctx.CenterPrintText != "" && ctx.Now < ctx.CenterPrintExpiry {
+		// Anchor at 40% of screen height; horizontally centered on
+		// CenterX (cached on Screen so the per-pixel hot loops don't
+		// divide). tyrquake's SCR_DrawCenterString uses
+		// vid.height * 0.35 for single-line messages; we round up to
+		// 2/5 to keep the integer division clean and still hit the
+		// upstream anchor band.
+		y := fb.Height * 2 / 5
+		if err := DrawCenteredString(fb, ctx.Chars, ctx.Screen.CenterX, y, ctx.CenterPrintText); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// drawIntermission lays out the per-line scoreboard / finale text
+// block centered vertically around fb.Height / 2. Each line is
+// horizontally centered on centerX via [DrawCenteredString]; lines
+// step by [CharHeight] pixels. An empty slice draws nothing (the
+// renderer is tolerant of "Intermission flag flipped but no lines
+// composed yet" -- the next frame just renders the empty
+// intermission screen).
+//
+// Propagates the first DrawCenteredString error (which can only
+// be ErrDrawCharsShape from a malformed chars Pic).
+func drawIntermission(fb *FrameBuffer, chars *Pic, centerX int, lines []string) error {
+	n := len(lines)
+	if n == 0 {
+		return nil
+	}
+	blockHeight := n * CharHeight
+	y0 := fb.Height/2 - blockHeight/2
+	for i, line := range lines {
+		if err := DrawCenteredString(fb, chars, centerX, y0+i*CharHeight, line); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

@@ -65,6 +65,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"strings"
 	"time"
 
 	_ "github.com/go-virtio/validate/board"
@@ -84,28 +85,48 @@ import (
 	"github.com/go-quake1/engine/bspfile/synthbsp"
 	"github.com/go-quake1/engine/bsprender"
 	"github.com/go-quake1/engine/client"
+	"github.com/go-quake1/engine/demo"
+	"github.com/go-quake1/engine/embedmusic"
 	"github.com/go-quake1/engine/embedpak"
 	enginehost "github.com/go-quake1/engine/host"
+	"github.com/go-quake1/engine/mathlib"
 	"github.com/go-quake1/engine/mdl"
+	"github.com/go-quake1/engine/menu"
 	"github.com/go-quake1/engine/model"
+	enginemusic "github.com/go-quake1/engine/music"
 	"github.com/go-quake1/engine/progs"
 	"github.com/go-quake1/engine/protocol"
+	"github.com/go-quake1/engine/quake-tamago/concharsfont"
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/runloop"
 	engineserver "github.com/go-quake1/engine/server"
 	enginesound "github.com/go-quake1/engine/sound"
+	enginespr "github.com/go-quake1/engine/spr"
 	"github.com/go-quake1/engine/vfs"
 	"github.com/go-quake1/engine/wad"
 	"github.com/go-quake1/engine/world"
 )
 
 // fbWidth / fbHeight are the framebuffer dimensions handed to
-// virtio-gpu's SetupFramebuffer. 1280x1024 is the boot resolution;
-// QEMU GTK/Cocoa display is resizable so the host window scales the
-// scanout buffer up or down freely.
+// virtio-gpu's SetupFramebuffer. 320x240 matches vanilla DOS Quake
+// (320x200/320x240) so the software span rasterizer's per-pixel
+// perspective-correct texture mapping stays affordable in QEMU TCG.
+//
+// History: this used to be 1280x1024 = 1.3 megapixels per frame,
+// which in pure-Go on QEMU TCG (no KVM) clocked ~0.85 tics per
+// wall-clock second -- effectively a slideshow, AND the engine's
+// renderer only paints the central viewport so the outer pixels
+// stayed at their (palette idx 0x02 / 0x20) clear colour. From a
+// distance that read as "colours wrong" + "doesn't look like
+// 1280x1024" because the rendered scene was a small inset in a
+// mostly-grey field. 320x240 is 76800 pixels (16.8x less work) so
+// the same TCG host now targets 30+ fps, the renderer fills the
+// whole surface, and QEMU's cocoa / gtk display layer (zoom-to-fit
+// = on, set in Taskfile.yml) upscales the 320x240 scanout to
+// whatever size the user drags the host window to.
 const (
-	fbWidth  = 1280
-	fbHeight = 1024
+	fbWidth  = 320
+	fbHeight = 240
 )
 
 // demoOrbit toggles the programmatic camera walk that the headless
@@ -182,6 +203,67 @@ type stubHost struct{}
 // + sv_main land.
 func (stubHost) Frame(_ float32) error { return nil }
 
+// changelevelHostFramer wraps an [enginehost.Host] so the per-tic
+// [runloop.Runner.RunFrame] step also polls
+// [enginehost.Host.ConsumeChangelevel] post-Frame. On a positive
+// poll the wrapper logs the requested map slug + drives the
+// SpawnServer re-entry into the new map.
+//
+// Without this wrapper the QC `changelevel` builtin would flip
+// [enginehost.Host.PendingChangelevel] = true but nobody would act
+// on it; the next per-tic Frame would just re-run the same map
+// indefinitely, so the player can never progress past
+// trigger_changelevel volumes.
+//
+// SpawnServer failures (corrupt BSP for the requested map, missing
+// pak entry, etc.) are logged + the player stays on the current
+// map (the previous Server.Active state is preserved by the
+// in-place SpawnServer call). The Frame error itself is not
+// surfaced -- a bad changelevel must not kill the runloop.
+type changelevelHostFramer struct {
+	host *enginehost.Host
+}
+
+// Frame runs one host tic, then polls + acts on any pending
+// changelevel request. The Frame error is surfaced verbatim; the
+// post-Frame SpawnServer error (if any) is logged but not returned
+// so a bad map name can't kill the loop.
+func (c *changelevelHostFramer) Frame(dt float32) error {
+	if err := c.host.Frame(dt); err != nil {
+		return err
+	}
+	if pending, mapSlug := c.host.ConsumeChangelevel(); pending {
+		fmt.Printf("QUAKE: level change requested -- nextmap=%q\n", mapSlug)
+
+		// Push svc_intermission + the four end-of-level stat
+		// slots into the server's ReliableDatagram BEFORE
+		// re-spawning into the new map -- the SpawnServer call
+		// would otherwise clear the buffers. HarvestIntermissionStats
+		// pulls the per-map tally from QC named globals
+		// (total_secrets / found_secrets / total_monsters /
+		// killed_monsters); missing globals leave the existing
+		// stats untouched (= zero on first call). EmitIntermission
+		// is logged but its failure is not surfaced -- a bad write
+		// must not kill the loop.
+		c.host.HarvestIntermissionStats()
+		if err := c.host.EmitIntermission(); err != nil {
+			fmt.Printf("QUAKE: EmitIntermission failed: %v\n", err)
+		} else {
+			s := c.host.LastIntermissionStats
+			fmt.Printf("QUAKE: intermission active=1 (secrets=%d/%d monsters=%d/%d)\n",
+				s.FoundSecrets, s.TotalSecrets, s.KilledMonsters, s.TotalMonsters)
+		}
+
+		if err := c.host.SpawnServer(mapSlug, c.host.Server.Protocol); err != nil {
+			fmt.Printf("QUAKE: changelevel SpawnServer(%q) failed: %v -- staying on previous map\n",
+				mapSlug, err)
+		} else {
+			fmt.Printf("QUAKE: changelevel SpawnServer(%q) ok -- now on new map\n", mapSlug)
+		}
+	}
+	return nil
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Printf("QUAKE: FAIL %v\n", err)
@@ -238,12 +320,34 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("OpenVirtioSound: %w", err)
 		}
-		// streamID 0; the PCMSetParams → PCMPrepare → PCMStart
-		// handshake is a follow-up. SampleRate() returns 0 until then,
-		// which the realdev wrapper documents as the "not yet
-		// negotiated" sentinel.
-		audioDev = realdev.WrapAudio(vs, 0)
-		fmt.Printf("QUAKE: sound=%#04x:%#04x\n", sndDev.Vendor, sndDev.Device)
+		// Diagnostic PCMInfo dump -- helps debug rate / format
+		// mismatches when SetupAudio rejects a tuple.
+		if infos, ierr := vs.PCMInfo(); ierr == nil {
+			for i, e := range infos {
+				fmt.Printf("QUAKE: snd-stream[%d] dir=%d rates=%#x formats=%#x ch=%d-%d\n",
+					i, e.Direction, e.Rates, e.Formats, e.ChannelsMin, e.ChannelsMax)
+			}
+		} else {
+			fmt.Printf("QUAKE: snd-PCMInfo err=%v\n", ierr)
+		}
+		// Drive the PCM lifecycle: PCMInfo -> PCMSetParams -> PCMPrepare
+		// -> PCMStart. After this the device DMA-consumes from the tx
+		// virtqueue and emits PCM to the host audio backend (the
+		// -audiodev wav,id=audio0 path used by `task qemu-headless`
+		// writes the mixed result to /tmp/quake-audio.wav). The engine
+		// mixer paints 11025 Hz stereo S16 frames; the WrapAudio
+		// adapter upsamples to the negotiated device rate before
+		// pushing to the tx virtqueue. A failure here logs + falls
+		// through to silent operation so the renderer still boots and
+		// we can see the PCMInfo dump above.
+		res, serr := realdev.SetupAudio(vs, realdev.DefaultAudioStreamConfig)
+		if serr != nil {
+			fmt.Printf("QUAKE: SetupAudio err=%v (engine runs silent)\n", serr)
+		} else {
+			audioDev = realdev.WrapAudio(vs, res.StreamID, enginesound.DefaultSampleRate)
+			fmt.Printf("QUAKE: sound=%#04x:%#04x stream=%d device-rate=%dHz mixer-rate=%dHz ch=%d fmt=%d (virtio-snd stream started)\n",
+				sndDev.Vendor, sndDev.Device, res.StreamID, res.Rate, enginesound.DefaultSampleRate, res.Channels, res.Format)
+		}
 	} else {
 		fmt.Printf("QUAKE: no virtio-snd device; engine runs silent\n")
 	}
@@ -281,7 +385,12 @@ func run() error {
 	syn := syntheticAssets()
 	v.Add(syn) // fallback layer (prepended -> ends up last in probe order)
 	if pakFS != nil {
-		v.Add(pakFS) // real pak (prepended -> first in probe order)
+		// Wrap with wadOverlay so gfx/X.lmp probes fall through to
+		// gfx.wad inner lumps when the pak doesn't expose them as
+		// standalone files (Quake Remastered case for conchars.lmp,
+		// sbar.lmp, etc.). Non-gfx paths still resolve via the base
+		// pak unchanged.
+		v.Add(newWADOverlay(pakFS, "gfx.wad")) // real pak (prepended -> first in probe order)
 	}
 	reportLumpSources(v, pakFS, syn, []string{
 		"gfx/palette.lmp",
@@ -463,9 +572,17 @@ func run() error {
 	// 9b. Pick the HostFramer the runner drives per-tic. When the real
 	//     host built successfully it goes straight in; otherwise the
 	//     stub keeps RunFrame's host.Frame call infallible.
+	//
+	//     The real host is wrapped in a [changelevelHostFramer] so the
+	//     post-Frame poll of [enginehost.Host.ConsumeChangelevel] fires
+	//     each tic; on a positive poll the wrapper logs the transition
+	//     + drives a fresh SpawnServer into the requested map slug.
+	//     Without the wrapper the QC `changelevel` builtin would flip
+	//     the flag but nobody would act on it, and the player would
+	//     stay parked on the previous map forever.
 	var hostFramer runloop.HostFramer = stubHost{}
 	if realHost != nil {
-		hostFramer = realHost
+		hostFramer = &changelevelHostFramer{host: realHost}
 	}
 
 	// 10. Construct the Runner via NewRunnerFromVFS. The runner now
@@ -487,14 +604,12 @@ func run() error {
 		return fmt.Errorf("NewRunnerFromVFS: %w", err)
 	}
 
-	// 11. Print something visible into the console so the rendered
-	//     frame is not blank. Drop the console fully open so the lines
-	//     are visible from frame 0 (otherwise ConCurrent=0 keeps the
-	//     drop-down closed and the synthetic conchars sheet has nothing
-	//     to draw against).
+	// 11. Seed the console buffer with a couple of bring-up lines. The
+	//     console drop-down stays closed (ConCurrent=0) so it doesn't
+	//     overlay the 3D scene; the user can drop it open via the
+	//     in-game console binding when that lands.
 	runner.Console.Print("PURE-GO QUAKE 1 -- TamaGo + go-virtio bring-up\n")
 	runner.Console.Print("runloop wired: input -> client.Tick -> host.Frame -> Pre2DDraw\n")
-	runner.Screen.ConCurrent = runner.Screen.ConLines
 
 	// 11b. Seed the sound pool with a few WAV samples from the pak so
 	//     the runloop's existing Paint + QueueAudio path has something
@@ -543,6 +658,167 @@ func run() error {
 			precached, mixerSamples, active)
 	}
 
+	// 11c-bis. Music driver wiring. Hand the runloop a pak-backed
+	//          resolver for the canonical "music/track%02d.ogg" path
+	//          + the pure-Go vorbis decoder factory. The svc_cdtrack
+	//          arm in the client's Apply layer writes the wire bytes
+	//          onto client.State.MusicTrack + MusicLoopTrack + bumps
+	//          State.MusicEpoch; the runloop's per-tic tickMusic
+	//          dispatch detects the epoch advance, opens the matching
+	//          OGG, and mixes the decoded PCM on top of the SFX
+	//          accumulator before QueueAudio. Missing tracks log ONCE
+	//          per (track, loopTrack) pair so a shareware pak (which
+	//          omits the music/ assets) stays boot-clean instead of
+	//          spamming the QEMU serial stream on every signon.
+	runner.MusicOpen = func(track int) ([]byte, bool) {
+		if track <= 0 {
+			return nil, false
+		}
+		// Canonical 2-digit zero-padded form: track01.ogg .. track99.ogg.
+		path := fmt.Sprintf("%s%02d%s", enginemusic.PathPrefix, track, enginemusic.PathSuffix)
+		// Try the pak first (user can override embedded tracks by
+		// shipping music/trackXX.ogg inside pak0).
+		if pakFS != nil {
+			if blob, ok := tryReadPakFile(pakFS, path); ok && len(blob) > 64 {
+				return blob, true
+			}
+		}
+		// Fall back to the embedded id1/music/ tracks. The placeholder
+		// files committed to embedmusic/ are 12 bytes (oggvorbis will
+		// reject them, music.Streamer logs silent fallback); replacing
+		// them with real id1/music/trackXX.ogg from the Quake archive
+		// enables in-game music with no other change.
+		blob, err := embedmusic.MusicFS.ReadFile(fmt.Sprintf("track%02d.ogg", track))
+		if err != nil || len(blob) < 64 {
+			return nil, false
+		}
+		return blob, true
+	}
+	runner.MusicDecoder = enginemusic.NewVorbisDecoder
+	runner.MusicVolume = enginemusic.DefaultVolume
+	runner.MusicMissingLog = func(track int) {
+		fmt.Printf("QUAKE: music track%02d.ogg missing -- silent\n", track)
+	}
+
+	// 11d. Particle pool wiring. One 2048-slot pool per process; the
+	//      runner steps it each tic (Pool.Run with sv_gravity = 800);
+	//      the Pre2DDraw closure draws it after the alias entities;
+	//      QC builtin #48 emits into it via the VM's particleSink
+	//      bridge; the client's svc_particle + svc_temp_entity arms
+	//      emit into it via the State.EmitParticles / .EmitTempEntity
+	//      callbacks. A shared cheap-LCG-derived byte source feeds
+	//      both Emit (which needs ~6 bytes per particle) and
+	//      EmitTrail (which needs ~3 per step); using the gameplay
+	//      random seed +0x01 keeps the streams decorrelated.
+	particlePool := render.NewPool()
+	particleRNG := newLCGByteSource(0xC0FFEF)
+	runner.ParticlePool = particlePool
+	runner.ParticleGravity = 800
+
+	// QC builtin #48 -- particle(org, dir, color, count). Bridges the
+	// VM into the pool via Pool.Emit (= R_RunParticleEffect). Without
+	// this the SpawnBlood / TraceAttack puff-spawn QC calls every
+	// gunshot makes are silent no-ops + the demo runs particle-free.
+	if realHost != nil && realHost.VM != nil {
+		realHost.VM.SetParticleSink(func(origin, dir [3]float32, color, count int) {
+			particlePool.Emit(origin, dir, byte(color), count, float32(realHost.Server.Time), particleRNG)
+		})
+	}
+
+	// svc_particle wire arm -- the same shape as the QC builtin but
+	// driven directly by the server (e.g. flash-only effects the
+	// progs.dat fires without going through PF_particle). Apply's
+	// DecodedParticle arm now dispatches into this sink.
+	clientState.EmitParticles = func(origin, dir [3]float32, color, count int) {
+		now := clientState.MsgTime
+		particlePool.Emit(origin, dir, byte(color), count, now, particleRNG)
+	}
+
+	// Load the s_explod.spr explosion sprite. id1 ships it at one of
+	// two canonical paths (progs/ on early shareware, sprites/ on the
+	// retail release); try both, and fall back to nil so the temp-
+	// entity arm degrades to particles-only when the asset is missing.
+	// The sprite count log goes out unconditionally so the QEMU serial
+	// stream proves whether the bring-up has billboarded explosions
+	// available or is running particles-only.
+	explosionSprite, explosionPath := loadExplosionSprite(pakFS)
+	spritesLoaded := 0
+	if explosionSprite != nil {
+		spritesLoaded = 1
+	}
+	fmt.Printf("QUAKE: sprites loaded %d (s_explod path=%q)\n",
+		spritesLoaded, explosionPath)
+
+	// Ephemeral client-side billboard pool. Holds in-flight explosion
+	// sprites: TE_EXPLOSION spawns one, the per-tic Pre2DDraw walks
+	// them via DrawSpriteAtTime. Spawning a sprite is additive on top
+	// of the particle burst -- the upstream renders BOTH at impact
+	// (R_ParticleExplosion fires the 1024-particle shower AND the
+	// CL_NewTempEntity arm queues the s_explod.spr billboard).
+	tempSpritePool := client.NewTempSpritePool()
+
+	// Lightning-bolt alias models (bolt1/bolt2/bolt3.mdl, one per
+	// TE_LIGHTNING* sub-type). Each is a 30-unit +X-aligned tile mesh
+	// the per-tic Pre2DDraw chains end-to-end along the beam vector.
+	// Missing entries (placeholder pak, or a build that ships only a
+	// subset) silently degrade: the EmitBeam arm logs nothing + the
+	// per-tic Walk renders the segments only when the matching mdl
+	// resolved. tyrquake: cl_main.c precaches progs/bolt[1-3].mdl
+	// statically; the Go port pulls them out of pak0 on demand.
+	boltModels, boltSkins, boltLoaded := loadBoltModels(pakFS)
+	fmt.Printf("QUAKE: bolt models loaded %d/3 (TE_LIGHTNING1/2/3 + TE_BEAM)\n", boltLoaded)
+
+	// Client-side lightning-beam pool. tyrquake: cl_beams[MAX_BEAMS].
+	// Holds in-flight bolts: each TE_LIGHTNING* / TE_BEAM message
+	// spawns or extends a slot; the per-tic Pre2DDraw walks them via
+	// BeamPool.Walk and draws each tile via DrawAliasInterpLit. The
+	// pool ages out slots whose .die < now (BeamLifetime = 0.2 s).
+	beamPool := client.NewBeamPool()
+
+	// svc_temp_entity point-effect arm. Wire the bigger-burst pool
+	// helpers (R_ParticleExplosion / R_LavaSplash / R_TeleportSplash)
+	// per TE_* kind; the smaller dust-burst kinds (Spike / Gunshot /
+	// SuperSpike / WizSpike / KnightSpike) collapse to Emit with the
+	// upstream's canonical (count, color) shorthand.
+	clientState.EmitTempEntity = func(kind int, origin [3]float32) {
+		now := clientState.MsgTime
+		switch kind {
+		case protocol.TEExplosion, protocol.TETarExplosion:
+			render.ParticleExplosion(particlePool, origin, now, particleRNG)
+			// Stack the billboard on top when the sprite is present;
+			// silent fall-back to particles-only otherwise.
+			if explosionSprite != nil {
+				tempSpritePool.Spawn(origin, now, 0)
+			}
+		case protocol.TELavaSplash:
+			render.LavaSplash(particlePool, origin, now, particleRNG)
+		case protocol.TETeleport:
+			render.TeleportSplash(particlePool, origin, now, particleRNG)
+		case protocol.TEGunshot:
+			particlePool.Emit(origin, [3]float32{}, 0, 20, now, particleRNG)
+		case protocol.TESpike, protocol.TESuperSpike:
+			particlePool.Emit(origin, [3]float32{}, 0, 10, now, particleRNG)
+		case protocol.TEKnightSpike:
+			particlePool.Emit(origin, [3]float32{}, 226, 20, now, particleRNG)
+		case protocol.TEWizSpike:
+			particlePool.Emit(origin, [3]float32{}, 20, 30, now, particleRNG)
+		}
+	}
+	fmt.Printf("QUAKE: particle pool wired -- cap=%d gravity=%v (QC #48 + svc_particle + svc_temp_entity)\n",
+		render.MaxParticles, runner.ParticleGravity)
+
+	// svc_temp_entity lightning arm. The wire decoder fires this for
+	// TE_LIGHTNING1 / 2 / 3 / TE_BEAM with the owner entity + start +
+	// end of the traceline the server emitted. We queue the bolt into
+	// the client-side BeamPool; the per-tic Pre2DDraw walks it and
+	// renders each 30-unit tile via DrawAliasInterpLit on the matching
+	// bolt mdl. tyrquake: CL_ParseBeam in cl_tent.c -- the same shape.
+	clientState.EmitBeam = func(kind, ent int, start, end [3]float32) {
+		beamPool.Spawn(kind, ent, start, end, clientState.MsgTime)
+	}
+	fmt.Printf("QUAKE: beam pool wired -- cap=%d lifetime=%vs segment=%v (TE_LIGHTNING1/2/3 + TE_BEAM)\n",
+		client.MaxBeams, client.BeamLifetime, client.BeamSegmentLength)
+
 	// 12. Build the Pre2DDraw hook (BSP load, mark/walk contexts,
 	//     synthetic texture, identity colormap) + anchor the camera
 	//     origin at pickInMapCamera. The closure is wired onto the
@@ -590,12 +866,90 @@ func run() error {
 	fmt.Printf("QUAKE: sbar -- loaded %d/%d assets, missing: %v\n",
 		sbarLoaded, sbarTotal, sample)
 
-	if err := setupRenderer(runner, pakFS, realHost, playerSlot, aliasModels, aliasSkins, sbarAssets); err != nil {
+	if err := setupRenderer(runner, pakFS, realHost, playerSlot, aliasPrecache, aliasModels, aliasSkins, sbarAssets, particleRNG, tempSpritePool, explosionSprite, beamPool, boltModels, boltSkins); err != nil {
 		return fmt.Errorf("setupRenderer: %w", err)
+	}
+
+	// 12c. Wire the main menu. The engine boots into StateMain so the
+	//      first frame the QEMU display surfaces is the title plaque,
+	//      NOT the 3D scene -- matches the upstream cold-boot flow
+	//      (M_Menu_Main_f called from Host_InitLocal). The runloop
+	//      freezes the world pass while the menu is up + draws the
+	//      menu overlay into r.FrameBuffer in the Pre2DDraw slot;
+	//      pressing Enter on the skill picker transitions to
+	//      StateNone + the next tic kicks the host into per-tic
+	//      simulation. Esc-while-playing reopens the menu so a paused
+	//      runloop is one keystroke away at any time.
+	menuAssets, menuLoaded, menuTotal := loadMenuAssets(pakFS)
+	fmt.Printf("QUAKE: menu -- loaded %d/%d assets, dots=%d\n",
+		menuLoaded, menuTotal, len(menuAssets.MenuDots))
+	runner.Menu = menu.New()
+	runner.MenuAssets = menuAssets
+	fmt.Printf("QUAKE: menu state=%s cursor=%d (boot lands on the main menu, world pass frozen until player picks Skill)\n",
+		runner.Menu.State, runner.Menu.CursorIndex)
+
+	// 12d. Wire the attract-loop demo. demo1.dem is the vanilla
+	//      cold-boot teaser ("you can't quit, you can only quit later"
+	//      narration tour through E1M1); when the pak ships it the
+	//      runloop plays it under the title menu + restarts on EOF so
+	//      the player sees motion behind the overlay. Any KeyDown
+	//      event halts the demo (vanilla "any key drops you out of the
+	//      attract loop"). With no pak (placeholder build) the demo
+	//      slot is left nil + the runloop falls back to the menu-only
+	//      title screen.
+	if pakFS != nil {
+		if d := loadAttractDemo(pakFS, "demo1.dem"); d != nil {
+			d.PlayerOpts = demo.PlayerOpts{
+				Protocol:       protocol.VersionNQ,
+				TickDelta:      1.0 / 20.0,
+				SkipUnknownSvc: true,
+			}
+			d.OnFrame = logDemoFrame
+			runner.Demo = d
+			fmt.Printf("QUAKE: attract-loop demo wired -- source=%q\n", "demo1.dem")
+		} else {
+			fmt.Printf("QUAKE: attract-loop demo skipped -- demo1.dem not in pak\n")
+		}
+	} else {
+		fmt.Printf("QUAKE: attract-loop demo skipped -- no pak available\n")
 	}
 
 	fmt.Printf("QUAKE: entering RunUntilQuit (realHost=%v)\n", realHost != nil)
 	return runner.RunUntilQuit()
+}
+
+// loadAttractDemo opens name inside pakFS + builds a [runloop.Demo]
+// with a Restart closure that re-opens the same entry on io.EOF (so
+// the attract loop runs forever in the background). Returns nil when
+// the entry is missing OR malformed -- the runloop's nil-Demo path
+// degrades gracefully to a static title screen.
+func loadAttractDemo(pakFS fs.FS, name string) *runloop.Demo {
+	open := func() (*demo.Reader, error) {
+		data, ok := tryReadPakFile(pakFS, name)
+		if !ok {
+			return nil, fmt.Errorf("attract demo %q not found in pak", name)
+		}
+		return demo.NewReader(bytes.NewReader(data))
+	}
+	rd, err := open()
+	if err != nil {
+		return nil
+	}
+	return &runloop.Demo{
+		Reader:  rd,
+		Restart: open,
+	}
+}
+
+// logDemoFrame is the [runloop.Demo.OnFrame] callback the embed wires
+// so the QEMU serial trace surfaces actual per-tic demo progression
+// without flooding the log (printed every 60 tics, ~once per second
+// at the 20-Hz default tic rate). Headless validation runs grep for
+// "QUAKE: demo playback frame" to prove the attract loop is alive.
+func logDemoFrame(frame int, angles [3]float32) {
+	if frame%60 == 0 {
+		fmt.Printf("QUAKE: demo playback frame %d viewAngles=%v\n", frame, angles)
+	}
 }
 
 // setupRenderer loads the BSP, builds the mark/walk contexts +
@@ -629,7 +983,7 @@ func run() error {
 // trace stack on purpose: the goal of this bring-up is "key press moves
 // the camera", not "physically correct movement". A follow-up batch
 // swaps the integrator for the real SV_Physics tick.
-func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int, aliasModels []*mdl.Model, aliasSkins []*render.Pic, sbarAssets *render.SBarAssets) error {
+func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Host, playerSlot int, aliasPrecache []string, aliasModels []*mdl.Model, aliasSkins []*render.Pic, sbarAssets *render.SBarAssets, particleRNG func() byte, tempSpritePool *client.TempSpritePool, explosionSprite *enginespr.Sprite, beamPool *client.BeamPool, boltModels [3]*mdl.Model, boltSkins [3]*render.Pic) error {
 	// 1. Source the BSP bytes: real pak0.pak first, synthbsp fallback.
 	bspBytes, size, err := loadBSP(pakFS)
 	if err != nil {
@@ -664,12 +1018,24 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	//     the BSP's own (id1) palette; the asset VFS now serves the
 	//     real gfx/palette.lmp out of the embedded pak, so the
 	//     destination RGBA the renderer emits is in true id1 colours.
-	miptexPics, loaded, total, err := loadMiptexPics(file)
+	miptexPics, miptexNames, loaded, total, err := loadMiptexPicsNamed(file)
 	if err != nil {
 		return fmt.Errorf("loadMiptexPics: %w", err)
 	}
 	fmt.Printf("QUAKE: loaded %d miptexes from BSP (total slots: %d, loaded: %d, null: %d)\n",
 		loaded, total, loaded, total-loaded)
+	// Census the special-surface population for the boot log so we
+	// can confirm sky + liquid dispatch will actually fire on this map.
+	var nSky, nTurb int
+	for _, n := range miptexNames {
+		switch {
+		case strings.HasPrefix(n, "sky"):
+			nSky++
+		case strings.HasPrefix(n, "*"):
+			nTurb++
+		}
+	}
+	fmt.Printf("QUAKE: miptex specials -- sky=%d liquid=%d\n", nSky, nTurb)
 
 	// 3. Identity colormap: every (light, src) -> src. Lighting is
 	//    full-bright in this MVP; the colormap reuse keeps the path
@@ -750,6 +1116,15 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 	markCtx := bsprender.NewMarkContext(bm)
 	var surfaces bsprender.SurfaceList
 	frameCount := 0
+	// prevEntityOrigin tracks the last-seen Origin per entity slot so
+	// per-tic rocket/grenade/gib trails can emit one particle stream
+	// per cm of motion between ticks. Mirrors tyrquake's per-entity
+	// trail_origin field in CL_LinkEntities -- on each tic the
+	// closure asks `if model is trail-bearing AND prevOrigin known`,
+	// emits a Pool.EmitTrail from prevOrigin to current Origin, then
+	// updates prevOrigin. Map keys are entity numbers (matches the
+	// client State.Entities key space).
+	prevEntityOrigin := make(map[int][3]float32)
 	// loggedWireSpawn latches the one-shot "server-side Spawned
 	// observed true" trace so the line appears at most once per
 	// process lifetime. Since the per-tic SendEntityUpdates broadcast
@@ -930,6 +1305,19 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 		// delta above the entity's base origin.
 		origin[2] += runner.Client.ViewHeightOffset
 
+		// Publish the listener basis to the host so per-tic QC-driven
+		// sound dispatch (builtinSound / builtinAmbientSound) can drive
+		// sound.Spatialize via [enginehost.Host.StartSoundAt] /
+		// [enginehost.Host.AmbientSoundAt]. The right axis is the
+		// second return of mathlib.AngleVectors -- the listener's right
+		// ear projection that determines stereo balance. tyrquake's
+		// S_Update updates the listener every frame via
+		// AngleVectors(cl.viewangles, ...); this is the equivalent.
+		if realHost != nil {
+			_, lright, _ := mathlib.AngleVectors(mathlib.Vec3(viewAngles))
+			realHost.SetListener(origin, [3]float32(lright))
+		}
+
 		rd := &render.RefDef{
 			VRect:      render.VRect{Width: fb.Width, Height: fb.Height},
 			ViewAngles: viewAngles,
@@ -1048,7 +1436,11 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				soundsStarted = realHost.LastSoundsStarted
 				ambientsStarted = realHost.LastAmbientsStarted
 			}
-			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v src=%s entOrigin=%v entPresent=%v (PlayerNum=%d, %d entities cached) viewAngles=%v cmd.fwd=%v cmd.side=%v clientConn=%d cl.vel=%v cl.viewh=%v cl.health=%d; %d surfaces; audio: %d active, %d mixed; sounds_started=%d ambients_started=%d\n",
+			activeParticles := 0
+			if runner.ParticlePool != nil {
+				activeParticles = runner.ParticlePool.NumAlive
+			}
+			fmt.Printf("QUAKE: tic %d -- viewOrigin=%v src=%s entOrigin=%v entPresent=%v (PlayerNum=%d, %d entities cached) viewAngles=%v cmd.fwd=%v cmd.side=%v clientConn=%d cl.vel=%v cl.viewh=%v cl.health=%d; %d surfaces; audio: %d active, %d mixed; sounds_started=%d ambients_started=%d; particles: %d active\n",
 				frame, origin, viewSrc, entOrigin, entPresent,
 				runner.Client.PlayerNum, len(runner.Client.Entities),
 				viewAngles, cmdFwd, cmdSide,
@@ -1056,7 +1448,29 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				runner.Client.Velocity, runner.Client.ViewHeightOffset, runner.Client.Health,
 				surfaces.Len(),
 				active, enginesound.MixBufferStereoFrames,
-				soundsStarted, ambientsStarted)
+				soundsStarted, ambientsStarted,
+				activeParticles)
+
+			// Sample spatialized channel: scan the dynamic + reserved
+			// channel pools for the FIRST active channel and log its
+			// (L, R) per-ear volumes. With Spatialize wired the values
+			// should diverge whenever the source isn't directly in
+			// front of the listener (centered = balanced; right of
+			// listener -> R > L; behind/far -> both attenuated).
+			// Without the listener basis OR with AttenuationNone the
+			// fall-through path leaves L == R (= master volume).
+			if realHost != nil && realHost.SoundPool() != nil {
+				pool := realHost.SoundPool()
+				for i := range pool.Channels {
+					if pool.Channels[i].Sfx == nil {
+						continue
+					}
+					ch := &pool.Channels[i]
+					fmt.Printf("QUAKE: spatialize sample tic %d -- ch[%d] ent=%d L=%d R=%d master=%v\n",
+						frame, i, ch.EntNum, ch.LeftVol, ch.RightVol, ch.Master)
+					break
+				}
+			}
 
 			// One-shot Entities-map census on the first per-60 log
 			// after the wire drain has populated svc_updates. Surfaces
@@ -1116,6 +1530,19 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			for _, msg := range realHost.LastThinkErrorMsgs {
 				fmt.Printf("QUAKE: think error -- %s\n", msg)
 			}
+			// Touch-trigger walk counters: per-tic count of QC
+			// .touch dispatches the post-RunPhysics SV_TouchLinks-
+			// equivalent walk fired, plus any per-dispatch error
+			// the walker swallowed. A non-zero "touches" count the
+			// moment the demo orbit grazes an item proves item
+			// pickup is wired end-to-end (item_*_touch invoked ->
+			// QC writes self.ammo_*/.health on the player + calls
+			// setorigin(-8000) to remove the item).
+			fmt.Printf("QUAKE: touches tic %d -- %d dispatched, %d errored\n",
+				frame, realHost.LastTriggerTouches, realHost.LastTouchErrors)
+			for _, msg := range realHost.LastTouchErrorMsgs {
+				fmt.Printf("QUAKE: touch error -- %s\n", msg)
+			}
 			if p := realHost.Progs(); p != nil {
 				base := realHost.Static.MaxClients + 1
 				scheduled := 0
@@ -1157,10 +1584,24 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			}
 		}
 
-		// Rasterize each visible face via TransformFace + FillTexturedPolygon.
-		// Per-face texture pick: TexInfo.MiptexIdx -> miptexPics[idx].
+		// Rasterize each visible face. Per-face dispatch on the miptex
+		// name prefix:
+		//
+		//   "sky*" -> two-layer sky composite (FillSkyPolygon). The
+		//             cloud overlay scrolls 2x the dome, both wrap
+		//             modulo the texture half-width.
+		//   "**"   -> liquid (water/lava/slime) warp via
+		//             FillTurbulentPolygon. Per-pixel UV is offset
+		//             by an LUT-sampled sin amplitude (TurbScale=8
+		//             texels) keyed off the wall-clock so the surface
+		//             ripples frame-to-frame.
+		//   else   -> the stock affine FillTexturedPolygon path.
+		//
 		// Faces that resolve to a null miptex slot OR a synthetic BSP
-		// with no Textures lump fall back to the checker.
+		// with no Textures lump fall back to the checker + the plain
+		// textured path (the dispatch only fires for real miptex hits).
+		skyTimeSec := float32(realHost.Server.Time)
+		turbTimeSec := float32(realHost.Server.Time)
 		for i := 0; i < surfaces.Len(); i++ {
 			ref := surfaces.Refs[i]
 			fv, err := bsprender.NewBrushFaceVerts(bm, ref.FaceIdx)
@@ -1172,12 +1613,62 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 				continue
 			}
 			tex := fallbackTex
+			var name string
 			if mtIdx, ok, _ := bm.FaceMipTexIdx(ref.FaceIdx); ok && mtIdx >= 0 && mtIdx < len(miptexPics) {
 				if p := miptexPics[mtIdx]; p != nil {
 					tex = p
+					name = miptexNames[mtIdx]
 				}
 			}
-			_ = render.FillTexturedPolygon(fb, tex, &cm, 0, verts)
+			switch {
+			case strings.HasPrefix(name, "sky"):
+				_ = render.FillSkyPolygon(fb, tex, verts, skyTimeSec)
+			case strings.HasPrefix(name, "*"):
+				_ = render.FillTurbulentPolygon(fb, tex, &cm, 0, verts, turbTimeSec)
+			default:
+				_ = render.FillTexturedPolygon(fb, tex, &cm, 0, verts)
+			}
+		}
+
+		// Per-tic projectile trail emission. Walk the wire-mirrored
+		// State.Entities map; for each entity whose ModelIdx resolves
+		// to a precache name flagged with a trail (rocket = grenade
+		// smoke trail, gib = blood drip, knight/scrag = tracer line,
+		// Voor = sucking-orb trail), emit Pool.EmitTrail between the
+		// previous-tic origin and the current origin. Skips entities
+		// we have no prior-origin for (first observation -- the next
+		// tic seeds the trail). tyrquake equivalent: the per-entity
+		// EF_ROCKET / EF_GRENADE / EF_GIB / EF_ZOMGIB / EF_TRACER /
+		// EF_TRACER2 / EF_TRACER3 dispatch inside CL_LinkEntities ->
+		// R_RocketTrail.
+		trailNow := runner.Client.MsgTime
+		if realHost != nil && runner.ParticlePool != nil {
+			precache := realHost.Server.ModelPrecache
+			seenThisTic := make(map[int]struct{}, len(runner.Client.Entities))
+			for entNum, es := range runner.Client.Entities {
+				seenThisTic[entNum] = struct{}{}
+				if es.ModelIdx <= 0 || es.ModelIdx >= len(precache) {
+					continue
+				}
+				kind, ok := trailKindForModel(precache[es.ModelIdx])
+				if !ok {
+					continue
+				}
+				prev, hadPrev := prevEntityOrigin[entNum]
+				prevEntityOrigin[entNum] = es.Origin
+				if !hadPrev {
+					continue
+				}
+				runner.ParticlePool.EmitTrail(prev, es.Origin, kind, trailNow, particleRNG)
+			}
+			// Garbage-collect prevOrigin entries whose entity slot no
+			// longer exists in the live map (entity freed / detonated /
+			// out-of-PVS). Keeps the map size bounded.
+			for k := range prevEntityOrigin {
+				if _, ok := seenThisTic[k]; !ok {
+					delete(prevEntityOrigin, k)
+				}
+			}
 		}
 
 		// Alias-model pass. Iterate the wire-mirrored State.Entities
@@ -1338,6 +1829,127 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 			}
 		}
 
+		// Particle pass. Runs AFTER alias entities (so monsters don't
+		// paint over particle bursts they triggered, e.g. blood from a
+		// player gibbing) and BEFORE the HUD/sbar pass (so particles
+		// land in the world layer, not on top of the status bar).
+		// DrawParticleQuads early-returns on a nil pool / rd; pool was
+		// wired at runner-build time so nil is a structural impossibility
+		// here, but the no-op guard keeps the call site safe regardless.
+		if err := render.DrawParticleQuads(fb, rd, runner.ParticlePool, runner.Client.MsgTime); err != nil {
+			if frame%60 == 0 {
+				fmt.Printf("QUAKE: DrawParticleQuads err: %v\n", err)
+			}
+		}
+
+		// Temp-sprite pass. Walks the explosion-billboard pool and
+		// blits each live sprite via DrawSpriteAtTime. Runs AFTER the
+		// particle pass so the bright sprite flash overlays the
+		// scatter-shower (the upstream draw order in
+		// R_DrawViewModel + R_DrawSpriteModel).  Skips silently when
+		// the sprite is nil (asset missing -- the temp-sprite pool is
+		// also kept empty by the EmitTempEntity arm in that case).
+		//
+		// The walk ALSO ages out expired slots even when explosionSprite
+		// is nil, so a future hot-reload that swaps the sprite in
+		// mid-run starts from a clean pool.
+		spritesDrawn := 0
+		tempSpritePool.Walk(now, func(origin [3]float32, elapsed float32) {
+			if explosionSprite == nil {
+				return
+			}
+			if err := render.DrawSpriteAtTime(fb, rd, explosionSprite, origin, elapsed); err != nil {
+				if frame%60 == 0 {
+					fmt.Printf("QUAKE: DrawSpriteAtTime err: %v\n", err)
+				}
+				return
+			}
+			spritesDrawn++
+		})
+
+		// Lightning-beam pass. Walks the BeamPool and draws one alias
+		// model per 30-unit tile of every live bolt via
+		// DrawAliasInterpLit. Per-tile (yaw, pitch) come from
+		// BeamSegments so each bolt mdl visually points end-ward; the
+		// (FrameIdx, Lerp) pair is pinned to frame 0 because bolt
+		// models are single-frame meshes (no animation to interp).
+		// Skips silently when the matching bolt mdl is nil (asset
+		// missing in this pak); the Walk still ages the slot so a
+		// future hot-reload starts from a clean pool. Runs AFTER the
+		// temp-sprite pass so the bright bolt overlays any concurrent
+		// explosion. tyrquake: CL_UpdateBeams in cl_tent.c.
+		beamsDrawn := 0
+		beamSegmentsDrawn := 0
+		beamPool.Walk(now, func(seg client.BeamSegment) {
+			var bm *mdl.Model
+			var bskin *render.Pic
+			switch seg.Kind {
+			case protocol.TELightning1:
+				bm, bskin = boltModels[0], boltSkins[0]
+			case protocol.TELightning2, protocol.TEBeam:
+				bm, bskin = boltModels[1], boltSkins[1]
+			case protocol.TELightning3:
+				bm, bskin = boltModels[2], boltSkins[2]
+			default:
+				return
+			}
+			if bm == nil {
+				return
+			}
+			if bskin == nil {
+				bskin = fallbackTex
+			}
+			ent := render.AliasEntityInterp{
+				AliasEntity: render.AliasEntity{
+					Origin:     seg.Origin,
+					AnglePitch: seg.Pitch,
+					AngleYaw:   seg.Yaw,
+					AngleRoll:  0,
+					FrameIdx:   0,
+					SkinIdx:    0,
+				},
+				FrameIdxNext: 0,
+				Lerp:         0,
+			}
+			if err := render.DrawAliasInterpLit(fb, rd, &cm, aliasShade, bm, bskin, ent); err != nil {
+				if frame%60 == 0 {
+					fmt.Printf("QUAKE: DrawAliasInterpLit(bolt kind=%d) err: %v\n", seg.Kind, err)
+				}
+				return
+			}
+			beamSegmentsDrawn++
+			if seg.Index == 0 {
+				beamsDrawn++
+			}
+		})
+		if frame%60 == 0 {
+			fmt.Printf("QUAKE: lightning beams active=%d segments=%d\n",
+				beamsDrawn, beamSegmentsDrawn)
+		}
+
+		// Per-tic in-flight projectile census. Counts entities whose
+		// model name (looked up through the alias precache the alias
+		// loader walked) maps to a projectile trail kind -- rockets,
+		// grenades, spikes, lasers, voorballs. The number is the
+		// renderer-visible projectile population at the top of the
+		// frame, the proof that the alias pipeline IS rendering the
+		// in-flight missiles (the existing per-entity DrawAliasInterpLit
+		// pass above already draws them; this counter surfaces the
+		// census so the QEMU serial log proves the route).
+		if frame%60 == 0 {
+			missiles := 0
+			for _, es := range runner.Client.Entities {
+				if es.ModelIdx <= 0 || es.ModelIdx >= len(aliasPrecache) {
+					continue
+				}
+				if _, ok := trailKindForModel(aliasPrecache[es.ModelIdx]); ok {
+					missiles++
+				}
+			}
+			fmt.Printf("QUAKE: tic %d missiles in flight: %d, explosion sprites: %d/%d (drawn/alive)\n",
+				frame, missiles, spritesDrawn, tempSpritePool.NumAlive(now))
+		}
+
 		// HUD/sbar pass. Runs AFTER the alias entities (so monsters /
 		// items don't paint over the status bar) and BEFORE Compose2D
 		// (so the 2D notify + console layers still overlay on top of
@@ -1371,12 +1983,30 @@ func setupRenderer(runner *runloop.Runner, pakFS fs.FS, realHost *enginehost.Hos
 // non-nil entries and total is the directory's slot count. A synthetic
 // BSP that lacks a textures lump returns ([], 0, 0, nil).
 func loadMiptexPics(file *bspfile.File) ([]*render.Pic, int, int, error) {
+	pics, names, loaded, total, err := loadMiptexPicsNamed(file)
+	_ = names // kept for the dispatch path below
+	return pics, loaded, total, err
+}
+
+// loadMiptexPicsNamed is the named-bearing variant. The parallel
+// `names` slice exposes the raw miptex name (16-byte slot, NUL-
+// trimmed) at each slot so the per-face dispatch can branch on the
+// upstream texture-name conventions:
+//
+//   - leading "sky"  -> two-layer sky composite (FillSkyPolygon)
+//   - leading "*"    -> sinusoidal water/lava warp (FillTurbulentPolygon)
+//   - everything else -> the stock affine FillTexturedPolygon path
+//
+// Empty string for missing / null slots (so the dispatch fall-through
+// to fallbackTex still works cleanly).
+func loadMiptexPicsNamed(file *bspfile.File) ([]*render.Pic, []string, int, int, error) {
 	mtl, err := file.Textures()
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("file.Textures: %w", err)
+		return nil, nil, 0, 0, fmt.Errorf("file.Textures: %w", err)
 	}
 	total := int(mtl.NumMipTex)
-	out := make([]*render.Pic, total)
+	pics := make([]*render.Pic, total)
+	names := make([]string, total)
 	loaded := 0
 	for i := 0; i < total; i++ {
 		mt, ok, err := mtl.MipTex(i)
@@ -1398,14 +2028,15 @@ func loadMiptexPics(file *bspfile.File) ([]*render.Pic, int, int, error) {
 		// copy keeps the renderer's invariants self-contained).
 		buf := make([]byte, len(px))
 		copy(buf, px)
-		out[i] = &render.Pic{
+		pics[i] = &render.Pic{
 			Width:  int(mt.Width),
 			Height: int(mt.Height),
 			Pixels: buf,
 		}
+		names[i] = mt.Name
 		loaded++
 	}
-	return out, loaded, total, nil
+	return pics, names, loaded, total, nil
 }
 
 // buildHost wires the embedded pak0 into a fully constructed
@@ -1484,9 +2115,10 @@ func buildHost(pakFS fs.FS, mapSlug string) (*enginehost.Host, error) {
 	}
 	h.SetSoundPool(pool)
 
-	// 4. Builtin table. RegisterMathBuiltins wires the 9 pure-math
-	//    builtins (normalize / vlen / vectoangles / random / ...);
-	//    registerSpawnTimeBuiltins layers no-op stubs on top of every
+	// 4. Builtin table. RegisterMathBuiltins wires the 10 pure-math
+	//    builtins (makevectors / normalize / vlen / vectoangles /
+	//    random / ...); registerSpawnTimeBuiltins layers no-op stubs
+	//    on top of every
 	//    builtin a typical Q1 entity-spawn QC function calls
 	//    (precache_model / precache_sound / setmodel / setorigin /
 	//    setsize / lightstyle / dprint / stuffcmd / cvar / particle /
@@ -1817,11 +2449,13 @@ func edictSlot(h *enginehost.Host, ent *progs.Edict) int32 {
 // the no-op shape is sufficient + safer than a half-port that crashes.
 func registerSpawnTimeBuiltins(vm *progs.VM, h *enginehost.Host) error {
 	noop := func(_ *progs.VM) error { return nil }
-	// makevectors writes v_forward/right/up; spawn-time entities
-	// rarely consult those, so the stub leaves them untouched. A
-	// future batch wires the real math.
-	vm.RegisterBuiltin(progs.BuiltinMakeVectors, noop)
-	vm.RegisterBuiltin(progs.BuiltinSetOrigin, noop)
+	// makevectors is NOT registered here: RegisterMathBuiltins
+	// (the prior call in buildHost) wires the real
+	// [progs.BuiltinFnMakeVectors] against v_forward / v_right /
+	// v_up. Overwriting it with a no-op here would silently break
+	// W_FireShotgun's aim basis -- every traceline (src, src +
+	// v_forward * 2048, ...) would collapse to a zero-length ray.
+	vm.RegisterBuiltin(progs.BuiltinSetOrigin, builtinSetOrigin(h))
 	vm.RegisterBuiltin(progs.BuiltinSetModel, builtinSetModel(h))
 	vm.RegisterBuiltin(progs.BuiltinSetSize, noop)
 	vm.RegisterBuiltin(progs.BuiltinBreak, noop)
@@ -1870,9 +2504,15 @@ func registerSpawnTimeBuiltins(vm *progs.VM, h *enginehost.Host) error {
 	// the builtin returns. Indices in between (68/69/70/71/73/75/...)
 	// get stubbed too so the next undefined-slot won't surface as the
 	// progs.dat exercises further functions on subsequent ticks.
-	for _, idx := range []int{68, 69, 70, 71, 72, 73, 75, 76, 77, 78, 79} {
+	for _, idx := range []int{68, 69, 71, 72, 73, 75, 76, 77, 78, 79} {
 		vm.RegisterBuiltin(idx, noop)
 	}
+	// changelevel(string mapname) -- builtin #70. The QC `trigger_changelevel`
+	// touch fires this when the player walks through the level-exit
+	// volume. Wired against the host's PendingChangelevel/NextMap
+	// fields so the embedder's main loop can poll the request +
+	// re-spawn into the new map. See [enginehost.BuiltinChangeLevel].
+	vm.RegisterBuiltin(enginehost.BuiltinChangeLevelIdx, enginehost.BuiltinChangeLevel(h))
 	// ambientsound(pos, samp, vol, atten) -- builtin #74. The C upstream
 	// PF_ambientsound (pr_cmds.c) calls SV_StartSound at the supplied
 	// world position with a static channel. Wired here against the
@@ -2022,10 +2662,7 @@ func builtinSound(h *enginehost.Host) progs.Builtin {
 		chanF, _ := vm.GlobalFloat(progs.OfsParm1)
 		nameOff, _ := vm.GlobalInt(progs.OfsParm2)
 		volF, _ := vm.GlobalFloat(progs.OfsParm3)
-		// PARM4 = attenuation; carried for the future Spatialize wiring
-		// (read here so the per-arg layout is documented + future code
-		// only flips one line, not five).
-		_, _ = vm.GlobalFloat(progs.OfsParm4)
+		attenF, _ := vm.GlobalFloat(progs.OfsParm4)
 
 		name := vm.String(nameOff)
 		if name == "" {
@@ -2036,8 +2673,10 @@ func builtinSound(h *enginehost.Host) progs.Builtin {
 		// upstream's "no specific origin" sentinel; non-world slots are
 		// for entity-attached sounds (weapon fire, monster grunt, ...).
 		entIdx := 0
+		var entEdict *progs.Edict
 		if arena := vm.Arena(); arena != nil && entPtr != 0 {
 			if ed, _, err := arena.ResolvePointer(entPtr); err == nil {
+				entEdict = ed
 				for i, e := range h.Server.Edicts {
 					if e == ed {
 						entIdx = i
@@ -2063,7 +2702,21 @@ func builtinSound(h *enginehost.Host) progs.Builtin {
 			vol = 255
 		}
 
-		if _, err := h.StartSound(entIdx, channel, name, vol, -1, -1); err != nil {
+		// Source origin: the owning entity's origin entvars field
+		// (zero when the sound is world-owned or the lookup fails;
+		// Spatialize treats a zero source with a non-zero listener as
+		// "to the listener's left/right depending on the right axis").
+		var sourceOrigin [3]float32
+		if entEdict != nil {
+			if p := h.Progs(); p != nil {
+				if ev, err := progs.NewEntVars(p, entEdict); err == nil {
+					sourceOrigin, _ = ev.ReadVec3("origin")
+				}
+			}
+		}
+
+		atten := enginesound.SoundAttenuation(attenF)
+		if _, err := h.StartSoundAt(entIdx, channel, name, vol, atten, sourceOrigin); err != nil {
 			// Log + continue. The most common failure here is "sample
 			// not precached" -- a real bug in the asset path but not
 			// a reason to abort the per-tic dispatch.
@@ -2105,13 +2758,14 @@ func builtinAmbientSound(h *enginehost.Host) progs.Builtin {
 		if h == nil || h.SoundPool() == nil {
 			return nil
 		}
-		// Read the world-space anchor; carried for the future Spatialize
-		// wiring (the C upstream stores it on the static channel so
-		// SND_Spatialize can compute per-frame L/R falloff).
-		_, _ = vm.GlobalVector(progs.OfsParm0)
+		// Read the world-space anchor; the C upstream stores it on the
+		// static channel so SND_Spatialize computes per-frame L/R
+		// falloff. The Go port spatializes at fire-time using the
+		// listener basis the embedder publishes via Host.SetListener.
+		position, _ := vm.GlobalVector(progs.OfsParm0)
 		nameOff, _ := vm.GlobalInt(progs.OfsParm1)
 		volF, _ := vm.GlobalFloat(progs.OfsParm2)
-		_, _ = vm.GlobalFloat(progs.OfsParm3)
+		attenF, _ := vm.GlobalFloat(progs.OfsParm3)
 
 		name := vm.String(nameOff)
 		if name == "" {
@@ -2143,7 +2797,8 @@ func builtinAmbientSound(h *enginehost.Host) progs.Builtin {
 		if vol > 255 {
 			vol = 255
 		}
-		if _, err := h.AmbientSound(slot, 0, name, vol); err != nil {
+		atten := enginesound.SoundAttenuation(attenF)
+		if _, err := h.AmbientSoundAt(slot, 0, name, vol, position, atten); err != nil {
 			fmt.Printf("QUAKE: ambientsound(%q vol=%d slot=%d): %v\n", name, vol, slot, err)
 		}
 		return nil
@@ -2500,6 +3155,54 @@ func builtinFindRadius(h *enginehost.Host) progs.Builtin {
 	}
 }
 
+// builtinSetOrigin returns a Builtin closure that implements the
+// QuakeC setorigin(entity, vector) built-in (tyrquake's PF_setorigin
+// at builtin slot 2). Reads the entity-pointer from OFS_PARM0 + the
+// vector from OFS_PARM1, writes the new origin onto the edict's
+// entvars, then re-links the area-tree entry so any subsequent
+// AreaQuery sees the new bounds.
+//
+// Why a real impl instead of the historical no-op: the item-pickup
+// chain depends on it. The QuakeC items.qc body of every
+// item_*_touch handler ends with
+//
+//	setmodel(self, "");
+//	setorigin(self, '-8000 -8000 -8000');
+//
+// Without re-linking on setorigin, the trigger's area-tree entry
+// stays at its pickup position and the player's next-tic
+// TouchTriggers walk re-fires the same item (= infinite ammo loop
+// + spammed pickup sound).
+//
+// Tolerated no-ops (one-line warning + return nil; same crash-safety
+// contract as the other host-bound builtins):
+//
+//   - h or h.Server nil                  -> no-op
+//   - VM arena unwired                   -> no-op
+//   - entity-pointer doesn't resolve     -> warn + return nil
+//   - host.SetOrigin handles entvars /
+//     area-tree absent cases silently    -> no extra branching here.
+func builtinSetOrigin(h *enginehost.Host) progs.Builtin {
+	return func(vm *progs.VM) error {
+		if h == nil || h.Server == nil {
+			return nil
+		}
+		arena := vm.Arena()
+		if arena == nil {
+			return nil
+		}
+		entPtr, _ := vm.GlobalInt(progs.OfsParm0)
+		origin, _ := vm.GlobalVector(progs.OfsParm1)
+		ent, _, err := arena.ResolvePointer(entPtr)
+		if err != nil {
+			fmt.Printf("QUAKE: setorigin(ptr=%d, %v): ResolvePointer: %v\n", entPtr, origin, err)
+			return nil
+		}
+		h.SetOrigin(ent, origin)
+		return nil
+	}
+}
+
 // solidKindFromEntvars reads the QC `solid` field off ev + maps it
 // to the world.SolidKind enum the area-tree link uses. SOLID_NOT
 // (= 0) collapses to SolidKindSkip (no link); SOLID_TRIGGER to
@@ -2539,6 +3242,57 @@ func newLCGRandom(seed uint32) func() float32 {
 		// uses the full 24-bit mantissa for a smoother distribution.
 		return float32(state>>8) / float32(1<<24)
 	}
+}
+
+// newLCGByteSource returns a uniform-byte callback for the particle
+// pool's Emit / EmitTrail RNG arg. Uses the same Numerical-Recipes
+// 32-bit LCG as newLCGRandom (a separate goroutine of state so
+// gameplay random + particle random don't sample the same stream);
+// callers feed it as `rng func() byte` -- each call rotates a byte
+// out of the high half of the LCG state for a uniform 0..255
+// distribution.
+func newLCGByteSource(seed uint32) func() byte {
+	state := seed
+	return func() byte {
+		state = state*1664525 + 1013904223
+		return byte(state >> 24)
+	}
+}
+
+// trailKindForModel maps a precache model name to the trail kind
+// tyrquake's CL_LinkEntities dispatches based on the entity's
+// per-model EF_* bits. The C upstream sets those bits at model-load
+// time inside Mod_LoadModel; the Go port collapses the bit table
+// down to a name-based lookup because the engine doesn't yet
+// re-derive the per-model EF_* mask from the .mdl flags field.
+//
+// Returns (kind, true) when the model name is trail-bearing,
+// (0, false) otherwise so the caller's tic loop skips the entity.
+//
+// Names mirror id1's canonical alias-model paths -- "progs/missile.mdl"
+// is the rocket (id1 progs.dat) and "progs/grenade.mdl" the grenade;
+// "progs/gib*.mdl" / "progs/zom_gib.mdl" emit blood drips; the
+// scrag/wizard/knight tracer + Voor orb mirror the upstream's
+// EF_TRACER / EF_TRACER2 / EF_TRACER3 bits which are model-pinned.
+func trailKindForModel(name string) (render.TrailKind, bool) {
+	switch name {
+	case "progs/missile.mdl":
+		return render.TrailRocket, true
+	case "progs/grenade.mdl":
+		return render.TrailGrenade, true
+	case "progs/gib1.mdl", "progs/gib2.mdl", "progs/gib3.mdl",
+		"progs/zom_gib.mdl":
+		return render.TrailBlood, true
+	case "progs/k_spike.mdl":
+		return render.TrailSlightBlood, true
+	case "progs/w_spike.mdl":
+		return render.TrailTracer, true
+	case "progs/laser.mdl":
+		return render.TrailTracer2, true
+	case "progs/v_spike.mdl":
+		return render.TrailVoor, true
+	}
+	return 0, false
 }
 
 // pickInMapCamera returns a viewpoint that lands inside a valid leaf
@@ -2939,14 +3693,28 @@ func makeColorMapLump() []byte {
 	return buf
 }
 
-// makeConcharsLump returns a 16384-byte synthetic 128x128 char sheet.
-// Each pixel = byte(i & 0xFF) so the glyph cells contain a gradient
-// of palette indices -- DrawCharacter treats non-zero as opaque, so
-// every glyph cell paints something onto the framebuffer.
+// makeConcharsLump returns a 16384-byte 128x128 char sheet built from
+// the inlined 8x8 ASCII bitmap font in
+// quake-tamago/concharsfont. Glyph cells contain real ASCII letter
+// shapes (palette index 0xDC on, 0 off in the lower bank; 0x67 on, 0
+// off in the upper "yellow" bank). DrawCharacter treats 0 as
+// transparent, so blank cells (space + non-printable codes) paint
+// nothing. This replaces the earlier synthetic fallback that filled
+// each cell with a single palette byte (= colored squares), which made
+// menu titles, console text, centerprint, and the intermission
+// scoreboard unreadable.
+//
+// The conchars sheet length is asserted against assets.ConCharsLumpSize
+// to keep the two constants in lock-step.
 func makeConcharsLump() []byte {
-	buf := make([]byte, assets.ConCharsLumpSize)
-	for i := range buf {
-		buf[i] = byte(i & 0xFF)
+	buf := concharsfont.Build(0xDC, 0x67)
+	if len(buf) != assets.ConCharsLumpSize {
+		// Build returns concharsfont.SheetSize (= 128*128 = 16384),
+		// matching ConCharsLumpSize by construction. The runtime
+		// guard is a paranoid sanity check so a mismatched constant
+		// surfaces as an obvious panic at boot rather than as silent
+		// downstream rendering corruption.
+		panic("concharsfont.Build size mismatch vs assets.ConCharsLumpSize")
 	}
 	return buf
 }
@@ -3003,6 +3771,44 @@ func seedSoundPool(pool *enginesound.Pool, pakFS fs.FS, names []string) int {
 	return seeded
 }
 
+// loadExplosionSprite opens the canonical s_explod.spr asset from the
+// embedded pak so the TE_EXPLOSION client arm can spawn billboarded
+// flashes on top of the particle shower. Tries both upstream paths in
+// order (early shareware paks shipped it under progs/; the retail
+// release moved it to sprites/), returning (sprite, resolvedPath) on
+// the first hit. (nil, "") when neither path is present -- callers
+// silently degrade to particles-only.
+//
+// A malformed .spr (truncated, bad magic, unsupported version) is
+// treated the same as a missing file: log the parse error so the
+// QEMU serial stream surfaces the cause, then return (nil, "") so
+// the bring-up keeps booting.
+//
+// nil pakFS returns (nil, "") -- placeholder-pak boots never have
+// real sprite assets.
+func loadExplosionSprite(pakFS fs.FS) (*enginespr.Sprite, string) {
+	if pakFS == nil {
+		return nil, ""
+	}
+	candidates := []string{
+		"progs/s_explod.spr",
+		"sprites/s_explod.spr",
+	}
+	for _, path := range candidates {
+		blob, ok := tryReadPakFile(pakFS, path)
+		if !ok {
+			continue
+		}
+		sp, err := enginespr.Load(bytes.NewReader(blob), int64(len(blob)))
+		if err != nil {
+			fmt.Printf("QUAKE: spr.Load(%s) err: %v\n", path, err)
+			continue
+		}
+		return sp, path
+	}
+	return nil, ""
+}
+
 // loadAliasModels walks the model precache and opens every entry that
 // names an alias model (".mdl" suffix), returning two parallel slices
 // the Pre2DDraw alias pass indexes by EntityState.ModelIdx:
@@ -3057,6 +3863,58 @@ func loadAliasModels(pakFS fs.FS, precache []string) ([]*mdl.Model, []*render.Pi
 		loaded++
 	}
 	return models, skins, loaded, names
+}
+
+// loadBoltModels opens the three canonical lightning-bolt alias models
+// out of pak0: progs/bolt1.mdl, progs/bolt2.mdl, progs/bolt3.mdl
+// (TE_LIGHTNING1 / 2 / 3 respectively; TE_BEAM re-uses bolt2). Returns
+// parallel three-slot arrays plus the count of slots that resolved --
+// missing files / parse failures leave the slot nil so the per-tic
+// beam Walk in setupRenderer can silently skip them.
+//
+// A nil pakFS returns three nil slots + 0 (placeholder-pak boot path,
+// no .mdl files anywhere).
+func loadBoltModels(pakFS fs.FS) (models [3]*mdl.Model, skins [3]*render.Pic, loaded int) {
+	if pakFS == nil {
+		return
+	}
+	paths := [3]string{
+		"progs/bolt.mdl",  // some shareware builds shipped bolt.mdl
+		"progs/bolt2.mdl", // TE_LIGHTNING2 + TE_BEAM (the thunderbolt)
+		"progs/bolt3.mdl", // TE_LIGHTNING3 (boss beam)
+	}
+	// TE_LIGHTNING1 (low-end boss bolt) is conventionally progs/bolt.mdl
+	// in the shareware paks; later retail variants ship progs/bolt1.mdl.
+	// Try the bolt1 alias first, fall back to bolt.
+	alt1 := "progs/bolt1.mdl"
+	if blob, ok := tryReadPakFile(pakFS, alt1); ok {
+		if m, err := mdl.Load(bytes.NewReader(blob), int64(len(blob))); err == nil {
+			models[0] = m
+			skins[0] = firstSkinAsPic(m)
+			loaded++
+		} else {
+			fmt.Printf("QUAKE: mdl.Load(%s) err: %v\n", alt1, err)
+		}
+	}
+	startIdx := 0
+	if models[0] != nil {
+		startIdx = 1 // skip slot 0; already loaded via bolt1.mdl alias
+	}
+	for i := startIdx; i < 3; i++ {
+		blob, ok := tryReadPakFile(pakFS, paths[i])
+		if !ok {
+			continue
+		}
+		m, err := mdl.Load(bytes.NewReader(blob), int64(len(blob)))
+		if err != nil {
+			fmt.Printf("QUAKE: mdl.Load(%s) err: %v\n", paths[i], err)
+			continue
+		}
+		models[i] = m
+		skins[i] = firstSkinAsPic(m)
+		loaded++
+	}
+	return
 }
 
 // firstSkinAsPic returns the model's first single-skin as a *render.Pic
@@ -3208,6 +4066,69 @@ func wadLumpName(name string) (string, bool) {
 		return "", false
 	}
 	return name[len(prefix) : len(name)-len(suffix)], true
+}
+
+// loadMenuAssets opens the menu pic lumps the [menu.Menu] overlay
+// paints with. Mirrors the loadSBarAssets shape: WAD-overlay-fronted
+// best-effort probe + verbose missing-asset logging so the QEMU serial
+// trace surfaces gaps without killing the boot.
+//
+// The lump set: qplaque (left-edge "QUAKE" plaque), ttl_main +
+// ttl_sgl (menu title banners), p_load / p_save / p_option (sub-menu
+// titles), mainmenu (top-level body pic), sp_menu (single-player
+// body pic), menudot1..6 (animated cursor strip). All live in
+// gfx.wad on the Quake Remastered pak; the overlay resolves
+// gfx/<name>.lmp transparently either way.
+//
+// Returns (assets, loaded, total). A nil pakFS skips the probe and
+// returns a zero bundle so the menu's text-fallback path keeps it
+// navigable.
+func loadMenuAssets(pakFS fs.FS) (*menu.Assets, int, int) {
+	if pakFS == nil {
+		return &menu.Assets{}, 0, 0
+	}
+	a := &menu.Assets{}
+	loaded, total := 0, 0
+	overlay := newWADOverlay(pakFS, "gfx.wad")
+
+	load := func(name string, dst **render.Pic) {
+		total++
+		blob, ok := tryReadPakFile(overlay, name)
+		if !ok {
+			fmt.Printf("QUAKE: menu asset %s missing -- text fallback\n", name)
+			return
+		}
+		pic, err := render.ParsePic(blob)
+		if err != nil {
+			fmt.Printf("QUAKE: menu asset %s ParsePic err: %v -- text fallback\n", name, err)
+			return
+		}
+		*dst = pic
+		loaded++
+	}
+
+	load("gfx/qplaque.lmp", &a.QPlaque)
+	load("gfx/ttl_main.lmp", &a.TitleMain)
+	load("gfx/ttl_sgl.lmp", &a.TitleSinglePlayer)
+	load("gfx/p_load.lmp", &a.TitleLoad)
+	load("gfx/p_save.lmp", &a.TitleSave)
+	load("gfx/p_option.lmp", &a.TitleOptions)
+	load("gfx/mainmenu.lmp", &a.MainMenu)
+	load("gfx/sp_menu.lmp", &a.SinglePlayerMenu)
+
+	// Animated cursor strip (6 frames).
+	a.MenuDots = make([]*render.Pic, 6)
+	for i := 0; i < 6; i++ {
+		load(fmt.Sprintf("gfx/menudot%d.lmp", i+1), &a.MenuDots[i])
+	}
+	// Drop trailing nils so menu.Draw's animation index stays valid.
+	end := len(a.MenuDots)
+	for end > 0 && a.MenuDots[end-1] == nil {
+		end--
+	}
+	a.MenuDots = a.MenuDots[:end]
+
+	return a, loaded, total
 }
 
 // loadSBarAssets opens the canonical sbar pic lumps out of pakFS via

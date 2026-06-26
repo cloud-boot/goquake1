@@ -87,6 +87,35 @@ func (s *Server) StartSound(entityIdx, channel int, entityOrigin, entityMins, en
 	return EncodeSound(s.Datagram, entityIdx, channel, soundNum, origin, volume, attenuation, s.Protocol)
 }
 
+// FireLightning is the *Server-bound wrapper around [EncodeLightning].
+// Writes one svc_temp_entity TE_LIGHTNING* / TE_BEAM event into the
+// per-tick datagram so every active client picks it up on the next
+// SV_SendClientMessages flush. tyrquake: the per-tick path inside
+// W_FireLightning (id1's weapons.qc), which traces from the player's
+// muzzle along v_forward for 600 units, calls LightningDamage along
+// the resulting line, then emits svc_temp_entity TE_LIGHTNING2 with
+// the (entity, start, end) triple.
+//
+// Parameters mirror [EncodeLightning]:
+//
+//	kind   one of protocol.TELightning1 / 2 / 3 / TEBeam
+//	ent    the owning entity slot (the player firing the bolt, or
+//	       the boss for TELightning1 / TELightning3)
+//	start  traceline source (the entity's muzzle)
+//	end    traceline endpoint (the impact point or max-range terminus)
+//
+// Returns the [EncodeLightning] errors verbatim: [ErrNilServer] /
+// [ErrNilDatagram] / [ErrLightningKind] / [ErrDatagramFull].
+func (s *Server) FireLightning(kind, ent int, start, end [3]float32) error {
+	if s == nil {
+		return ErrNilServer
+	}
+	if s.Datagram == nil {
+		return ErrNilDatagram
+	}
+	return EncodeLightning(s.Datagram, kind, ent, start, end)
+}
+
 // BroadcastNop appends a single svc_nop byte to the per-client
 // reliable Message buffer of every Active + Spawned client. Used to
 // keep slow connections alive when nothing else is going out.

@@ -149,3 +149,130 @@ func TestParticleReserve_TyrquakeValue(t *testing.T) {
 		t.Errorf("particleReserve drift: got %d want 16 (tyrquake)", particleReserve)
 	}
 }
+
+// --- EncodeLightning -------------------------------------------------------
+
+// Happy path: every field round-trips through msg.Read* in the order
+// the wire format defines.
+func TestEncodeLightning_HappyPath(t *testing.T) {
+	buf := sizebuf.New(make([]byte, 64))
+	if err := EncodeLightning(buf, protocol.TELightning2, 7,
+		[3]float32{1, 2, 3}, [3]float32{61, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 16 {
+		t.Errorf("wire size: got %d want 16", buf.Len())
+	}
+	r := msg.NewReader(buf.Bytes())
+	if cmd := r.ReadU8(); cmd != protocol.SvcTempEntity {
+		t.Errorf("cmd: got %d want SvcTempEntity(%d)", cmd, protocol.SvcTempEntity)
+	}
+	if k := r.ReadU8(); k != protocol.TELightning2 {
+		t.Errorf("kind: got %d want TELightning2(%d)", k, protocol.TELightning2)
+	}
+	if e := r.ReadShort(); e != 7 {
+		t.Errorf("entity: got %d want 7", e)
+	}
+	for axis, want := range [3]float32{1, 2, 3} {
+		if got := r.ReadCoord(); got != want {
+			t.Errorf("start[%d]: got %v want %v", axis, got, want)
+		}
+	}
+	for axis, want := range [3]float32{61, 2, 3} {
+		if got := r.ReadCoord(); got != want {
+			t.Errorf("end[%d]: got %v want %v", axis, got, want)
+		}
+	}
+}
+
+// All four kinds round-trip.
+func TestEncodeLightning_AllKindsAccepted(t *testing.T) {
+	kinds := []int{
+		protocol.TELightning1,
+		protocol.TELightning2,
+		protocol.TELightning3,
+		protocol.TEBeam,
+	}
+	for _, k := range kinds {
+		buf := sizebuf.New(make([]byte, 64))
+		if err := EncodeLightning(buf, k, 1,
+			[3]float32{}, [3]float32{30, 0, 0}); err != nil {
+			t.Errorf("kind=%d: %v", k, err)
+		}
+		r := msg.NewReader(buf.Bytes())
+		_ = r.ReadU8()
+		if got := r.ReadU8(); got != k {
+			t.Errorf("kind wire byte: got %d want %d", got, k)
+		}
+	}
+}
+
+// Bad kind -> ErrLightningKind, no bytes written.
+func TestEncodeLightning_RejectsUnknownKind(t *testing.T) {
+	buf := sizebuf.New(make([]byte, 64))
+	err := EncodeLightning(buf, 0x42, 1, [3]float32{}, [3]float32{30, 0, 0})
+	if !errors.Is(err, ErrLightningKind) {
+		t.Errorf("got %v want ErrLightningKind", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("buffer mutated on bad-kind reject: %d bytes", buf.Len())
+	}
+}
+
+// Nil sizebuf -> error.
+func TestEncodeLightning_NilBufErrors(t *testing.T) {
+	if err := EncodeLightning(nil, protocol.TELightning2, 0,
+		[3]float32{}, [3]float32{}); err == nil {
+		t.Error("expected error on nil sizebuf")
+	}
+}
+
+// Datagram nearly full -> ErrDatagramFull, no bytes written.
+func TestEncodeLightning_DatagramFull(t *testing.T) {
+	buf := sizebuf.New(make([]byte, MaxDatagram))
+	filler := make([]byte, MaxDatagram-lightningReserve+1)
+	if err := buf.Write(filler); err != nil {
+		t.Fatal(err)
+	}
+	prevLen := buf.Len()
+	err := EncodeLightning(buf, protocol.TELightning2, 1,
+		[3]float32{}, [3]float32{30, 0, 0})
+	if !errors.Is(err, ErrDatagramFull) {
+		t.Errorf("got %v want ErrDatagramFull", err)
+	}
+	if buf.Len() != prevLen {
+		t.Errorf("buffer modified on overflow: was %d, now %d", prevLen, buf.Len())
+	}
+}
+
+// Per-write error propagation walk: each msg.Write* inside
+// EncodeLightning has its own err-return branch. Wire layout (16
+// bytes): cmd | kind | short ent (2) | 3 coord start (6) | 3 coord
+// end (6). Successively larger capacities each fail one byte LATER
+// than the previous, walking every write site.
+func TestEncodeLightning_PerWriteOverflowPropagates(t *testing.T) {
+	caps := []int{0, 1, 2, 4, 5, 9, 11, 15}
+	for _, capN := range caps {
+		t.Run("", func(t *testing.T) {
+			buf := sizebuf.New(make([]byte, capN))
+			err := EncodeLightning(buf, protocol.TELightning2, 1,
+				[3]float32{}, [3]float32{30, 0, 0})
+			if err == nil || errors.Is(err, ErrDatagramFull) {
+				t.Errorf("cap=%d: expected propagated write error, got %v", capN, err)
+			}
+		})
+	}
+	// Sanity: cap 16 succeeds.
+	buf := sizebuf.New(make([]byte, 16))
+	if err := EncodeLightning(buf, protocol.TELightning2, 1,
+		[3]float32{}, [3]float32{30, 0, 0}); err != nil {
+		t.Errorf("cap=16: expected success, got %v", err)
+	}
+}
+
+// lightningReserve drift detector.
+func TestLightningReserve_DefaultValue(t *testing.T) {
+	if lightningReserve != 24 {
+		t.Errorf("lightningReserve drift: got %d want 24", lightningReserve)
+	}
+}

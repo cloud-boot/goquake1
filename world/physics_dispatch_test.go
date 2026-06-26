@@ -442,17 +442,16 @@ func TestRunPhysics_DispatchesFlyMissile(t *testing.T) {
 	}
 }
 
-// Unknown / unsupported movetypes are silently skipped: Walk, Step,
-// Push, AngleClip, AngleNoClip, and any out-of-enum value all go
-// through the default arm. Use a nil ThinkCaller to assert no
-// handler routed (any of None/NoClip/Fly/Toss/Bounce would have
-// surfaced ErrNoThinkCaller via their RunThink call).
+// Unknown / unsupported movetypes are silently skipped: AngleClip,
+// AngleNoClip, and any out-of-enum value all go through the default
+// arm. Use a nil ThinkCaller to assert no handler routed (any of
+// None/NoClip/Fly/Toss/Bounce/Push would have surfaced
+// ErrNoThinkCaller via their RunThink call).
 func TestRunPhysics_SkipsUnsupportedMovetypes(t *testing.T) {
 	cases := []server.MoveType{
-		// Walk + Step now WIRED through PhysicsWalk + PhysicsStep
-		// (post-batch10); only Push / Angle* / unknown stay in the
-		// silent-skip default arm.
-		server.MoveTypePush,
+		// Walk + Step + Push now WIRED through PhysicsWalk +
+		// PhysicsStep + PhysicsPusher; only Angle* / unknown stay in
+		// the silent-skip default arm.
 		server.MoveTypeAngleClip,
 		server.MoveTypeAngleNoClip,
 		server.MoveType(99), // genuinely-unknown

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<!--
+ Copyright (c) 2026 the go-quake1/engine authors.
+ SPDX-License-Identifier: BSD-3-Clause
+
+ Browser host page for the pure-Go Quake engine. Mirrors the
+ cmd/quake-tamago bare-metal entry point: a fixed 320x240 canvas
+ (vanilla DOS Quake framebuffer) the wasm payload paints once per
+ frame via backend/wasm.CanvasFramebuffer.PresentRGBA. CSS upscales
+ the canvas with image-rendering: pixelated for crisp scaled output;
+ the framebuffer itself stays 320x240 so the software rasterizer's
+ per-pixel work matches the tamago build.
+
+ The page deliberately avoids any framework: lib/wasm/wasm_exec.js
+ (the Go runtime's bundled JS glue) is enough to instantiate quake.wasm
+ + start its main goroutine. The status bar logs FPS / payload state
+ so the user knows the wasm is alive even before the first frame paints.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Quake 1 (pure-Go / wasm)</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #111;
+      color: #eee;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      min-height: 100vh;
+    }
+    main {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 0;
+      gap: 16px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: 0.05em;
+      color: #c33;
+    }
+    canvas {
+      width: 1280px;
+      height: 960px;
+      max-width: 95vw;
+      max-height: 80vh;
+      background: #000;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      border: 1px solid #333;
+      cursor: crosshair;
+    }
+    #status {
+      font-size: 13px;
+      color: #888;
+      min-height: 1em;
+    }
+    .hint {
+      font-size: 12px;
+      color: #666;
+      max-width: 640px;
+      text-align: center;
+      line-height: 1.5;
+    }
+    .hint code {
+      background: #222;
+      padding: 0 4px;
+      border-radius: 3px;
+      color: #aaa;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>QUAKE 1 &mdash; pure-Go / wasm</h1>
+    <canvas id="quake" width="320" height="240"></canvas>
+    <div id="status">loading wasm runtime&hellip;</div>
+    <p class="hint">
+      Click the canvas to enable mouse-look (pointer lock).
+      <code>W A S D</code> &middot; <code>SPACE</code> &middot; <code>ESC</code>.
+      First-frame paint follows the
+      <code>wasm.NewDefault("#quake", 320, 240)</code> Canvas2D bridge.
+    </p>
+  </main>
+
+  <!-- Go runtime glue. Provides window.Go (constructor) + the syscall/js
+       bridge tables the wasm module looks up at instantiate time. -->
+  <script src="wasm_exec.js"></script>
+  <script>
+    (async () => {
+      const status = document.getElementById('status');
+      function log(msg) {
+        status.textContent = msg;
+        console.log('[quake-wasm]', msg);
+      }
+      if (typeof Go === 'undefined') {
+        log('error: wasm_exec.js did not define window.Go');
+        return;
+      }
+      const go = new Go();
+      log('fetching quake.wasm...');
+      try {
+        const resp = await fetch('quake.wasm');
+        if (!resp.ok) {
+          log('error: fetch quake.wasm -> ' + resp.status + ' ' + resp.statusText);
+          return;
+        }
+        const result = await WebAssembly.instantiateStreaming(resp, go.importObject);
+        log('starting quake engine...');
+        go.run(result.instance);
+      } catch (err) {
+        log('error: ' + err);
+        console.error(err);
+      }
+    })();
+  </script>
+</body>
+</html>

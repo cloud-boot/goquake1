@@ -59,11 +59,14 @@ func TestApply_MsgTime_UpdatedOnEveryCall(t *testing.T) {
 		{"Print", DecodedPrint{Text: "hi"}},
 		{"StuffText", DecodedStuffText{Text: "echo hi"}},
 		{"Finale", DecodedFinale{Text: "the end"}},
+		{"Intermission", DecodedIntermission{}},
 		{"Cutscene", DecodedCutscene{Text: "..."}},
+		{"CenterPrint", DecodedCenterPrint{Text: "hi"}},
 		{"SellScreen", DecodedSellScreen{}},
 		{"KilledMonster", DecodedKilledMonster{}},
 		{"FoundSecret", DecodedFoundSecret{}},
 		{"Particle", DecodedParticle{}},
+		{"TempEntity", DecodedTempEntity{Kind: TEGunshot}},
 		{"Sound", DecodedSound{}},
 		{"Baseline", DecodedBaseline{}},
 		{"Update", DecodedUpdate{}},
@@ -772,12 +775,12 @@ func TestApply_DocumentedNoOps_DoNotMutate(t *testing.T) {
 	}{
 		{"Print", DecodedPrint{Text: "hi"}},
 		{"StuffText", DecodedStuffText{Text: "exec config.cfg"}},
-		{"Finale", DecodedFinale{Text: "Episode 1 complete"}},
 		{"Cutscene", DecodedCutscene{Text: "..."}},
 		{"SellScreen", DecodedSellScreen{}},
 		{"KilledMonster", DecodedKilledMonster{}},
 		{"FoundSecret", DecodedFoundSecret{}},
 		{"Particle", DecodedParticle{Origin: [3]float32{1, 2, 3}, Count: 10}},
+		{"TempEntity", DecodedTempEntity{Kind: TEGunshot, Origin: [3]float32{1, 2, 3}}},
 		{"Sound", DecodedSound{EntityIdx: 5, SoundNum: 10, Volume: 200}},
 	}
 	for _, c := range cases {
@@ -813,6 +816,114 @@ func TestApply_DocumentedNoOps_DoNotMutate(t *testing.T) {
 	}
 }
 
+// --- DecodedParticle dispatch ------------------------------------------
+
+func TestApply_Particle_NoSink_StateUnmodified(t *testing.T) {
+	s := NewState()
+	s.Health = 77
+	msg := DecodedParticle{
+		Origin: [3]float32{1, 2, 3},
+		Dir:    [3]float32{0, 0, 1},
+		Color:  73,
+		Count:  64,
+	}
+	if err := Apply(s, msg, 5.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	// EmitParticles is nil, so the arm is a silent no-op + Health
+	// stays put. MsgTime still updates (always-on side effect).
+	if s.Health != 77 {
+		t.Fatalf("Health = %d, want 77", s.Health)
+	}
+	if s.MsgTime != 5.0 {
+		t.Fatalf("MsgTime = %v, want 5.0", s.MsgTime)
+	}
+}
+
+func TestApply_Particle_SinkInvokedWithDecodedArgs(t *testing.T) {
+	s := NewState()
+	var got struct {
+		origin, dir [3]float32
+		color       int
+		count       int
+		calls       int
+	}
+	s.EmitParticles = func(origin, dir [3]float32, color, count int) {
+		got.origin = origin
+		got.dir = dir
+		got.color = color
+		got.count = count
+		got.calls++
+	}
+	msg := DecodedParticle{
+		Origin: [3]float32{10, 20, 30},
+		Dir:    [3]float32{-1, 0, 1},
+		Color:  73,
+		Count:  20,
+	}
+	if err := Apply(s, msg, 3.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if got.calls != 1 {
+		t.Fatalf("sink calls = %d, want 1", got.calls)
+	}
+	if got.origin != msg.Origin || got.dir != msg.Dir ||
+		got.color != msg.Color || got.count != msg.Count {
+		t.Fatalf("sink args mismatch: got %+v, want %+v", got, msg)
+	}
+}
+
+// --- DecodedTempEntity dispatch ----------------------------------------
+
+func TestApply_TempEntity_NoSink_StateUnmodified(t *testing.T) {
+	s := NewState()
+	s.Health = 44
+	msg := DecodedTempEntity{Kind: TEGunshot, Origin: [3]float32{9, 8, 7}}
+	if err := Apply(s, msg, 4.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.Health != 44 {
+		t.Fatalf("Health = %d, want 44", s.Health)
+	}
+	if s.MsgTime != 4.0 {
+		t.Fatalf("MsgTime = %v, want 4.0", s.MsgTime)
+	}
+}
+
+func TestApply_TempEntity_SinkInvokedPerKind(t *testing.T) {
+	s := NewState()
+	type capture struct {
+		kind   int
+		origin [3]float32
+	}
+	var caught []capture
+	s.EmitTempEntity = func(kind int, origin [3]float32) {
+		caught = append(caught, capture{kind: kind, origin: origin})
+	}
+	kinds := []TempEntityKind{
+		TESpike, TESuperSpike, TEGunshot, TEExplosion,
+		TETarExplosion, TEWizSpike, TEKnightSpike,
+		TELavaSplash, TETeleport,
+	}
+	for i, k := range kinds {
+		msg := DecodedTempEntity{Kind: k, Origin: [3]float32{float32(i), 0, 0}}
+		if err := Apply(s, msg, 1.0); err != nil {
+			t.Fatalf("Apply kind=%v: %v", k, err)
+		}
+	}
+	if len(caught) != len(kinds) {
+		t.Fatalf("captured %d, want %d", len(caught), len(kinds))
+	}
+	for i, k := range kinds {
+		if caught[i].kind != int(k) {
+			t.Fatalf("call %d kind = %d, want %d", i, caught[i].kind, k)
+		}
+		if caught[i].origin[0] != float32(i) {
+			t.Fatalf("call %d origin = %v, want [%d,0,0]", i, caught[i].origin, i)
+		}
+	}
+}
+
 // --- applyBadStateErr internals -----------------------------------------
 
 // Direct exercise of the wrapper's Is/Unwrap protocol to lock the
@@ -834,5 +945,211 @@ func TestApplyBadStateErr_IsAndUnwrap(t *testing.T) {
 	otherSentinel := errors.New("unrelated")
 	if errors.Is(w, otherSentinel) {
 		t.Error("Is(unrelated): true; want false")
+	}
+}
+
+// --- DecodedCenterPrint --------------------------------------------------
+
+func TestApply_CenterPrint_SetsTextAndExpiry(t *testing.T) {
+	s := NewState()
+	const now float32 = 7.5
+	const text = "you got the shotgun"
+	if err := Apply(s, DecodedCenterPrint{Text: text}, now); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.CenterPrintText != text {
+		t.Errorf("CenterPrintText = %q want %q", s.CenterPrintText, text)
+	}
+	wantExpiry := now + CenterPrintLifetime
+	if s.CenterPrintExpiry != wantExpiry {
+		t.Errorf("CenterPrintExpiry = %v want %v", s.CenterPrintExpiry, wantExpiry)
+	}
+	if s.MsgTime != now {
+		t.Errorf("MsgTime = %v want %v", s.MsgTime, now)
+	}
+}
+
+func TestApply_CenterPrint_EmptyTextClearsExpiry(t *testing.T) {
+	s := NewState()
+	// Pre-seed an active centerprint so we can verify the empty arm
+	// clears it.
+	s.CenterPrintText = "stale"
+	s.CenterPrintExpiry = 42
+	if err := Apply(s, DecodedCenterPrint{Text: ""}, 3.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.CenterPrintText != "" {
+		t.Errorf("CenterPrintText = %q want empty", s.CenterPrintText)
+	}
+	if s.CenterPrintExpiry != 0 {
+		t.Errorf("CenterPrintExpiry = %v want 0 (empty text clears expiry)", s.CenterPrintExpiry)
+	}
+}
+
+// --- DecodedIntermission arm -------------------------------------------
+
+// svc_intermission flips State.Intermission true, leaves
+// IntermissionText empty (scoreboard mode), stamps IntermissionTime
+// with nowSec, AND clears any active centerprint banner.
+func TestApply_Intermission_FlipsFlag(t *testing.T) {
+	s := NewState()
+	s.CenterPrintText = "you got the shotgun"
+	s.CenterPrintExpiry = 99
+	if err := Apply(s, DecodedIntermission{}, 12.5); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !s.Intermission {
+		t.Error("Intermission: got false want true")
+	}
+	if s.IntermissionText != "" {
+		t.Errorf("IntermissionText: got %q want empty (scoreboard mode)", s.IntermissionText)
+	}
+	if s.IntermissionTime != 12.5 {
+		t.Errorf("IntermissionTime: got %v want 12.5", s.IntermissionTime)
+	}
+	if s.CenterPrintText != "" || s.CenterPrintExpiry != 0 {
+		t.Errorf("centerprint not cleared: text=%q expiry=%v",
+			s.CenterPrintText, s.CenterPrintExpiry)
+	}
+}
+
+// --- DecodedFinale arm ------------------------------------------------
+
+// svc_finale flips State.Intermission true AND stashes the
+// caller-supplied credits text. Centerprint is cleared too.
+func TestApply_Finale_StashesText(t *testing.T) {
+	s := NewState()
+	s.CenterPrintText = "stale"
+	s.CenterPrintExpiry = 9
+	const credits = "Episode 1 complete\n\nWell done, Ranger"
+	if err := Apply(s, DecodedFinale{Text: credits}, 30.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !s.Intermission {
+		t.Error("Intermission: got false want true")
+	}
+	if s.IntermissionText != credits {
+		t.Errorf("IntermissionText: got %q want %q", s.IntermissionText, credits)
+	}
+	if s.IntermissionTime != 30.0 {
+		t.Errorf("IntermissionTime: got %v want 30", s.IntermissionTime)
+	}
+	if s.CenterPrintText != "" || s.CenterPrintExpiry != 0 {
+		t.Errorf("centerprint not cleared: text=%q expiry=%v",
+			s.CenterPrintText, s.CenterPrintExpiry)
+	}
+}
+
+// Finale with empty text still flips Intermission. The renderer's
+// drawIntermission helper tolerates an empty IntermissionText (the
+// runloop's intermissionLines helper passes [""] in that case).
+func TestApply_Finale_EmptyText_StillFlipsFlag(t *testing.T) {
+	s := NewState()
+	if err := Apply(s, DecodedFinale{}, 1.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !s.Intermission {
+		t.Error("Intermission: got false want true")
+	}
+	if s.IntermissionText != "" {
+		t.Errorf("IntermissionText: got %q want empty", s.IntermissionText)
+	}
+}
+
+// Intermission cleared on Disconnect (covered indirectly via Clear).
+func TestApply_Intermission_ClearedOnDisconnect(t *testing.T) {
+	s := NewState()
+	s.Intermission = true
+	s.IntermissionText = "x"
+	s.IntermissionTime = 7
+	if err := Apply(s, DecodedDisconnect{}, 0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.Intermission || s.IntermissionText != "" || s.IntermissionTime != 0 {
+		t.Errorf("Disconnect did not clear intermission: %+v", s)
+	}
+}
+
+// --- DecodedCDTrack arm ---------------------------------------------
+
+// Happy path: Apply writes (Track, LoopTrack) and bumps the epoch.
+func TestApply_CDTrack_HappyPath(t *testing.T) {
+	s := NewState()
+	if err := Apply(s, DecodedCDTrack{Track: 5, LoopTrack: 5}, 1.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.MusicTrack != 5 {
+		t.Errorf("MusicTrack: got %d want 5", s.MusicTrack)
+	}
+	if s.MusicLoopTrack != 5 {
+		t.Errorf("MusicLoopTrack: got %d want 5", s.MusicLoopTrack)
+	}
+	if s.MusicEpoch != 1 {
+		t.Errorf("MusicEpoch: got %d want 1", s.MusicEpoch)
+	}
+}
+
+// Repeated apply bumps the epoch each time (so a server retransmit
+// re-triggers the embedder's open path, mirroring the upstream
+// "BGM_PlayCDtrack restarts the stream" semantics).
+func TestApply_CDTrack_EpochBumpsOnEachCall(t *testing.T) {
+	s := NewState()
+	for i := uint64(1); i <= 4; i++ {
+		if err := Apply(s, DecodedCDTrack{Track: 5, LoopTrack: 5}, 1.0); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if s.MusicEpoch != i {
+			t.Errorf("after call %d: MusicEpoch=%d want %d", i, s.MusicEpoch, i)
+		}
+	}
+}
+
+// Distinct tracks land on distinct fields and bump the epoch.
+func TestApply_CDTrack_DistinctTracks(t *testing.T) {
+	s := NewState()
+	if err := Apply(s, DecodedCDTrack{Track: 7, LoopTrack: 11}, 0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.MusicTrack != 7 || s.MusicLoopTrack != 11 {
+		t.Errorf("(MusicTrack, MusicLoopTrack): got (%d, %d) want (7, 11)",
+			s.MusicTrack, s.MusicLoopTrack)
+	}
+}
+
+// Track 0 (silence) is wire-legal and lands as MusicTrack==0 + bumps
+// epoch so the embedder driver tears down the streamer.
+func TestApply_CDTrack_TrackZeroSilence(t *testing.T) {
+	s := NewState()
+	s.MusicTrack = 5
+	s.MusicLoopTrack = 5
+	s.MusicEpoch = 3
+	if err := Apply(s, DecodedCDTrack{Track: 0, LoopTrack: 0}, 0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if s.MusicTrack != 0 || s.MusicLoopTrack != 0 {
+		t.Errorf("silence: got (%d, %d) want (0, 0)", s.MusicTrack, s.MusicLoopTrack)
+	}
+	if s.MusicEpoch != 4 {
+		t.Errorf("MusicEpoch: got %d want 4", s.MusicEpoch)
+	}
+}
+
+// Clear preserves MusicEpoch (so the embedder's monotonic driver
+// counter doesn't regress on a map change) but resets the active
+// MusicTrack / MusicLoopTrack to 0.
+func TestApply_CDTrack_ClearPreservesEpochResetsTracks(t *testing.T) {
+	s := NewState()
+	if err := Apply(s, DecodedCDTrack{Track: 5, LoopTrack: 5}, 1.0); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	preEpoch := s.MusicEpoch
+	s.Clear()
+	if s.MusicEpoch != preEpoch {
+		t.Errorf("MusicEpoch after Clear: got %d want %d (preserved across wipe)",
+			s.MusicEpoch, preEpoch)
+	}
+	if s.MusicTrack != 0 || s.MusicLoopTrack != 0 {
+		t.Errorf("(MusicTrack, MusicLoopTrack) after Clear: got (%d, %d) want (0, 0)",
+			s.MusicTrack, s.MusicLoopTrack)
 	}
 }

@@ -81,3 +81,75 @@ func EncodeParticle(buf *sizebuf.Buffer, org, dir [3]float32, color, count int) 
 	}
 	return nil
 }
+
+// ErrLightningKind is returned by [EncodeLightning] when kind is not
+// one of the four canonical lightning/beam sub-types (TE_LIGHTNING1 /
+// 2 / 3 / TE_BEAM). The upstream Sys_Errors on a bad sub-type byte;
+// the Go port surfaces a recoverable error so caller mistakes don't
+// kill the whole tick.
+var ErrLightningKind = errors.New("server: EncodeLightning: kind not in {TELightning1, TELightning2, TELightning3, TEBeam}")
+
+// lightningReserve is the byte budget [EncodeLightning] reserves at
+// the END of the datagram. Wire size = 2 (svc + kind) + 2 (entity
+// short) + 6 (start coord triple) + 6 (end coord triple) = 16 bytes;
+// the upstream's bail margin is `MAX_DATAGRAM - 16` (same as
+// particleReserve). Rounded to 24 here so the same threshold protects
+// any svc_temp_entity body whose payload extends past the canonical
+// 16-byte shape.
+const lightningReserve = 24
+
+// EncodeLightning writes one svc_temp_entity LIGHTNING/BEAM event into
+// buf: the lightning sub-type byte (TE_LIGHTNING1 / 2 / 3 / TE_BEAM),
+// the owning entity index, and the (start, end) coord triples
+// describing the traceline the bolt was fired along. tyrquake: the
+// `MSG_WriteByte(&sv.datagram, svc_temp_entity); MSG_WriteByte(...,
+// TE_LIGHTNING2); MSG_WriteShort(..., NUM_FOR_EDICT(self));
+// MSG_WriteCoord(..., start[i]); MSG_WriteCoord(..., end[i]);` body
+// inside PF_WriteCoord-bearing builtins -- the same shape the
+// client's [client.SvcReader.decodeTELightning] reads back.
+//
+// Wire shape (16 bytes):
+//
+//	byte    svc_temp_entity        (cmd)
+//	byte    TE_LIGHTNING[1|2|3] |
+//	        TE_BEAM                (sub-type)
+//	short   owning entity index
+//	coord*3 start                  (6 bytes)
+//	coord*3 end                    (6 bytes)
+//
+// Returns [ErrLightningKind] when kind isn't recognized;
+// [ErrDatagramFull] when buf is within lightningReserve bytes of its
+// capacity; any propagated msg.Write* error otherwise.
+func EncodeLightning(buf *sizebuf.Buffer, kind, ent int, start, end [3]float32) error {
+	if buf == nil {
+		return errors.New("server: nil sizebuf")
+	}
+	switch kind {
+	case protocol.TELightning1, protocol.TELightning2, protocol.TELightning3, protocol.TEBeam:
+	default:
+		return ErrLightningKind
+	}
+	if buf.Len() > MaxDatagram-lightningReserve {
+		return ErrDatagramFull
+	}
+	if err := msg.WriteByte(buf, protocol.SvcTempEntity); err != nil {
+		return err
+	}
+	if err := msg.WriteByte(buf, kind); err != nil {
+		return err
+	}
+	if err := msg.WriteShort(buf, ent); err != nil {
+		return err
+	}
+	for axis := 0; axis < 3; axis++ {
+		if err := msg.WriteCoord(buf, start[axis]); err != nil {
+			return err
+		}
+	}
+	for axis := 0; axis < 3; axis++ {
+		if err := msg.WriteCoord(buf, end[axis]); err != nil {
+			return err
+		}
+	}
+	return nil
+}

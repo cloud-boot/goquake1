@@ -229,3 +229,170 @@ func TestCompose2D_SkipBackgroundFill(t *testing.T) {
 		}
 	}
 }
+
+// TestCompose2D_CenterPrintRenderedAtFortyPercent drives the
+// centerprint overlay through Compose2D + asserts a glyph lands at
+// (fb.Height * 2 / 5). The single-char banner "X" lands one glyph
+// wide centered on Screen.CenterX -> the left edge is CenterX -
+// CharWidth/2; the glyph fill 'X' = 0x58 maps to row=5 col=8 in the
+// makeCharsSheet helper, so fill = 0x10 + 5*16 + 8 = 0x68.
+func TestCompose2D_CenterPrintRenderedAtFortyPercent(t *testing.T) {
+	fb, ctx := newComposeCtx(t)
+	ctx.CenterPrintText = "X"
+	ctx.CenterPrintExpiry = ctx.Now + 1 // 1s of life left
+	if err := Compose2D(fb, ctx); err != nil {
+		t.Fatalf("Compose2D: %v", err)
+	}
+	y := fb.Height * 2 / 5
+	// Single 'X', centered on CenterX -> left = CenterX - CharWidth/2.
+	leftX := ctx.Screen.CenterX - CharWidth/2
+	idx := y*fb.Pitch + leftX
+	if fb.Pixels[idx] != 0x68 {
+		t.Fatalf("centerprint glyph pixel at (x=%d,y=%d) = %#x want 0x68 ('X' fill)", leftX, y, fb.Pixels[idx])
+	}
+}
+
+// TestCompose2D_CenterPrintEmptyTextSkipped verifies an empty
+// CenterPrintText leaves the centerprint anchor untouched (no
+// DrawCenteredString runs).
+func TestCompose2D_CenterPrintEmptyTextSkipped(t *testing.T) {
+	fb, ctx := newComposeCtx(t)
+	ctx.CenterPrintText = ""
+	ctx.CenterPrintExpiry = ctx.Now + 5
+	if err := Compose2D(fb, ctx); err != nil {
+		t.Fatalf("Compose2D: %v", err)
+	}
+	y := fb.Height * 2 / 5
+	leftX := ctx.Screen.CenterX - CharWidth/2
+	if fb.Pixels[y*fb.Pitch+leftX] != ctx.BackgroundIdx {
+		t.Fatalf("centerprint anchor wrote despite empty text")
+	}
+}
+
+// TestCompose2D_CenterPrintExpiredSkipped verifies an expired
+// centerprint (Now >= CenterPrintExpiry) is NOT drawn.
+func TestCompose2D_CenterPrintExpiredSkipped(t *testing.T) {
+	fb, ctx := newComposeCtx(t)
+	ctx.CenterPrintText = "X"
+	ctx.CenterPrintExpiry = ctx.Now - 1 // already expired
+	if err := Compose2D(fb, ctx); err != nil {
+		t.Fatalf("Compose2D: %v", err)
+	}
+	y := fb.Height * 2 / 5
+	leftX := ctx.Screen.CenterX - CharWidth/2
+	if fb.Pixels[y*fb.Pitch+leftX] != ctx.BackgroundIdx {
+		t.Fatalf("expired centerprint was still drawn")
+	}
+}
+
+// TestCompose2D_CenterPrintExactExpirySkipped verifies the boundary
+// case Now == CenterPrintExpiry (the strict-less-than guard treats it
+// as expired -- matches the upstream's scr_centertime_off > 0 check).
+func TestCompose2D_CenterPrintExactExpirySkipped(t *testing.T) {
+	fb, ctx := newComposeCtx(t)
+	ctx.CenterPrintText = "X"
+	ctx.CenterPrintExpiry = ctx.Now // boundary -- treat as expired
+	if err := Compose2D(fb, ctx); err != nil {
+		t.Fatalf("Compose2D: %v", err)
+	}
+	y := fb.Height * 2 / 5
+	leftX := ctx.Screen.CenterX - CharWidth/2
+	if fb.Pixels[y*fb.Pitch+leftX] != ctx.BackgroundIdx {
+		t.Fatalf("centerprint drawn at Now == Expiry boundary; want expired")
+	}
+}
+
+// --- Intermission overlay ----------------------------------------
+
+// Intermission true + a single-line block: the centered text lands
+// on the centerY row. With one line, y0 = fb.Height/2 - CharHeight/2.
+// "X" -> left = CenterX - CharWidth/2; the 'X' fill (0x68) appears
+// at the line's anchor pixel.
+func TestCompose2D_Intermission_DrawsLineBlockCentered(t *testing.T) {
+	fb, ctx := newComposeCtx(t)
+	ctx.Intermission = true
+	ctx.IntermissionLines = []string{"X"}
+	if err := Compose2D(fb, ctx); err != nil {
+		t.Fatalf("Compose2D: %v", err)
+	}
+	y := fb.Height/2 - CharHeight/2
+	leftX := ctx.Screen.CenterX - CharWidth/2
+	if fb.Pixels[y*fb.Pitch+leftX] != 0x68 {
+		t.Fatalf("intermission glyph pixel = %#x want 0x68 ('X' fill)",
+			fb.Pixels[y*fb.Pitch+leftX])
+	}
+}
+
+// Intermission true suppresses centerprint even if CenterPrintText is
+// non-empty + expiry in future.
+func TestCompose2D_Intermission_SuppressesCenterPrint(t *testing.T) {
+	fb, ctx := newComposeCtx(t)
+	ctx.Intermission = true
+	ctx.IntermissionLines = nil // empty intermission block
+	ctx.CenterPrintText = "X"
+	ctx.CenterPrintExpiry = ctx.Now + 100
+	if err := Compose2D(fb, ctx); err != nil {
+		t.Fatalf("Compose2D: %v", err)
+	}
+	// Centerprint would land at 2/5 height. Intermission must suppress
+	// it; that pixel stays at the background fill.
+	y := fb.Height * 2 / 5
+	leftX := ctx.Screen.CenterX - CharWidth/2
+	if fb.Pixels[y*fb.Pitch+leftX] != ctx.BackgroundIdx {
+		t.Fatalf("centerprint drawn despite Intermission flag: pixel=%#x",
+			fb.Pixels[y*fb.Pitch+leftX])
+	}
+}
+
+// Intermission true + empty IntermissionLines = no-op (no glyphs
+// drawn, no error). The framebuffer stays at the background fill.
+func TestCompose2D_Intermission_EmptyLinesNoOp(t *testing.T) {
+	fb, ctx := newComposeCtx(t)
+	ctx.Intermission = true
+	ctx.IntermissionLines = nil
+	if err := Compose2D(fb, ctx); err != nil {
+		t.Fatalf("Compose2D: %v", err)
+	}
+	for i, p := range fb.Pixels {
+		if p != 0x99 {
+			t.Fatalf("pixel[%d] = %#x; want background 0x99 (empty intermission block draws nothing)", i, p)
+		}
+	}
+}
+
+// Intermission glyph error path: a malformed chars Pic propagates
+// the same ErrDrawCharsShape sentinel out of Compose2D. We close the
+// console + clear notify so the only DrawCharacter call is the
+// intermission line.
+func TestCompose2D_Intermission_ErrorPropagated(t *testing.T) {
+	fb, ctx := newComposeCtx(t)
+	ctx.Chars = &Pic{Width: 4, Height: 4, Pixels: make([]byte, 16)}
+	ctx.Console, _ = NewConsole(MinConsoleWidth, MinConsoleLines)
+	ctx.Screen.ConCurrent = 0
+	ctx.Intermission = true
+	ctx.IntermissionLines = []string{"X"}
+	err := Compose2D(fb, ctx)
+	if !errors.Is(err, ErrDrawCharsShape) {
+		t.Fatalf("err = %v want ErrDrawCharsShape (intermission should propagate DrawCharacter errors)", err)
+	}
+}
+
+// TestCompose2D_CenterPrintErrorPropagated proves DrawCenteredString
+// errors propagate out of Compose2D verbatim. A mis-sized chars Pic
+// trips ErrDrawCharsShape inside DrawCharacter.
+func TestCompose2D_CenterPrintErrorPropagated(t *testing.T) {
+	fb, ctx := newComposeCtx(t)
+	// Stash a 4x4 chars Pic that DrawCharacter will reject.
+	ctx.Chars = &Pic{Width: 4, Height: 4, Pixels: make([]byte, 16)}
+	// Skip the console/notify paths (they'd trip the same error first).
+	ctx.CenterPrintText = "X"
+	ctx.CenterPrintExpiry = ctx.Now + 1
+	// Empty the notify + close the console so the only DrawCharacter
+	// call originates from the centerprint arm.
+	ctx.Console, _ = NewConsole(MinConsoleWidth, MinConsoleLines)
+	ctx.Screen.ConCurrent = 0
+	err := Compose2D(fb, ctx)
+	if !errors.Is(err, ErrDrawCharsShape) {
+		t.Fatalf("err = %v want ErrDrawCharsShape (centerprint should propagate DrawCharacter errors)", err)
+	}
+}

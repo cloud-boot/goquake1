@@ -221,12 +221,13 @@ func TestBuiltin_Ceil(t *testing.T) {
 	}
 }
 
-// --- RegisterMathBuiltins wires all 9 ---
+// --- RegisterMathBuiltins wires all 10 ---
 
 func TestRegisterMathBuiltins(t *testing.T) {
 	vm := builtinVM()
 	vm.RegisterMathBuiltins()
 	required := []int{
+		BuiltinMakeVectors,
 		BuiltinRandom, BuiltinNormalize, BuiltinVLen,
 		BuiltinVecToYaw, BuiltinVecToAngles, BuiltinFAbs,
 		BuiltinRInt, BuiltinFloor, BuiltinCeil,
@@ -235,6 +236,150 @@ func TestRegisterMathBuiltins(t *testing.T) {
 		if vm.builtins[idx] == nil {
 			t.Errorf("builtin %d not registered", idx)
 		}
+	}
+}
+
+// --- MAKEVECTORS -----------------------------------------------------------
+
+// progsForMakeVectors builds a stub Progs with v_forward / v_right /
+// v_up globals declared at distinct vec3-aligned offsets so
+// BuiltinFnMakeVectors's FindGlobal lookups land and the writes can
+// be observed via GlobalVector.
+func progsForMakeVectors() *Progs {
+	strs := []byte{0}
+	fwdName := int32(len(strs))
+	strs = append(strs, []byte("v_forward")...)
+	strs = append(strs, 0)
+	rgtName := int32(len(strs))
+	strs = append(strs, []byte("v_right")...)
+	strs = append(strs, 0)
+	upName := int32(len(strs))
+	strs = append(strs, []byte("v_up")...)
+	strs = append(strs, 0)
+
+	const fwdOfs, rgtOfs, upOfs = 30, 33, 36
+
+	return &Progs{
+		Header:     Header{EntityFields: 32},
+		Strings:    strs,
+		Globals:    make([]byte, 256*globalSlotSize),
+		Statements: []Statement{{Op: OP_DONE}},
+		Functions: []Function{
+			{FirstStatement: 0, SName: 0},
+		},
+		GlobalDefs: []Def{
+			{Type: uint16(EvVector), Ofs: fwdOfs, SName: fwdName},
+			{Type: uint16(EvVector), Ofs: rgtOfs, SName: rgtName},
+			{Type: uint16(EvVector), Ofs: upOfs, SName: upName},
+		},
+	}
+}
+
+// BuiltinFnMakeVectors at the zero rotation: forward = +X, right =
+// -Y, up = +Z (matching mathlib.AngleVectors's identity-rotation
+// shape).
+func TestBuiltin_MakeVectors_Identity(t *testing.T) {
+	p := progsForMakeVectors()
+	vm := NewVM(p)
+	_ = vm.SetGlobalVector(OfsParm0, [3]float32{0, 0, 0})
+	if err := BuiltinFnMakeVectors(vm); err != nil {
+		t.Fatalf("BuiltinFnMakeVectors: %v", err)
+	}
+	fwdDef := p.FindGlobal("v_forward")
+	if fwdDef == nil {
+		t.Fatal("v_forward def missing")
+	}
+	fwd, _ := vm.GlobalVector(int(fwdDef.Ofs))
+	if fwd != ([3]float32{1, 0, 0}) {
+		t.Errorf("v_forward got %v want {1,0,0}", fwd)
+	}
+	rgtDef := p.FindGlobal("v_right")
+	rgt, _ := vm.GlobalVector(int(rgtDef.Ofs))
+	if rgt != ([3]float32{0, -1, 0}) {
+		t.Errorf("v_right got %v want {0,-1,0}", rgt)
+	}
+	upDef := p.FindGlobal("v_up")
+	up, _ := vm.GlobalVector(int(upDef.Ofs))
+	if up != ([3]float32{0, 0, 1}) {
+		t.Errorf("v_up got %v want {0,0,1}", up)
+	}
+}
+
+// BuiltinFnMakeVectors at yaw=90 (looking +Y): forward = +Y.
+// The 90-degree rotation tests that the AngleVectors plumbing is
+// real (not a pass-through of the input).
+func TestBuiltin_MakeVectors_Yaw90(t *testing.T) {
+	p := progsForMakeVectors()
+	vm := NewVM(p)
+	_ = vm.SetGlobalVector(OfsParm0, [3]float32{0, 90, 0})
+	if err := BuiltinFnMakeVectors(vm); err != nil {
+		t.Fatalf("BuiltinFnMakeVectors: %v", err)
+	}
+	fwdDef := p.FindGlobal("v_forward")
+	fwd, _ := vm.GlobalVector(int(fwdDef.Ofs))
+	// cos(90deg) ~= 0, sin(90deg) = 1 -- forward = (cp*cy, cp*sy, -sp)
+	// = (~0, ~1, 0). Use a coarse tolerance on the near-zero leg
+	// because Go's math.Cos(pi/2) returns a tiny non-zero residual.
+	if math.Abs(float64(fwd[0])) > 1e-6 || math.Abs(float64(fwd[1]-1)) > 1e-6 || fwd[2] != 0 {
+		t.Errorf("yaw=90 v_forward got %v want ~{0,1,0}", fwd)
+	}
+}
+
+// BuiltinFnMakeVectors with a Progs that declares no v_forward etc:
+// silent no-op (writes skip per-name; no error).
+func TestBuiltin_MakeVectors_MissingGlobals(t *testing.T) {
+	p := progsForVM(nil) // no GlobalDefs at all
+	vm := NewVM(p)
+	_ = vm.SetGlobalVector(OfsParm0, [3]float32{0, 0, 0})
+	if err := BuiltinFnMakeVectors(vm); err != nil {
+		t.Errorf("MakeVectors with no globals: %v want nil", err)
+	}
+}
+
+// BuiltinFnMakeVectors with a nil VM is a no-op no-error guard
+// (matches the defensive shape of the rest of the math builtin
+// family).
+func TestBuiltin_MakeVectors_NilVM(t *testing.T) {
+	if err := BuiltinFnMakeVectors(nil); err != nil {
+		t.Errorf("MakeVectors(nil): %v want nil", err)
+	}
+}
+
+// BuiltinFnMakeVectors with a VM whose progs is nil (impossible via
+// the public NewVM API but defensible): silent no-op.
+func TestBuiltin_MakeVectors_NilProgs(t *testing.T) {
+	vm := &VM{}
+	if err := BuiltinFnMakeVectors(vm); err != nil {
+		t.Errorf("MakeVectors(nil-progs VM): %v want nil", err)
+	}
+}
+
+// BuiltinFnMakeVectors surfaces ErrGlobalOffset when v_forward's
+// declared offset overruns the Globals buffer (defensive: a
+// malformed progs.dat). The SetGlobalVector call returns the error;
+// the builtin propagates it verbatim.
+func TestBuiltin_MakeVectors_OutOfRangeGlobalSurfaceError(t *testing.T) {
+	strs := []byte{0}
+	fwdName := int32(len(strs))
+	strs = append(strs, []byte("v_forward")...)
+	strs = append(strs, 0)
+	// Globals sized to 32 slots; declare v_forward at slot 100 so
+	// the SetGlobalVector at ofs=100 (= 400 bytes) overruns and
+	// returns ErrGlobalOffset.
+	p := &Progs{
+		Header:     Header{EntityFields: 8},
+		Strings:    strs,
+		Globals:    make([]byte, 32*globalSlotSize),
+		Statements: []Statement{{Op: OP_DONE}},
+		Functions:  []Function{{FirstStatement: 0, SName: 0}},
+		GlobalDefs: []Def{
+			{Type: uint16(EvVector), Ofs: 100, SName: fwdName},
+		},
+	}
+	vm := NewVM(p)
+	_ = vm.SetGlobalVector(OfsParm0, [3]float32{0, 0, 0})
+	if err := BuiltinFnMakeVectors(vm); !errors.Is(err, ErrGlobalOffset) {
+		t.Errorf("got %v want ErrGlobalOffset", err)
 	}
 }
 

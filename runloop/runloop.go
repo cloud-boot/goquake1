@@ -9,6 +9,9 @@ import (
 
 	"github.com/go-quake1/engine/backend"
 	"github.com/go-quake1/engine/client"
+	"github.com/go-quake1/engine/menu"
+	"github.com/go-quake1/engine/music"
+	"github.com/go-quake1/engine/protocol"
 	"github.com/go-quake1/engine/render"
 	"github.com/go-quake1/engine/server"
 	"github.com/go-quake1/engine/sound"
@@ -56,10 +59,30 @@ type Runner struct {
 	// Audio state.
 	SoundPool *sound.Pool
 
+	// Particle pool. Optional (nil = no per-tic particle advance,
+	// matches the historical bring-up behaviour from the renderer
+	// pre-this-batch). When non-nil [RunFrame] calls Pool.Run between
+	// the client tick and the Pre2DDraw hook so the closure can hand
+	// the already-advanced pool to DrawParticles/DrawParticleQuads.
+	ParticlePool *render.Pool
+	// ParticleGravity is the world-gravity scalar fed into
+	// Pool.Run -- typically the server's sv_gravity cvar (default
+	// 800 in Q1). Zero = no gravity force on ParticleGrav/Slow types.
+	ParticleGravity float32
+
 	// Per-frame input bundles (advanced by the input event handler).
 	Buttons    client.MovementButtons
 	Speeds     client.InputSpeeds
 	ViewAngles [3]float32
+
+	// ConsoleOpen tracks whether the developer console drop-down is
+	// currently armed (true) or closed (false). Toggled on the down-
+	// edge of [backend.KeyTilde] by [RunFrame]. The per-frame
+	// AnimateConsole call lerps Screen.ConCurrent toward
+	// Screen.ConLines when open / 0 when closed at ScrollSpeed
+	// pixels per tick. tyrquake: the boolean Con_ToggleConsole_f
+	// flips, surfaced through key_dest = key_console / key_game.
+	ConsoleOpen bool
 
 	// Triggers tracks the held state of the on-wire trigger keys
 	// (mouse-fire = +attack, Enter = +jump). Translated to the
@@ -109,6 +132,98 @@ type Runner struct {
 	// Errors propagate from RunFrame verbatim (the present /
 	// audio steps are skipped for that tic).
 	Pre2DDraw func(fb *render.FrameBuffer, viewOrigin [3]float32, viewAngles [3]float32) error
+
+	// Menu is the optional [menu.Menu] state machine the runloop
+	// drives ahead of the world pass. When Menu != nil AND
+	// Menu.Active() returns true the runloop:
+	//
+	//   - routes per-frame KeysDown events into Menu.Handle BEFORE
+	//     they reach the movement/trigger button mappers, so a key
+	//     consumed by the menu does not also drive the player edict;
+	//   - SKIPS the Host.Frame tic (the game world stays paused) +
+	//     the Pre2DDraw closure (no 3D BSP walk);
+	//   - calls Menu.Draw into fb in the Pre2DDraw slot so the menu
+	//     overlay is the only scene composed on top of the 2D layer.
+	//
+	// Esc-while-not-in-menu opens the menu (Menu.Open). The runloop
+	// then sets the frozen-world flag on the NEXT tic so the in-game
+	// pause is single-frame sharp.
+	//
+	// nil = previous behaviour (no menu; world pass + input run
+	// unconditionally).
+	Menu *menu.Menu
+
+	// MenuAssets is the WAD-pic bundle Menu.Draw paints with. nil
+	// falls back to the text-only path inside [menu.Menu.Draw].
+	MenuAssets *menu.Assets
+
+	// Demo is the optional attract-loop demo-playback state. When
+	// non-nil (and the menu is at the title screen) [Runner.RunFrame]
+	// substitutes a [demo.PlayTick] call for the live host.Frame so
+	// the recorded stream drives the client state per-tic. Any
+	// KeyDown event halts the demo (vanilla "any key drops you out
+	// of the attract loop"); on io.EOF the optional Restart closure
+	// re-opens the source for the next loop. See [Demo] for the
+	// full lifecycle.
+	//
+	// nil = no demo. The runner falls back to the normal host.Frame
+	// + client.Tick path verbatim.
+	Demo *Demo
+
+	// MusicOpen is the pak-agnostic asset resolver the music driver
+	// consults whenever the wire-received [client.State.MusicTrack]
+	// changes. The closure should return (blob, true) when
+	// "music/track%02d.ogg" exists in the asset source, (nil, false)
+	// otherwise.
+	//
+	// nil disables the music driver entirely; the audio pipeline
+	// still runs SFX through [sound.Paint] but no music is decoded.
+	// This keeps the runloop usable on builds whose pak omits the
+	// .ogg files (the typical shareware bring-up state).
+	MusicOpen music.OpenFunc
+
+	// MusicDecoder is the [music.DecoderFactory] the driver uses to
+	// parse the OGG/Vorbis blob into a streaming [music.Decoder].
+	// Production callers pass [music.NewVorbisDecoder]; tests pass
+	// a fake. nil + a non-nil MusicOpen surfaces as a degraded
+	// "skip the music driver entirely" path (same as nil MusicOpen);
+	// the runloop logs nothing in either case (the embedder owns
+	// the "music missing" log via the resolver-side closure if it
+	// wants one).
+	MusicDecoder music.DecoderFactory
+
+	// MusicVolume is the per-stream mix scale the driver passes to
+	// [music.LoadTrack]. Zero defaults to [music.DefaultVolume].
+	MusicVolume float32
+
+	// MusicMissingLog is the optional "music track XX missing" sink
+	// the driver fires ONCE per (MusicTrack, MusicLoopTrack) pair
+	// whose resolver returned (nil, false). Mirrors the
+	// vanilla-engine "QUAKE: missing music track XX -- silent"
+	// printf so QEMU-serial-stream-driven bring-up surfaces the
+	// missing-music state without leaking noise on every signon.
+	// nil = no log.
+	MusicMissingLog func(track int)
+
+	// musicStreamer is the active [music.Streamer], (re-)opened
+	// whenever the wire-broadcast (MusicTrack, MusicLoopTrack) pair
+	// changes. nil = no track is playing (either MusicTrack == 0 OR
+	// the resolver returned "track missing" + the driver degraded
+	// to silence for this signon).
+	musicStreamer *music.Streamer
+
+	// musicEpochSeen is the last [client.State.MusicEpoch] value the
+	// driver acted on. The per-tic music dispatch ignores any
+	// epoch < musicEpochSeen + 1, so a no-change tic is allocation-
+	// free.
+	musicEpochSeen uint64
+
+	// musicMissingLogged tracks (Track, LoopTrack) pairs the driver
+	// has already logged as missing so the log fires once per unique
+	// pair rather than every signon. Bounded by the wire byte
+	// range, so the worst case is 256*256 entries -- in practice the
+	// game uses < 16 distinct pairs across a full playthrough.
+	musicMissingLogged map[uint16]struct{}
 }
 
 // Sentinel errors returned by [Runner.RunFrame] before any work runs.
@@ -187,13 +302,95 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		return err
 	}
 
-	// 2) Translate the raw key events into the persistent button state.
-	UpdateButtonsFromSnapshot(&r.Buttons, snap)
-	UpdateTriggersFromSnapshot(&r.Triggers, snap)
+	// 1a) Attract-loop demo interrupt. Any KeyDown event on the
+	//     incoming snapshot halts an in-flight demo playback (the
+	//     vanilla "any key drops you out of the attract loop"
+	//     behaviour). The check fires BEFORE the menu dispatch so
+	//     the same Esc that opens the menu also stops the demo on
+	//     the same tic; the menu_state machine then sees an empty
+	//     demo slot + behaves normally.
+	r.interruptDemoOnInput(snap)
 
-	// 3) Advance server simulation.
-	if err := r.Host.Frame(dt); err != nil {
-		return err
+	// 1b) Menu state machine. When the menu is up, every KeyDown
+	//     event is routed into Menu.Handle and CONSUMED before the
+	//     movement / trigger mappers run, so a key the menu took
+	//     does not also drive the player edict (the C upstream
+	//     uses key_dest to multiplex; the Go port hardcodes the
+	//     menu-first split because the menu is the only mode
+	//     above the game today). Esc-pressed-while-not-in-menu
+	//     opens the menu; Esc-pressed-in-menu is dispatched into
+	//     Menu.Handle by the same loop and pops the screen back.
+	//
+	//     menuConsumed tracks whether the menu intercepted any
+	//     event this tic; downstream the runloop uses it to decide
+	//     whether to skip the host tick + the world pass.
+	menuConsumed := r.dispatchMenuInput(snap)
+
+	// 2) Translate the raw key events into the persistent button
+	//    state. Skipped when the menu consumed the inputs so a
+	//    held movement key from BEFORE the menu opened doesn't keep
+	//    driving the player. (The button slots already in
+	//    r.Buttons stay held until the user releases, matching
+	//    upstream behaviour.)
+	if !menuConsumed {
+		UpdateButtonsFromSnapshot(&r.Buttons, snap)
+		UpdateTriggersFromSnapshot(&r.Triggers, snap)
+	}
+
+	// 2b) Console toggle: down-edge of KeyTilde flips r.ConsoleOpen.
+	//     Up-edges are intentionally ignored (matches tyrquake's
+	//     Con_ToggleConsole_f, which is bound to the press half only;
+	//     the release half is a no-op so a held key doesn't oscillate).
+	for _, k := range snap.KeysDown {
+		if k == backend.KeyTilde {
+			r.ConsoleOpen = !r.ConsoleOpen
+		}
+	}
+
+	// 2c) Animate the console drop-down toward its target each tic.
+	//     Open target = Screen.ConLines; closed target = 0. Screen +
+	//     ConsoleOpen wiring is optional (tests that omit Screen rely
+	//     on the nil guard above; the per-tic animation is skipped
+	//     when Screen is nil because the renderer code path doesn't
+	//     run either).
+	if r.Screen != nil {
+		target := 0
+		if r.ConsoleOpen {
+			target = r.Screen.ConLines
+		}
+		r.Screen.AnimateConsole(target)
+	}
+
+	// 3) Advance server simulation. Skipped in two cases:
+	//
+	//    a) the menu is up (the C upstream sets cl.paused / sv.paused
+	//       when the menu is open; the Go port pauses by short-
+	//       circuiting the host tic entirely, which keeps sv.time +
+	//       all per-tic QC progressions frozen until the player
+	//       dismisses the menu);
+	//    b) a demo is playing (the attract-loop path: the demo body
+	//       IS the server's per-tic broadcast snapshot, so running
+	//       the live server on top would race against the recorded
+	//       stream + corrupt the playback).
+	//
+	//    The demo path swaps host.Frame for a [demo.PlayTick] call
+	//    that decodes one recorded tic into the client state +
+	//    advances r.ViewAngles to the recorded camera; on io.EOF the
+	//    optional Restart closure re-opens the stream for the next
+	//    loop (vanilla attract-loop behaviour). When BOTH menu and
+	//    demo are active (title screen + attract loop) the demo path
+	//    wins so the player still sees motion under the overlay.
+	menuActive := r.Menu != nil && r.Menu.Active()
+	demoActive := r.demoActive()
+	switch {
+	case demoActive:
+		if err := r.playDemoTick(); err != nil {
+			return err
+		}
+	case !menuActive:
+		if err := r.Host.Frame(dt); err != nil {
+			return err
+		}
 	}
 
 	// 4) Client tick: drain inbound, send clc_move (post-signon only).
@@ -206,7 +403,11 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 	//    so a pre-signon Tick is a pure inbound-drain (no spurious
 	//    clc_move on the wire before the handshake completes).
 	in := client.TickInput{
-		Buttons:       r.Buttons,
+		// Pointer (not a copy) so the per-frame impulse drain inside
+		// KeyState lands on the runloop's persistent r.Buttons state.
+		// See client.TickInput.Buttons + client.BaseMove docs for the
+		// "0.5 forever" bug a stack copy would re-introduce.
+		Buttons:       &r.Buttons,
 		MouseDX:       snap.MouseDX,
 		MouseDY:       snap.MouseDY,
 		Sensitivity:   1,
@@ -220,6 +421,19 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		return err
 	}
 	r.ViewAngles = out.ViewAngles
+
+	// 4b) Particle pool per-tic step. Advances every alive particle
+	//     by dt seconds using the world gravity scalar; expired
+	//     particles are freed back into the pool. Runs BEFORE
+	//     Pre2DDraw so the closure renders the up-to-date state.
+	//     A nil pool skips the step (matches the legacy bring-up
+	//     where the renderer existed but the per-tic advance was
+	//     not yet wired). tyrquake: CL_RunParticles inside
+	//     Host_Frame's per-tic block, between the server tick and
+	//     the screen update.
+	if r.ParticlePool != nil {
+		r.ParticlePool.Run(dt, r.ParticleGravity, nowSec)
+	}
 
 	// 5) Optional 3D pass. The closure owns the BSP walk +
 	//    rasterization; on return r.FrameBuffer holds the rendered
@@ -238,9 +452,26 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 	//
 	//    ViewAngles is the (pitch, yaw, roll) the client tick has
 	//    just refreshed from mouse + arrow-key input.
-	if r.Pre2DDraw != nil {
+	//    SKIPPED while the menu is up UNLESS a demo is playing
+	//    underneath (the attract-loop path: the recorded stream's
+	//    camera is visible behind the semi-opaque menu overlay, so
+	//    the world pass must run to give the overlay something to
+	//    sit on). With no demo + the menu up the world pass would
+	//    only add CPU cost the menu is going to overdraw anyway.
+	//    The menu's own Draw fires in step 5b below.
+	if (!menuActive || demoActive) && r.Pre2DDraw != nil {
 		viewOrigin := viewOriginFromState(r.Client)
 		if err := r.Pre2DDraw(r.FrameBuffer, viewOrigin, r.ViewAngles); err != nil {
+			return err
+		}
+	}
+
+	// 5b) Menu overlay. When the menu is up, Menu.Draw paints the
+	//     full-screen overlay into r.FrameBuffer; Compose2D's
+	//     background-fill is then skipped so the menu pixels
+	//     survive into the present.
+	if menuActive {
+		if err := r.Menu.Draw(r.FrameBuffer, r.Chars, r.MenuAssets, nowSec); err != nil {
 			return err
 		}
 	}
@@ -257,7 +488,11 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		NotifyLifetime:     r.NotifyLifetime,
 		MaxNotifyRows:      r.MaxNotifyRows,
 		BackgroundIdx:      r.BackgroundIdx,
-		SkipBackgroundFill: r.Pre2DDraw != nil,
+		SkipBackgroundFill: r.Pre2DDraw != nil || menuActive,
+		CenterPrintText:    r.Client.CenterPrintText,
+		CenterPrintExpiry:  r.Client.CenterPrintExpiry,
+		Intermission:       r.Client.Intermission,
+		IntermissionLines:  intermissionLines(r.Client, nowSec),
 	}
 	if err := render.ExpandFrame(r.FrameBuffer, r.RGBA, ctx); err != nil {
 		return err
@@ -281,6 +516,14 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 		if err := sound.Paint(r.SoundPool, r.MixBuffer, n); err != nil {
 			return err
 		}
+		// 8b) Music driver: poll the client's MusicEpoch, (re-)open
+		//     the streamer when the wire-broadcast track changes, and
+		//     mix the decoded PCM on TOP of the SFX accumulator. The
+		//     dispatch is a no-op when the embedder did not wire
+		//     MusicOpen / MusicDecoder, or when the track is silence
+		//     (MusicTrack == 0), or when no track epoch advance has
+		//     happened since the last poll.
+		r.tickMusic(r.MixBuffer[:n])
 		if err := r.Backend.QueueAudio(r.MixBuffer[:n]); err != nil {
 			if !errors.Is(err, backend.ErrUnsupported) {
 				return err
@@ -289,6 +532,103 @@ func (r *Runner) RunFrame(dt float32, nowSec float32) error {
 	}
 
 	return nil
+}
+
+// tickMusic is the per-frame music driver. (Re-)opens the
+// [music.Streamer] whenever the wire-mirrored
+// (client.State.MusicTrack, client.State.MusicLoopTrack) pair changes,
+// and mixes the decoded PCM into out by ACCUMULATING into each frame
+// alongside the SFX already deposited there by [sound.Paint].
+//
+// No-ops when:
+//
+//   - r.MusicOpen is nil (embedder disabled the music driver),
+//   - r.MusicDecoder is nil (same),
+//   - r.Client is nil (defensive; RunFrame's preconditions already
+//     forbid this, but the helper stays safe to call standalone).
+//
+// On a track change to MusicTrack == 0 the driver releases the
+// streamer (silence). On a change to a missing track the driver logs
+// once via [Runner.MusicMissingLog] (when wired) and leaves the
+// streamer cleared.
+func (r *Runner) tickMusic(out []sound.StereoSample) {
+	if r.Client == nil {
+		return
+	}
+	if r.MusicOpen == nil || r.MusicDecoder == nil {
+		return
+	}
+	// Detect a track change via the monotonic epoch.
+	if r.Client.MusicEpoch != r.musicEpochSeen {
+		r.musicEpochSeen = r.Client.MusicEpoch
+		r.musicStreamer = nil
+		track := r.Client.MusicTrack
+		if track > 0 {
+			loop := r.Client.MusicLoopTrack
+			s, err := music.LoadTrack(r.MusicOpen, r.MusicDecoder, track, loop, r.MusicVolume)
+			switch {
+			case errors.Is(err, music.ErrTrackMissing):
+				r.logMusicMissingOnce(track, loop)
+			case err != nil:
+				// Decoder/factory failure: log under the same "missing"
+				// once-per-pair gate so a buggy blob doesn't spam the
+				// console. The embedder can distinguish the two via
+				// its own loader telemetry if it cares.
+				r.logMusicMissingOnce(track, loop)
+			default:
+				r.musicStreamer = s
+			}
+		}
+	}
+	if r.musicStreamer == nil || r.musicStreamer.Stopped() {
+		return
+	}
+	// Mix on TOP of the existing accumulator. The streamer overwrites
+	// its frames (it has no knowledge of the SFX already there); to
+	// preserve both, we mix into a scratch slice and add. The runloop
+	// allocates the scratch once per call (it's bounded by len(out) =
+	// MaxMixOutputFrames = 512 frames; a fixed 4 KB stack alloc).
+	var scratch [sound.MaxMixOutputFrames]sound.StereoSample
+	n := r.musicStreamer.NextSamples(scratch[:len(out)])
+	for i := 0; i < n; i++ {
+		out[i].L = saturatedAdd16(out[i].L, scratch[i].L)
+		out[i].R = saturatedAdd16(out[i].R, scratch[i].R)
+	}
+}
+
+// saturatedAdd16 sums two int16 samples without int16 wrap-around.
+// The mixer accumulator is int16 so a naive `a+b` overflows when
+// loud SFX overlap with loud music; the saturation keeps the worst-
+// case sum inside [-32768, 32767] (the audible result is the
+// familiar "clip" rather than the wrap-around "click").
+func saturatedAdd16(a, b int16) int16 {
+	sum := int32(a) + int32(b)
+	if sum > 32767 {
+		return 32767
+	}
+	if sum < -32768 {
+		return -32768
+	}
+	return int16(sum)
+}
+
+// logMusicMissingOnce dispatches the "music track XX missing" log
+// through the embedder's optional sink, but only the first time a
+// given (track, loopTrack) pair is observed. Idempotent on repeated
+// signon retransmits.
+func (r *Runner) logMusicMissingOnce(track, loopTrack int) {
+	if r.MusicMissingLog == nil {
+		return
+	}
+	if r.musicMissingLogged == nil {
+		r.musicMissingLogged = make(map[uint16]struct{})
+	}
+	key := uint16(track)<<8 | uint16(loopTrack&0xff)
+	if _, seen := r.musicMissingLogged[key]; seen {
+		return
+	}
+	r.musicMissingLogged[key] = struct{}{}
+	r.MusicMissingLog(track)
 }
 
 // viewOriginFromState returns the camera position the per-tic
@@ -318,6 +658,117 @@ func viewOriginFromState(cs *client.State) [3]float32 {
 		return [3]float32{}
 	}
 	return es.Origin
+}
+
+// intermissionLines composes the per-frame scoreboard line block for
+// the intermission overlay. Sourced from the client's cached
+// per-tic state:
+//
+//   - State.IntermissionText non-empty (svc_finale): one slice
+//     entry per '\n'-separated substring (the finale credits text
+//     the server pushed verbatim). The renderer draws each line
+//     centered.
+//
+//   - State.IntermissionText empty (svc_intermission, scoreboard
+//     mode): three rows computed from the stat bank +
+//     (nowSec - IntermissionTime):
+//
+//     "TIME: M:SS"               (mm:ss since intermission start)
+//     "SECRETS: X / Y"           (Stats[StatSecrets]  / Stats[StatTotalSecrets])
+//     "MONSTERS: X / Y"          (Stats[StatMonsters] / Stats[StatTotalMonsters])
+//
+// Returns nil when cs is nil OR cs.Intermission is false (the
+// renderer's drawIntermission helper is a no-op on a nil slice too,
+// so the guard is also a defensive double-check).
+//
+// tyrquake: the line-by-line text composition inside SCR_DrawIntermission /
+// Sbar_IntermissionOverlay; the C upstream renders each row as a
+// WAD pic for the label + DrawNumber for the digits. The Go port
+// uses plain conchars throughout (the WAD pics aren't loaded yet),
+// which keeps the helper free of any asset dependency.
+func intermissionLines(cs *client.State, nowSec float32) []string {
+	if cs == nil || !cs.Intermission {
+		return nil
+	}
+	if cs.IntermissionText != "" {
+		return splitLines(cs.IntermissionText)
+	}
+	elapsed := nowSec - cs.IntermissionTime
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	mins := int(elapsed) / 60
+	secs := int(elapsed) % 60
+	return []string{
+		formatTimeLine(mins, secs),
+		formatStatLine("SECRETS", cs.Stats[protocol.StatSecrets], cs.Stats[protocol.StatTotalSecrets]),
+		formatStatLine("MONSTERS", cs.Stats[protocol.StatMonsters], cs.Stats[protocol.StatTotalMonsters]),
+	}
+}
+
+// splitLines splits s on '\n' boundaries. An empty s yields a
+// single-element slice containing "" (matches strings.Split's
+// behaviour); the renderer's drawIntermission tolerates empty rows
+// by drawing nothing for that row's character loop.
+func splitLines(s string) []string {
+	if s == "" {
+		return []string{""}
+	}
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	out = append(out, s[start:])
+	return out
+}
+
+// formatTimeLine formats the "TIME: M:SS" row.
+func formatTimeLine(mins, secs int) string {
+	return "TIME: " + itoa(mins) + ":" + pad2(secs)
+}
+
+// formatStatLine formats a "LABEL: X / Y" row.
+func formatStatLine(label string, x, y int32) string {
+	return label + ": " + itoa(int(x)) + " / " + itoa(int(y))
+}
+
+// itoa is a strconv-free integer-to-string helper. Negative values
+// are prefixed with '-'; zero yields "0".
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}
+
+// pad2 zero-pads a non-negative int to at least 2 digits.
+func pad2(n int) string {
+	if n < 0 {
+		n = 0
+	}
+	if n < 10 {
+		return "0" + itoa(n)
+	}
+	return itoa(n)
 }
 
 // UpdateButtonsFromSnapshot translates the per-frame raw key events in
@@ -449,6 +900,51 @@ func (t TriggerButtons) ActionButtons() uint8 {
 		b |= client.ButtonJump
 	}
 	return b
+}
+
+// dispatchMenuInput routes per-frame KeyDown events through the
+// optional [menu.Menu] state machine. Returns true when the menu
+// is currently active (which makes the caller short-circuit the
+// movement / trigger button mappers + the host tick + the world
+// pass for the rest of the tic).
+//
+// When the menu is NOT active, Esc-pressed-this-frame opens it
+// (Menu.Open) and the function returns true on that same tic so
+// the press isn't double-counted (the same Esc would otherwise hit
+// no movement slot but would still flow through to Tick as a
+// no-op + then a SECOND frame's Esc would immediately close the
+// menu the user just opened).
+//
+// Up-events are NOT routed into the menu: the menu's contract is
+// "fire on key press", matching upstream M_Keydown which is wired
+// to the down-half of the binding only. A nil [Runner.Menu] makes
+// the function a constant false return.
+func (r *Runner) dispatchMenuInput(snap backend.InputSnapshot) bool {
+	if r.Menu == nil {
+		return false
+	}
+	if !r.Menu.Active() {
+		// Out-of-menu: open on Esc press, but only when an Esc
+		// arrived this frame (don't treat the held state as a
+		// continuous "open" command).
+		for _, k := range snap.KeysDown {
+			if k == backend.KeyEscape {
+				r.Menu.Open()
+				return true
+			}
+		}
+		return false
+	}
+	// In-menu: every down-edge feeds Handle. We do NOT early-return
+	// after the first key so multi-key snapshots (rare in practice)
+	// stay deterministic in their dispatch order.
+	for _, k := range snap.KeysDown {
+		r.Menu.Handle(k)
+	}
+	// Still active means "menu owns the frame"; transition to
+	// StateNone (e.g. Skill confirm) makes the next tic unfreeze
+	// the world automatically.
+	return r.Menu.Active()
 }
 
 // UpdateTriggersFromSnapshot edge-applies snap.KeysDown / snap.KeysUp

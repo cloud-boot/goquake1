@@ -98,6 +98,28 @@ func EncodeSignonNum(buf *sizebuf.Buffer, signonStage int) error {
 	return msg.WriteByte(buf, signonStage)
 }
 
+// EncodeIntermission writes a single svc_intermission byte. The
+// client flips into intermission mode on receipt: the renderer
+// hides the in-game HUD and overlays the end-of-level scoreboard
+// (time taken + secrets found + monsters killed, sourced from the
+// per-client stat bank already pushed via svc_updatestat). tyrquake:
+// emitted by SV_SaveSpawnparms inside Host_FindMaxClients during a
+// changelevel + by PF_Intermission (a QC builtin) for trigger-driven
+// intermissions.
+//
+// No payload: the camera lock + text layout are driven entirely off
+// the client's cached stat bank + the most-recent info_intermission
+// entity origin (which the server still has to push separately via
+// svc_setangle + svc_setview in a follow-up batch; this commit
+// lands the wire opcode + HUD swap, the camera pose stays at the
+// player's last-known origin).
+func EncodeIntermission(buf *sizebuf.Buffer) error {
+	if buf == nil {
+		return ErrNilBuf
+	}
+	return msg.WriteByte(buf, protocol.SvcIntermission)
+}
+
 // EncodeFinale writes svc_finale + a centered NUL-terminated text
 // string. Shown at end-of-episode / end-of-level intermissions.
 // tyrquake: emitted by PF_Finale (a QC builtin).
@@ -124,6 +146,21 @@ func EncodeCutscene(buf *sizebuf.Buffer, text string) error {
 	return msg.WriteString(buf, text)
 }
 
+// EncodeCenterPrint writes svc_centerprint + a NUL-terminated text
+// string. The client overlays it horizontally-centered near 40% of
+// the screen height (the "you got the shotgun" / intermission banner).
+// tyrquake: emitted by PF_centerprint (a QC builtin) + by SV_PrintToClient
+// for intermission text.
+func EncodeCenterPrint(buf *sizebuf.Buffer, text string) error {
+	if buf == nil {
+		return ErrNilBuf
+	}
+	if err := msg.WriteByte(buf, protocol.SvcCenterPrint); err != nil {
+		return err
+	}
+	return msg.WriteString(buf, text)
+}
+
 // EncodeStuffText writes svc_stufftext + a NUL-terminated string
 // the client interprets as console commands (e.g. "name BlubBlub\n"
 // to rename a player). tyrquake: SV_BroadcastCommand / per-builtin
@@ -136,4 +173,52 @@ func EncodeStuffText(buf *sizebuf.Buffer, text string) error {
 		return err
 	}
 	return msg.WriteString(buf, text)
+}
+
+// ErrCDTrackRange is returned by EncodeCDTrack when track or loopTrack
+// is outside the unsigned-byte range the wire format encodes. The C
+// upstream silently truncates via the byte cast in MSG_WriteByte; the
+// Go port validates so a buggy caller surfaces loudly rather than
+// silently switching to the wrong track number.
+var ErrCDTrackRange = errors.New("server: cdtrack number outside [0, 255]")
+
+// EncodeCDTrack writes svc_cdtrack + two bytes: the active track and
+// the loop-back track. The client reads both, opens the matching
+// "music/trackXX.ogg" off the embedded pak (or any other registered
+// audio asset source), and streams the decoded PCM through the audio
+// mixer alongside the per-tic SFX.
+//
+// In id Software's original Q1, the two bytes selected a CD audio
+// track (the 1996 retail discs shipped 10 ambient/score tracks on
+// audio tracks 2..11 of the CD); the Go port replaces the CD-DA
+// dependency with .ogg files inside the pak, matching the convention
+// used by every modern source port (QuakeSpasm, FTEQW, vkQuake).
+// tyrquake: SV_SendServerinfo emits this right after the precache
+// lists -- the wire byte was reused 1:1 by the source-port community,
+// only the playback backend changed.
+//
+// track is the active music track (1 = title music, 2..11 = per-map
+// score from the retail soundtrack; 0 = silence). loopTrack is the
+// track the streamer falls back to once `track` reaches EOF (typically
+// equal to `track` for self-looping background score; 0 stops at EOF).
+//
+// Both byte ranges are validated against [0, 255]; out-of-range
+// returns [ErrCDTrackRange] without writing any bytes.
+func EncodeCDTrack(buf *sizebuf.Buffer, track, loopTrack int) error {
+	if buf == nil {
+		return ErrNilBuf
+	}
+	if track < 0 || track > 0xff {
+		return fmt.Errorf("%w: track=%d", ErrCDTrackRange, track)
+	}
+	if loopTrack < 0 || loopTrack > 0xff {
+		return fmt.Errorf("%w: loopTrack=%d", ErrCDTrackRange, loopTrack)
+	}
+	if err := msg.WriteByte(buf, protocol.SvcCDTrack); err != nil {
+		return err
+	}
+	if err := msg.WriteByte(buf, track); err != nil {
+		return err
+	}
+	return msg.WriteByte(buf, loopTrack)
 }

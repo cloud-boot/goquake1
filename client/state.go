@@ -39,6 +39,12 @@ const (
 	NumPingTimes    = 16  // mirrors server.NumPingTimes
 )
 
+// CenterPrintLifetime is the wall-clock duration (in seconds) a
+// centerprint message stays on screen before fading out. tyrquake:
+// scr_centertime_off seeded to scr_centertime->value (default 2.0)
+// inside SCR_CenterPrint. The Go port hard-codes the same default.
+const CenterPrintLifetime float32 = 2.0
+
 // MaxClientMessage is the per-client transport buffer size. Same
 // numeric value as server.MaxMsgLen (1 << 18); duplicated here so
 // the client package stays decoupled from the server package.
@@ -236,6 +242,161 @@ type State struct {
 	// Like Baselines, the map is allocated by [NewState] + reset by
 	// [State.Clear] so per-map state doesn't leak.
 	Entities map[int]EntityState
+
+	// EmitParticles is the optional sink that the [Apply] arm for
+	// [DecodedParticle] dispatches into, mirroring tyrquake's
+	// svc_particle handler that calls R_RunParticleEffect. nil is a
+	// silent no-op (the historical bring-up behaviour). The embedder
+	// wires this to render.Pool.Emit -- the client package itself
+	// MUST stay free of any render-layer dependency so the wire
+	// decoder + state machine remain testable in isolation, hence
+	// the callback indirection.
+	//
+	// Signature mirrors PF_particle / R_RunParticleEffect:
+	//
+	//	origin -- world-space anchor for the burst
+	//	dir    -- per-axis velocity bias the renderer adds onto its
+	//	          random per-particle jitter
+	//	color  -- palette base index (renderer keeps top 5 bits,
+	//	          jitters the low 3 per particle)
+	//	count  -- number of particles to spawn
+	EmitParticles func(origin, dir [3]float32, color, count int)
+
+	// EmitTempEntity is the optional sink the [Apply] arm for the
+	// svc_temp_entity point-effect family (TE_Spike, TE_SuperSpike,
+	// TE_Gunshot, TE_Explosion, TE_TarExplosion, TE_WizSpike,
+	// TE_KnightSpike, TE_LavaSplash, TE_Teleport) dispatches into.
+	// nil is a silent no-op so callers that don't yet wire it keep
+	// the historical bring-up behaviour (the temp-entity decoder
+	// landed before the particle pool did; this arm was previously
+	// documented as "particle pool + sound mixer -- separate layers"
+	// in the apply.go comment block).
+	//
+	// Bridges into render.Pool.Emit / Pool.ParticleExplosion /
+	// Pool.LavaSplash / Pool.TeleportSplash depending on the Kind:
+	// the embedder's closure switches on Kind and picks the right
+	// pool method. The client package stays render-agnostic.
+	//
+	// Signature: (kind = the TE_* sub-type byte, origin = the wire-
+	// reported world-space coord).
+	EmitTempEntity func(kind int, origin [3]float32)
+
+	// CenterPrintText is the latest svc_centerprint payload the
+	// renderer should overlay horizontally-centered near the top of
+	// the screen. tyrquake: scr_centerstring + scr_centertime_off in
+	// screen.c -- Quake renders it via SCR_CheckDrawCenterString and
+	// fades it out after [CenterPrintLifetime] seconds; the Go port
+	// stashes the string on State + the renderer reads + clears it
+	// when CenterPrintExpiry < now.
+	//
+	// Empty string = nothing to render. Non-empty + CenterPrintExpiry
+	// in the future = draw centered. CenterPrintExpiry <= current
+	// MsgTime = stale; renderer treats it as empty.
+	CenterPrintText string
+
+	// CenterPrintExpiry is the MsgTime at which the active centerprint
+	// stops being drawn. Set by the [Apply] arm for [DecodedCenterPrint]
+	// to nowSec + [CenterPrintLifetime]. Zero = no active centerprint
+	// (matches a freshly-zeroed State; the renderer's "expiry <= now"
+	// guard makes this equivalent to "no draw").
+	CenterPrintExpiry float32
+
+	// Intermission flips true on receipt of svc_intermission /
+	// svc_finale. The renderer hides the in-game HUD and overlays
+	// the end-of-level scoreboard (or the finale credits text)
+	// instead. The flag stays set until the next svc_serverinfo
+	// (= map change tearing the client back to first-spawn) clears
+	// it via [State.Clear].
+	//
+	// tyrquake: cl.intermission in NQ/client.h. The C upstream
+	// stores 1 (svc_intermission), 2 (svc_finale "end of episode"
+	// credits), or 3 (cutscene); the Go port collapses the kind
+	// distinction into IntermissionText (empty = scoreboard mode,
+	// non-empty = finale-style centered text block) since the only
+	// observable difference is "show stats" vs "show text".
+	Intermission bool
+
+	// IntermissionText is the multi-line credits payload from
+	// svc_finale (and the lone-line "end of cutscene" payload from
+	// svc_cutscene if that arm is ever wired). Empty means the
+	// intermission is the scoreboard-only end-of-level kind
+	// (svc_intermission) and the renderer composes its text from
+	// the cached stat bank (StatTotalSecrets / StatSecrets /
+	// StatTotalMonsters / StatMonsters + Time).
+	IntermissionText string
+
+	// IntermissionTime is the nowSec the [Apply] arm stamped when
+	// the intermission was triggered (the value passed to Apply).
+	// The renderer reads it to compute "time elapsed since
+	// intermission started" for the centered scoreboard's "time:
+	// MM:SS" line; the embedder's per-button advance-trigger logic
+	// reads it to enforce the "any button after IntermissionTime +
+	// 2s closes the intermission" rule. tyrquake: cl.completed_time.
+	IntermissionTime float32
+
+	// MusicTrack is the currently-selected music track index broadcast
+	// by the server via svc_cdtrack. The [Apply] arm for
+	// [DecodedCDTrack] writes both this field and MusicLoopTrack; the
+	// embedder's per-tic music driver polls them (see
+	// [State.MusicEpoch]) and (re-)opens the matching "music/trackXX.ogg"
+	// asset whenever the wire-broadcast track changes. 0 = silence;
+	// 1..255 = the per-map score index (1 = title music; the per-map
+	// indices follow the upstream Q1 retail soundtrack convention,
+	// where audio-CD tracks 2..11 corresponded to the 10 in-game
+	// score loops).
+	//
+	// tyrquake: cl.cdtrack in NQ/client.h, written by the svc_cdtrack
+	// arm of CL_ParseServerMessage. The Go port keeps the same wire
+	// shape and the same field name shape; only the playback backend
+	// changes (.ogg streamer instead of CD-DA hardware).
+	MusicTrack int
+
+	// MusicLoopTrack is the fallback track the music streamer switches
+	// to when MusicTrack reaches EOF. Wired by [DecodedCDTrack]'s
+	// Apply arm alongside MusicTrack. 0 = stop at EOF; non-zero =
+	// re-open and stream that track (typically == MusicTrack for a
+	// self-looping background score).
+	//
+	// tyrquake: cl.looptrack in NQ/client.h, written alongside cdtrack.
+	MusicLoopTrack int
+
+	// MusicEpoch is a monotonically-increasing counter the Apply arm
+	// for [DecodedCDTrack] bumps every time it writes a new
+	// (MusicTrack, MusicLoopTrack) pair. The embedder's per-tic music
+	// driver tracks the last value it observed and triggers a
+	// (re-)open whenever the epoch changes, which makes the
+	// "same wire byte arrives twice" case (a server retransmit of
+	// the same track) correctly idempotent: the epoch advances but
+	// the open path's caller can deduplicate by comparing
+	// (MusicTrack, MusicLoopTrack) themselves.
+	//
+	// Bumped even when the new pair is identical to the previous one
+	// so a server-side restart-the-music intent is preserved on the
+	// wire-driven hand-off; the receiving side decides what
+	// "epoch advanced but identical pair" means for its mixer.
+	MusicEpoch uint64
+
+	// EmitBeam is the optional sink the [Apply] arm for the
+	// svc_temp_entity lightning family (TE_Lightning1 / TE_Lightning2 /
+	// TE_Lightning3 / TE_Beam) dispatches into. nil is a silent no-op
+	// so callers that don't yet wire it keep the historical "lightning
+	// is a stub" behaviour. tyrquake: CL_ParseBeam in cl_tent.c (the
+	// per-kind switch that picks bolt1/bolt2/bolt3.mdl + queues the
+	// per-tic CL_UpdateBeams pass).
+	//
+	// Bridges into the client-side [BeamPool] (or the embedder's own
+	// per-frame renderer) via:
+	//
+	//	kind  -- TE_* sub-type byte (TELightning1 / 2 / 3 / TEBeam)
+	//	ent   -- owning entity index (the player's or boss's slot)
+	//	start -- traceline source (the owner's muzzle)
+	//	end   -- traceline endpoint (impact / max range)
+	//
+	// The client package stays render-agnostic; the embedder's closure
+	// switches on kind, looks up the matching bolt mdl, and either
+	// spawns a [Beam] in a [BeamPool] (the canonical client-side path)
+	// or hands the segments to a custom renderer.
+	EmitBeam func(kind, ent int, start, end [3]float32)
 }
 
 // ErrAlreadyConnected is returned by [State.SetConnecting] when
@@ -270,6 +431,14 @@ func NewState() *State {
 func (s *State) Clear() {
 	buf := s.Message
 	buf.Clear()
+	// Preserve MusicEpoch across the wipe so the embedder's per-tic
+	// music driver keeps seeing strictly-increasing values; the
+	// per-map MusicTrack / MusicLoopTrack themselves SHOULD reset to
+	// 0 (a new map starts silent until the server emits svc_cdtrack),
+	// but the monotonic counter the driver compares against MUST NOT
+	// regress on a map change or a stale "track 0 already handled"
+	// observation would silently lose the next emission.
+	epoch := s.MusicEpoch
 	*s = State{
 		Connection: s.Connection,
 		Spawned:    s.Spawned,
@@ -277,6 +446,7 @@ func (s *State) Clear() {
 		Message:    buf,
 		Baselines:  make(map[int]EntityBaseline),
 		Entities:   make(map[int]EntityState),
+		MusicEpoch: epoch,
 	}
 }
 

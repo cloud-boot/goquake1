@@ -210,6 +210,13 @@ func (s *Server) SpawnServer(mapName string, protocol int, deps SpawnDeps) error
 	s.ModelPrecache[0] = ""
 	s.ModelPrecache[1] = bspPath
 	s.Models[1] = world
+	// Slot 1's BrushModel is the worldmodel itself (already carved by
+	// LoadBrush(file, 0) above); reuse that instance so the trace
+	// dispatcher's modelindex==1 lookup lands on the same hulls the
+	// world trace clips against (the world entity's setmodel sets its
+	// modelindex to 1 -- the BSP path; tyrquake's SV_HullForEntity
+	// equivalent).
+	s.BrushModels[1] = worldBrush
 	for i := 1; i < len(models); i++ {
 		// LocalModelName errors only for i < 0 or i >= MaxModels;
 		// the loop bound clamps to len(models) which the cache-
@@ -221,10 +228,20 @@ func (s *Server) SpawnServer(mapName string, protocol int, deps SpawnDeps) error
 		// Submodel slots share the worldmodel's bspfile.File -- the
 		// upstream's Mod_ForName treats "*N" as an in-bsp reference,
 		// not a separate file, so the *Model wrapper points at the
-		// same parsed bspfile. The per-submodel hull carving
-		// (model.LoadBrush(file, N)) is the host layer's job and is
-		// done lazily on first collision query, not here.
+		// same parsed bspfile.
 		s.Models[1+i] = world
+		// Carve a per-submodel BrushModel from the worldmodel's
+		// bspfile so SOLID_BSP entities (doors / movers / breakables)
+		// drive their own clipping hull through world.HullForBounds.
+		// tyrquake: Mod_ForName's "*N" branch dispatches to the
+		// Mod_MakeClipHulls per-submodel pass at map load. A LoadBrush
+		// failure here surfaces as a nil BrushModel slot (the trace
+		// dispatcher falls back to a non-BSP candidate filter rather
+		// than aborting map load -- a single corrupt submodel costs
+		// per-entity occlusion for that entity, not the whole map).
+		if sub, err := model.LoadBrush(world.Brush, i); err == nil {
+			s.BrushModels[1+i] = sub
+		}
 	}
 
 	// Step 8: entity parse + spawn. ParseEntities is tolerant of an

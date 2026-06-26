@@ -138,6 +138,60 @@ type Host struct {
 	// spawn time" from "per-tic gameplay sound triggers".
 	LastAmbientsStarted int
 
+	// LastTriggerTouches is the count of QC `.touch` functions the
+	// most recent [Host.Frame] call dispatched via [Host.TouchTriggers]
+	// (the SV_TouchLinks-equivalent walk that runs once per client
+	// edict after RunPhysics). Reset to zero at the top of every Frame.
+	// Exposed for bring-up instrumentation -- a non-zero value the
+	// moment the demo camera grazes an item proves the QC `.touch`
+	// dispatch chain (= item pickup) is wired end-to-end.
+	LastTriggerTouches int
+
+	// LastTouchErrors is the count of touch dispatches the most recent
+	// [Host.Frame] call's TouchTriggers walk swallowed (logged +
+	// continued rather than aborting the frame). A trigger whose QC
+	// touch function calls an unstubbed builtin surfaces here.
+	LastTouchErrors int
+
+	// LastTouchErrorMsgs accumulates the first 8 unique error strings
+	// the most recent [Host.Frame] call's TouchTriggers walk swallowed,
+	// in arrival order. Same shape as LastThinkErrorMsgs.
+	LastTouchErrorMsgs []string
+
+	// PendingChangelevel is set by the QC `changelevel(mapname)` builtin
+	// (= [BuiltinChangeLevel]) and polled by the embedder's main loop
+	// to know "the QC asked us to re-spawn into NextMap". The host
+	// itself does NOT re-spawn -- it has no way to know the embedder's
+	// post-SpawnServer wiring (sound pool, sound loader, OnArenaReady
+	// hook). The embedder reads + clears the flag, then drives the
+	// re-spawn via Host.SpawnServer + whatever per-map state it needs
+	// to refresh. tyrquake: pr_global_struct->nextmap + the
+	// SV_SaveSpawnparms + Host_Reconnect_f path that re-enters the
+	// new map at the top of host_frame.
+	//
+	// Reset semantics: the host never clears this on its own. The
+	// embedder MUST clear it after acting; otherwise the next Frame()
+	// will see it still set and the level-reload print log emits
+	// every tic. Frame() itself ignores the flag (= no behavioural
+	// change inside the host); the embedder polls it post-Frame.
+	PendingChangelevel bool
+
+	// NextMap is the bare map-slug the most recent `changelevel` QC
+	// call requested (the embedder's main loop combines it with the
+	// "maps/<slug>.bsp" expansion that SpawnServer does internally).
+	// Stable while PendingChangelevel is true; undefined otherwise.
+	NextMap string
+
+	// LastIntermissionStats is the cumulative per-map progression
+	// tally [Host.EmitIntermission] pushes to every client as
+	// svc_updatestat slots ahead of the svc_intermission marker.
+	// Embedders populate it (typically from named-global QC reads of
+	// `total_secrets` / `found_secrets` / `total_monsters` /
+	// `killed_monsters`) before calling EmitIntermission; the
+	// zero value is a tolerated fallback (the scoreboard renders
+	// "SECRETS: 0 / 0" / "MONSTERS: 0 / 0" instead of garbage).
+	LastIntermissionStats IntermissionStats
+
 	// soundPool is the mixer pool installed via [Host.SetSoundPool].
 	// nil = audio path silent-no-ops (the runloop owns its own pool;
 	// the host needs a reference so the QC-driven StartSound builtin
@@ -149,6 +203,27 @@ type Host struct {
 	// path (ErrSoundLoadFailed). Decoupled from the host so the package
 	// stays free of any `pak` / `vfs` dependency.
 	soundLoader SoundLoader
+
+	// listenerSet records whether a per-tic listener context has been
+	// wired via [Host.SetListener]. Without one, the spatialize-then-
+	// allocate path in [Host.StartSoundAt] / [Host.AmbientSoundAt]
+	// degrades to the existing "full master volume on both ears"
+	// behaviour (= no stereo balance, no distance falloff). Tests +
+	// pre-signon embedders that never call SetListener get the
+	// unspatialized path verbatim; production quake-tamago calls
+	// SetListener every tic with the camera origin + right axis.
+	listenerSet    bool
+	listenerOrigin [3]float32
+	listenerRight  [3]float32
+
+	// SaveSkill is the active difficulty rung the most recent
+	// menu-driven skill confirm wrote. SaveSlot persists it into
+	// the save header; LoadSlot restores it. Defaults to 1 (Normal)
+	// to match the upstream `skill` cvar default.
+	//
+	// Exposed for the runloop's menu hook (it copies the post-confirm
+	// menu.SkillLevel into here via [Host.SetSkill]).
+	SaveSkill int
 }
 
 // ErrNilDep fires on a missing required NewHost dependency.
@@ -266,21 +341,34 @@ func hostKeyAt(i int) world.Key { return world.Key(i) }
 
 // runClientCmds drains every active client's inbox via ReadClientMoves
 // then copies the resulting Cmd.ViewAngles into the bound edict's
-// `v_angle` entvars field. tyrquake: SV_RunClients in NQ/host.c -- the
-// per-tic SV_ReadClientMessage + SV_ClientThink call pair that runs
-// just before SV_Physics so PhysicsWalk sees the freshest UserCmd +
-// view angles.
+// `v_angle` entvars field plus the per-tic trigger-button bits
+// (button0 = +attack, button2 = +jump) and the +impulse byte.
+// tyrquake: SV_RunClients in NQ/host.c -- the per-tic
+// SV_ReadClientMessage + SV_ClientThink call pair that runs just
+// before SV_Physics so PhysicsWalk sees the freshest UserCmd + view
+// angles, and so the per-tic PlayerPostThink QC dispatch sees a
+// fresh self.button0 / self.button2 / self.impulse the W_WeaponFrame
+// + ImpulseCommands chain reads.
 //
-// The v_angle copy is the minimal SV_RunCmd equivalent: PhysicsWalk's
-// CalcWishVel reads v_angle (NOT the cmd's ViewAngles) for the
-// forward/right basis, so without this propagation the player's
-// wishvel would always lock to v_angle's last value (zero at spawn).
+// The v_angle copy is the minimal SV_RunCmd equivalent for movement:
+// PhysicsWalk's CalcWishVel reads v_angle (NOT the cmd's ViewAngles)
+// for the forward/right basis, so without this propagation the
+// player's wishvel would always lock to v_angle's last value (zero
+// at spawn).
+//
+// The button0 / button2 / impulse propagation is the minimal
+// SV_RunCmd equivalent for triggers: PlayerPostThink reads
+// self.button0 inside W_WeaponFrame ("if (self.button0) W_Attack();")
+// and self.impulse inside ImpulseCommands ("ImpulseCommands();" at
+// the top of PlayerPostThink). Without it, +attack on the client
+// flips the on-wire `buttons` bit but the QC dispatch sees zero on
+// the edict's field, so W_Attack never runs and no shot is fired.
 //
 // Slots without an Edict yet (ConnectClient ran but the edict pool
-// wasn't ready) and slots without a v_angle field (test stubs with
-// stripped progs) are skipped silently. Other errors -- a transport
-// failure, a bad clc opcode -- are surfaced verbatim so callers can
-// log + drop.
+// wasn't ready) and slots without a given field (test stubs with
+// stripped progs) are skipped silently per field. Other errors -- a
+// transport failure, a bad clc opcode -- are surfaced verbatim so
+// callers can log + drop.
 func (h *Host) runClientCmds() error {
 	p := h.findProgs()
 	for _, c := range h.Static.Clients {
@@ -300,8 +388,30 @@ func (h *Host) runClientCmds() error {
 		// v_angle absent (stripped test progs) -> silent skip. A real
 		// Q1 progs.dat always declares it.
 		_ = ev.WriteVec3("v_angle", c.Cmd.ViewAngles)
+		// button0 (=ButtonAttack), button2 (=ButtonJump), impulse:
+		// per-tic trigger bits the QC reads via self.button0 /
+		// self.button2 / self.impulse. Stripped test progs without
+		// these fields silent-skip; real Q1 progs.dat always
+		// declares them as EvFloat.
+		_ = ev.WriteFloat("button0", boolToFloat(c.Cmd.Buttons&server.ButtonAttack != 0))
+		_ = ev.WriteFloat("button2", boolToFloat(c.Cmd.Buttons&server.ButtonJump != 0))
+		_ = ev.WriteFloat("impulse", float32(c.Cmd.Impulse))
 	}
 	return nil
+}
+
+// boolToFloat is the inline "0 or 1" helper the button-bit
+// propagation in [Host.runClientCmds] uses to flatten a bitmask test
+// into the EvFloat value QC reads. tyrquake encodes per-tic buttons
+// as floats on the entvars (button0 / button1 / button2) even though
+// the on-wire shape is a single byte bitmask -- the QC compiler has
+// no integer type, so the bit-to-float widen happens at the server-
+// to-VM boundary.
+func boolToFloat(b bool) float32 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // runThink is the per-tic SV_RunThink-equivalent walker. Iterates
@@ -479,6 +589,35 @@ func (h *Host) Frame(dt float32) error {
 		h.findProgs(),
 	); err != nil {
 		return err
+	}
+
+	// SV_TouchLinks-equivalent: per-client per-tic walk the area
+	// tree for SOLID_TRIGGER edicts whose absbounds overlap the
+	// player edict, dispatching each trigger's QC `.touch` function
+	// with self=trigger, other=player. This is the half of the
+	// upstream SV_Physics_Client that delivers item pickup (the
+	// item_*_touch QC functions write self.ammo_* / self.health onto
+	// the player, then setmodel("") + setorigin(item, -8000) to
+	// remove the item).
+	//
+	// Runs AFTER RunPhysics so the player edict's post-walk position
+	// is what the trigger query sees (matches the upstream's
+	// SV_LinkEdict (which calls SV_TouchLinks internally) firing
+	// per per-MOVETYPE handler at the end of its move integration).
+	//
+	// Walks only client slots [1, MaxClients]: NPCs / monsters /
+	// movers don't fire trigger touches in vanilla Quake -- only
+	// the player does (the upstream wires SV_LinkEdict's
+	// SV_TouchLinks call for every MOVETYPE_WALK move, and only
+	// clients use MOVETYPE_WALK). The Go port preserves the same
+	// shape by iterating client slots directly.
+	h.ResetTouchCounters()
+	for slot := 1; slot <= h.Static.MaxClients && slot < len(h.Server.Edicts); slot++ {
+		c := h.Static.Clients[slot-1]
+		if c == nil || !c.Active || c.Edict == nil {
+			continue
+		}
+		h.TouchTriggers(slot, hostKeyAt(slot))
 	}
 
 	// Per-client svc_clientdata compose+encode. Runs BEFORE

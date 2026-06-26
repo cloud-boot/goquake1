@@ -127,22 +127,39 @@ func Apply(state *State, msg Decoded, nowSec float32) error {
 	case DecodedUpdate:
 		applyUpdate(state, m, nowSec)
 		return nil
+	case DecodedParticle:
+		applyParticle(state, m)
+		return nil
+	case DecodedTempEntity:
+		applyTempEntity(state, m)
+		return nil
+	case DecodedCenterPrint:
+		applyCenterPrint(state, m, nowSec)
+		return nil
+	case DecodedIntermission:
+		applyIntermission(state, nowSec)
+		return nil
+	case DecodedFinale:
+		applyFinale(state, m, nowSec)
+		return nil
+	case DecodedCDTrack:
+		applyCDTrack(state, m)
+		return nil
 	case DecodedNop,
 		DecodedPrint,
 		DecodedStuffText,
-		DecodedFinale,
 		DecodedCutscene,
 		DecodedSellScreen,
 		DecodedKilledMonster,
 		DecodedFoundSecret,
-		DecodedParticle,
 		DecodedSound:
 		// Documented no-op arms:
 		//   - Nop:                       connection-alive heartbeat
 		//   - Print / StuffText:         renderer/UI + console concern
-		//   - Finale / Cutscene / SellScreen: UI-state transitions
-		//   - KilledMonster / FoundSecret:    gameplay sound triggers
-		//   - Particle / Sound:          particle pool + sound mixer (separate layers)
+		//   - Cutscene / SellScreen:     UI-state transitions
+		//   - KilledMonster / FoundSecret: gameplay sound triggers
+		//     (the stat-bank tallies still arrive via svc_updatestat)
+		//   - Sound:                     sound mixer (separate layer)
 		return nil
 	}
 	return fmt.Errorf("%w: %T", ErrApplyUnknown, msg)
@@ -257,6 +274,146 @@ func applyBaseline(state *State, m DecodedBaseline) {
 		Angles:   m.Angles,
 		Alpha:    m.Alpha,
 	}
+}
+
+// applyParticle dispatches a svc_particle burst into the embedder's
+// optional [State.EmitParticles] sink. nil sink = silent no-op
+// (mirrors the historical bring-up behaviour: the particle decoder
+// landed before the renderer pool did, and the apply arm was a
+// documented "particle pool is a separate layer" no-op). Once the
+// embedder wires the sink to render.Pool.Emit the same arm starts
+// driving real particles.
+//
+// tyrquake: the svc_particle case inside CL_ParseServerMessage --
+// the C upstream parses origin/dir/color/count off the wire then
+// calls R_RunParticleEffect directly (no callback indirection
+// because the C engine has a global *r_particles pool); the Go
+// port keeps the engine-renderer split clean via the sink.
+func applyParticle(state *State, m DecodedParticle) {
+	if state.EmitParticles == nil {
+		return
+	}
+	state.EmitParticles(m.Origin, m.Dir, m.Color, m.Count)
+}
+
+// applyTempEntity dispatches a svc_temp_entity sub-event into the
+// embedder's optional sinks: point-effect kinds (Spike / SuperSpike /
+// Gunshot / Explosion / TarExplosion / WizSpike / KnightSpike /
+// LavaSplash / Teleport) go through [State.EmitTempEntity] with the
+// wire-reported Origin; lightning kinds (TELightning1 / 2 / 3 / TEBeam)
+// go through [State.EmitBeam] with the (Start, End) traceline + the
+// owning entity index. TEExplosion2 still routes to EmitTempEntity
+// (colour-mapped explosion is a future renderer batch -- the embedder
+// is free to inspect Kind and dispatch it locally if it grows that
+// capability later).
+//
+// nil sinks = silent no-ops so callers that don't yet wire the pool
+// keep the historical "TE arm is a stub" behaviour.
+//
+// tyrquake: CL_ParseTEnt -- the per-kind switch that calls
+// R_ParticleExplosion / R_RunParticleEffect / R_LavaSplash /
+// R_TeleportSplash / CL_NewDLight / CL_ParseBeam depending on the
+// TE_* byte. Light-emission (CL_NewDLight calls) is out of scope here
+// -- the dynamic-lighting pool is wired separately when the bring-up
+// gets to it.
+func applyTempEntity(state *State, m DecodedTempEntity) {
+	switch m.Kind {
+	case TELightning1, TELightning2, TELightning3, TEBeam:
+		if state.EmitBeam == nil {
+			return
+		}
+		state.EmitBeam(int(m.Kind), m.EntityNum, m.Start, m.End)
+		return
+	}
+	if state.EmitTempEntity == nil {
+		return
+	}
+	state.EmitTempEntity(int(m.Kind), m.Origin)
+}
+
+// applyCenterPrint handles svc_centerprint: stash the text on State +
+// stamp the per-frame expiry [CenterPrintLifetime] seconds in the
+// future. Empty text clears the active centerprint immediately (matches
+// upstream SCR_CenterPrint, which sets scr_centertime_off = 0 on an
+// empty string so the renderer's fade-out runs the next frame).
+//
+// tyrquake: SCR_CenterPrint in screen.c -- copies the string into
+// scr_centerstring + seeds scr_centertime_off = scr_centertime->value
+// (default 2.0).
+func applyCenterPrint(state *State, m DecodedCenterPrint, nowSec float32) {
+	state.CenterPrintText = m.Text
+	if m.Text == "" {
+		state.CenterPrintExpiry = 0
+		return
+	}
+	state.CenterPrintExpiry = nowSec + CenterPrintLifetime
+}
+
+// applyIntermission handles svc_intermission: flip the
+// [State.Intermission] flag, clear any [State.IntermissionText] (the
+// scoreboard variant has no caller-supplied text -- the renderer
+// composes it from the stat bank), and stamp IntermissionTime with
+// nowSec. The renderer reads the flag + the cached stat bank
+// (StatTotalSecrets / StatSecrets / StatTotalMonsters / StatMonsters
+// + Time) to lay out the end-of-level scoreboard.
+//
+// Active centerprint is suppressed (cleared) on entry so a "you got
+// the shotgun" banner doesn't bleed through the scoreboard overlay.
+// tyrquake: the scr_centertime_off = 0 reset inside CL_ParseStartSound's
+// svc_intermission arm.
+//
+// tyrquake: the svc_intermission case inside CL_ParseServerMessage
+// (NQ/cl_parse.c) that sets cl.intermission = 1 + cl.completed_time
+// = cl.time + scr_centertime_off = 0.
+func applyIntermission(state *State, nowSec float32) {
+	state.Intermission = true
+	state.IntermissionText = ""
+	state.IntermissionTime = nowSec
+	state.CenterPrintText = ""
+	state.CenterPrintExpiry = 0
+}
+
+// applyFinale handles svc_finale: flip the [State.Intermission] flag
+// AND stash the caller-supplied multi-line credits text in
+// [State.IntermissionText]. The renderer composes the centered-text
+// overlay from IntermissionText (one screen line per '\n'-delimited
+// substring); the per-map scoreboard from the stat bank is
+// suppressed when IntermissionText is non-empty.
+//
+// Active centerprint is suppressed on entry (same rationale as
+// applyIntermission). tyrquake: the svc_finale case inside
+// CL_ParseServerMessage that sets cl.intermission = 2 + copies the
+// payload into scr_centerstring.
+func applyFinale(state *State, m DecodedFinale, nowSec float32) {
+	state.Intermission = true
+	state.IntermissionText = m.Text
+	state.IntermissionTime = nowSec
+	state.CenterPrintText = ""
+	state.CenterPrintExpiry = 0
+}
+
+// applyCDTrack handles svc_cdtrack: write the (track, loopTrack) byte
+// pair onto [State.MusicTrack] + [State.MusicLoopTrack] and bump
+// [State.MusicEpoch] so the embedder's per-tic music driver detects
+// the change and (re-)opens the streamer.
+//
+// The epoch is bumped unconditionally, even when the new pair is
+// identical to the previous one: the server may legitimately
+// retransmit svc_cdtrack to force a music restart (e.g. after a save-
+// game load that ought to re-trigger the current track from the top),
+// and the embedder's driver is responsible for deciding whether to
+// re-arm the streamer or treat the redundant emission as a no-op by
+// comparing (MusicTrack, MusicLoopTrack) themselves.
+//
+// tyrquake: the svc_cdtrack arm of CL_ParseServerMessage (the C
+// upstream writes cl.cdtrack + cl.looptrack then immediately calls
+// BGM_PlayCDtrack -- the Go port splits the wire write from the
+// playback driver via the epoch counter so the music subsystem stays
+// out of the wire decoder).
+func applyCDTrack(state *State, m DecodedCDTrack) {
+	state.MusicTrack = m.Track
+	state.MusicLoopTrack = m.LoopTrack
+	state.MusicEpoch++
 }
 
 // applyUpdate handles svc_update: seed the entity's live state from

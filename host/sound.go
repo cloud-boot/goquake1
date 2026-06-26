@@ -26,6 +26,44 @@ var ErrNoSoundPool = errors.New("host: no sound pool wired (call SetSoundPool fi
 // can tell why nothing played.
 var ErrSoundNotPrecached = errors.New("host: sample not in precache table")
 
+// SetListener records the per-tic listener context the spatializing
+// sound dispatch ([Host.StartSoundAt] / [Host.AmbientSoundAt]) reads
+// to drive stereo balance + distance falloff. tyrquake: the per-tic
+// AngleVectors(cl.viewangles, forward, right, up) inside S_Update,
+// hoisted out so the host doesn't directly depend on the client
+// package + so embedders can wire any listener basis (replay viewer,
+// fixed camera, ...).
+//
+//	origin -- viewer world position (typically the wire-mirrored
+//	          client.State.Entities[PlayerNum].Origin)
+//	right  -- viewer right axis (the second return of
+//	          mathlib.AngleVectors(viewangles); points to the
+//	          listener's right ear)
+//
+// Until called for the first time, StartSoundAt / AmbientSoundAt
+// degrade to "no spatial separation" (= existing pre-batch behaviour).
+// After a SetListener, every subsequent spatializing call uses the
+// stored basis until a new SetListener overrides it.
+func (h *Host) SetListener(origin, right [3]float32) {
+	if h == nil {
+		return
+	}
+	h.listenerOrigin = origin
+	h.listenerRight = right
+	h.listenerSet = true
+}
+
+// HasListener reports whether [Host.SetListener] has been called at
+// least once. Exposed so embedders that want to choose between the
+// spatializing and the non-spatializing StartSound path can detect
+// the wiring state without re-tracking it themselves.
+func (h *Host) HasListener() bool {
+	if h == nil {
+		return false
+	}
+	return h.listenerSet
+}
+
 // SetSoundPool wires the mixer pool the per-tic runloop ALREADY owns
 // (runloop.Runner.SoundPool, allocated by NewRunnerFromVFS when
 // SoundChannels > 0). The host's StartSound / AmbientSound builtins
@@ -255,6 +293,63 @@ func (h *Host) StartSound(entIdx, channel int, name string, volume int, leftVol,
 	return slot, nil
 }
 
+// StartSoundAt is the spatializing variant of [Host.StartSound] that
+// computes the per-ear volumes via [sound.Spatialize] from the stored
+// listener context ([Host.SetListener]) and the source's world
+// position. tyrquake: the SV_StartSound -> SND_Spatialize chain
+// inside snd_dma.c (the C upstream spatializes on the client side
+// every Paint; the Go port spatializes once at fire-time on the host
+// side -- a cheaper shape that gives the same audible result for
+// short one-shot effects + matches the "do it once where the source
+// origin is known" pattern the embedder's QC builtin already lives in).
+//
+// Per-arg shape:
+//
+//	entIdx       -- entity owning the sound (0 = world / global)
+//	channel      -- 0..7, entity-relative channel
+//	name         -- sample name (canonical bare form, looked up in
+//	                Server.SoundPrecache)
+//	vol          -- caller-supplied master volume (0..[sound.MaxVolume],
+//	                = the QC `volume` arg scaled to byte range)
+//	attenuation  -- per-sound distance falloff coefficient (= the QC
+//	                `attenuation` arg; typical values:
+//	                [sound.AttenuationNone] for global UI sounds,
+//	                [sound.AttenuationNormal] for gameplay,
+//	                [sound.AttenuationIdle] for short-range monster
+//	                idle sounds, [sound.AttenuationStatic] for env_sound)
+//	sourceOrigin -- world position of the sound source (typically the
+//	                owning entity's `origin` entvars value; callers
+//	                pass [3]float32{} for entIdx==0 + no specific
+//	                anchor)
+//
+// Without a listener wired (HasListener()==false) OR with
+// attenuation==[sound.AttenuationNone], the dispatch falls through to
+// the existing [Host.StartSound] no-spatialize path (full vol on both
+// ears). Otherwise sound.Spatialize computes leftVol + rightVol from
+// the (listener->source) vector + the listener's right axis, and
+// those values are passed verbatim to StartSound's channel-fill.
+//
+// Errors mirror [Host.StartSound] verbatim.
+func (h *Host) StartSoundAt(entIdx, channel int, name string, vol int, attenuation sound.SoundAttenuation, sourceOrigin [3]float32) (int, error) {
+	if h == nil || h.soundPool == nil {
+		return -1, ErrNoSoundPool
+	}
+	// AttenuationNone short-circuits the per-ear math (master scale is
+	// always 1, balance is irrelevant) -- skip Spatialize and reuse the
+	// existing no-spatialize path so the channel-fill stays single-sourced.
+	if !h.listenerSet || attenuation == sound.AttenuationNone {
+		return h.StartSound(entIdx, channel, name, vol, -1, -1)
+	}
+	out := sound.Spatialize(sound.SpatializeIn{
+		ListenerOrigin: h.listenerOrigin,
+		ListenerRight:  h.listenerRight,
+		SoundOrigin:    sourceOrigin,
+		MasterVolume:   vol,
+		Attenuation:    attenuation,
+	})
+	return h.StartSound(entIdx, channel, name, vol, out.LeftVol, out.RightVol)
+}
+
 // AmbientSound parks `name` on one of the pool's reserved-static
 // channels (slots 0..ReservedStatic-1) as a looped ambient track.
 // tyrquake: PF_ambientsound (pr_cmds.c builtin #74) -- the C upstream
@@ -324,4 +419,54 @@ func (h *Host) AmbientSound(slot, entIdx int, name string, volume int) (int, err
 	ch.Master = true
 	h.LastAmbientsStarted++
 	return slot, nil
+}
+
+// AmbientSoundAt is the spatializing variant of [Host.AmbientSound]
+// that drives stereo balance + distance falloff via [sound.Spatialize]
+// from the listener context [Host.SetListener] last recorded + the
+// passed `position` (the QC `position` arg of PF_ambientsound, the
+// world-space anchor of the ambient source). tyrquake: the static-
+// channel arm of PF_ambientsound + SND_Spatialize.
+//
+//	slot        -- reserved-static channel index (0..ReservedStatic-1)
+//	entIdx      -- owning entity (typically 0 for env_sound entities)
+//	name        -- sample name (canonical bare form)
+//	volume      -- caller-supplied master volume (0..[sound.MaxVolume])
+//	position    -- world-space anchor (= QC ambientsound's first arg)
+//	attenuation -- per-source distance falloff coefficient (the QC
+//	               ATTN_STATIC=3 / ATTN_IDLE=2 / ATTN_NORM=1 dispatch)
+//
+// Without a wired listener OR with attenuation==[sound.AttenuationNone]
+// the dispatch falls through to the existing [Host.AmbientSound] path
+// (full vol on both ears). Channel.Master stays true (= ambient,
+// looping) regardless of which branch wrote the volumes.
+//
+// Errors mirror [Host.AmbientSound] verbatim.
+func (h *Host) AmbientSoundAt(slot, entIdx int, name string, volume int, position [3]float32, attenuation sound.SoundAttenuation) (int, error) {
+	if h == nil || h.soundPool == nil {
+		return -1, ErrNoSoundPool
+	}
+	if !h.listenerSet || attenuation == sound.AttenuationNone {
+		return h.AmbientSound(slot, entIdx, name, volume)
+	}
+	out := sound.Spatialize(sound.SpatializeIn{
+		ListenerOrigin: h.listenerOrigin,
+		ListenerRight:  h.listenerRight,
+		SoundOrigin:    position,
+		MasterVolume:   volume,
+		Attenuation:    attenuation,
+	})
+	// Park the sample on the slot via AmbientSound first (handles
+	// precache lookup + channel-fill + Master flag), then override the
+	// left/right volumes with the spatialized values. AmbientSound's
+	// own volume clamp is harmless (the Spatialize output is already
+	// clamped to [0, MaxVolume]).
+	out2, err := h.AmbientSound(slot, entIdx, name, volume)
+	if err != nil || out2 < 0 {
+		return out2, err
+	}
+	ch := &h.soundPool.Channels[out2]
+	ch.LeftVol = out.LeftVol
+	ch.RightVol = out.RightVol
+	return out2, nil
 }

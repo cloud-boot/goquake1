@@ -125,6 +125,23 @@ func TestNext_FoundSecret_Roundtrip(t *testing.T) {
 	}
 }
 
+// ------- DecodedIntermission -------------------------------------
+
+func TestNext_Intermission_Roundtrip(t *testing.T) {
+	buf := sizebuf.New(make([]byte, 8))
+	if err := server.EncodeIntermission(buf); err != nil {
+		t.Fatal(err)
+	}
+	sr := newReader(buf.Bytes())
+	v, err := sr.Next(protocol.VersionNQ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := v.(DecodedIntermission); !ok {
+		t.Errorf("type: got %T want DecodedIntermission", v)
+	}
+}
+
 // ------- DecodedSellScreen ---------------------------------------
 
 func TestNext_SellScreen_Roundtrip(t *testing.T) {
@@ -285,6 +302,46 @@ func TestNext_Cutscene_Roundtrip(t *testing.T) {
 	}
 	if v.(DecodedCutscene).Text != want {
 		t.Errorf("text mismatch")
+	}
+}
+
+func TestNext_CenterPrint_Roundtrip(t *testing.T) {
+	const want = "you got the shotgun"
+	buf := sizebuf.New(make([]byte, 64))
+	if err := server.EncodeCenterPrint(buf, want); err != nil {
+		t.Fatal(err)
+	}
+	sr := newReader(buf.Bytes())
+	v, err := sr.Next(protocol.VersionNQ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.(DecodedCenterPrint).Text != want {
+		t.Errorf("text: got %q want %q", v.(DecodedCenterPrint).Text, want)
+	}
+}
+
+func TestNext_CenterPrint_Truncated(t *testing.T) {
+	// Cmd byte only -- ReadString hits EOF immediately.
+	sr := newReader([]byte{protocol.SvcCenterPrint})
+	if _, err := sr.Next(protocol.VersionNQ); !errors.Is(err, ErrCorruptMessage) {
+		t.Errorf("err: got %v want ErrCorruptMessage", err)
+	}
+}
+
+func TestNext_CenterPrint_Empty(t *testing.T) {
+	// Empty string body (lone NUL after the cmd byte).
+	buf := sizebuf.New(make([]byte, 4))
+	if err := server.EncodeCenterPrint(buf, ""); err != nil {
+		t.Fatal(err)
+	}
+	sr := newReader(buf.Bytes())
+	v, err := sr.Next(protocol.VersionNQ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.(DecodedCenterPrint).Text != "" {
+		t.Errorf("text: got %q want empty", v.(DecodedCenterPrint).Text)
 	}
 }
 
@@ -1042,7 +1099,8 @@ func TestDecodedMarkers(t *testing.T) {
 		DecodedFoundSecret{}, DecodedSellScreen{},
 		DecodedSetView{}, DecodedSignonNum{},
 		DecodedPrint{}, DecodedStuffText{},
-		DecodedFinale{}, DecodedCutscene{},
+		DecodedFinale{}, DecodedIntermission{}, DecodedCutscene{},
+		DecodedCDTrack{},
 		DecodedUpdateName{}, DecodedUpdateColors{},
 		DecodedUpdateFrags{}, DecodedUpdateStat{},
 		DecodedParticle{}, DecodedSound{},
@@ -1072,6 +1130,8 @@ func TestDecodedMarkers(t *testing.T) {
 			v.isDecoded()
 		case DecodedFinale:
 			v.isDecoded()
+		case DecodedIntermission:
+			v.isDecoded()
 		case DecodedCutscene:
 			v.isDecoded()
 		case DecodedUpdateName:
@@ -1094,8 +1154,70 @@ func TestDecodedMarkers(t *testing.T) {
 			v.isDecoded()
 		case DecodedClientData:
 			v.isDecoded()
+		case DecodedCDTrack:
+			v.isDecoded()
 		}
 		sink = d
 	}
 	_ = sink
+}
+
+// ------- DecodedCDTrack ------------------------------------------
+
+func TestNext_CDTrack_Roundtrip(t *testing.T) {
+	const wantTrack = 5
+	const wantLoop = 5
+	buf := sizebuf.New(make([]byte, 8))
+	if err := server.EncodeCDTrack(buf, wantTrack, wantLoop); err != nil {
+		t.Fatal(err)
+	}
+	sr := newReader(buf.Bytes())
+	v, err := sr.Next(protocol.VersionNQ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cd, ok := v.(DecodedCDTrack)
+	if !ok {
+		t.Fatalf("type: got %T want DecodedCDTrack", v)
+	}
+	if cd.Track != wantTrack {
+		t.Errorf("Track: got %d want %d", cd.Track, wantTrack)
+	}
+	if cd.LoopTrack != wantLoop {
+		t.Errorf("LoopTrack: got %d want %d", cd.LoopTrack, wantLoop)
+	}
+}
+
+func TestNext_CDTrack_DistinctBytes(t *testing.T) {
+	// Track != LoopTrack so the two-byte order is verified.
+	buf := sizebuf.New(make([]byte, 8))
+	if err := server.EncodeCDTrack(buf, 7, 11); err != nil {
+		t.Fatal(err)
+	}
+	sr := newReader(buf.Bytes())
+	v, err := sr.Next(protocol.VersionNQ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cd := v.(DecodedCDTrack)
+	if cd.Track != 7 || cd.LoopTrack != 11 {
+		t.Errorf("(Track, LoopTrack): got (%d, %d) want (7, 11)", cd.Track, cd.LoopTrack)
+	}
+}
+
+func TestNext_CDTrack_TruncatedAfterCmd(t *testing.T) {
+	// Cmd byte only, no payload -- the first ReadU8 lands on EOF.
+	sr := newReader([]byte{protocol.SvcCDTrack})
+	if _, err := sr.Next(protocol.VersionNQ); !errors.Is(err, ErrCorruptMessage) {
+		t.Errorf("err: got %v want ErrCorruptMessage", err)
+	}
+}
+
+func TestNext_CDTrack_TruncatedAfterTrack(t *testing.T) {
+	// Cmd + one byte (track) but no loopTrack -- the second ReadU8
+	// trips Bad.
+	sr := newReader([]byte{protocol.SvcCDTrack, 5})
+	if _, err := sr.Next(protocol.VersionNQ); !errors.Is(err, ErrCorruptMessage) {
+		t.Errorf("err: got %v want ErrCorruptMessage", err)
+	}
 }

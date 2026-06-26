@@ -99,6 +99,21 @@ func KeyState(b *ButtonState) float32 {
 // (cl_forwardspeed, cl_backspeed, ...) becomes a struct field so
 // callers can pass an immutable snapshot instead of reaching into
 // the cvar registry per-frame.
+//
+// MouseYaw / MousePitch are the m_yaw / m_pitch cvars (degrees of
+// view rotation per pixel of mouse delta, BEFORE cl_sensitivity is
+// folded in). They live on this struct so the runloop can vary
+// them per-session (player config, in-game menu binding) instead of
+// pinning them to compile-time constants. The upstream defaults
+// are 0.022 each (see NQ/cl_main.c) and [DefaultInputSpeeds]
+// returns those.
+//
+// MouseYaw / MousePitch == 0 is a SUPPORTED configuration: it
+// disables mouse contribution on that axis entirely (the upstream
+// behaviour when the cvar is zeroed). The default-zero of an
+// uninitialised [InputSpeeds] therefore silently disables mouse
+// look -- callers that want vanilla behaviour MUST go through
+// [DefaultInputSpeeds] (which the runloop's [Setup] already does).
 type InputSpeeds struct {
 	Forward       float32 // cl_forwardspeed
 	Back          float32 // cl_backspeed
@@ -108,13 +123,30 @@ type InputSpeeds struct {
 	Pitch         float32 // cl_pitchspeed
 	AngleSpeedKey float32 // cl_anglespeedkey -- multiplier when "+speed" is held
 	MoveSpeedKey  float32 // cl_movespeedkey
+	MouseYaw      float32 // m_yaw   -- degrees of yaw   per mouse-X delta unit (default 0.022)
+	MousePitch    float32 // m_pitch -- degrees of pitch per mouse-Y delta unit (default 0.022)
 }
+
+// DefaultMouseYaw is the upstream m_yaw default (NQ/cl_main.c):
+// 0.022 degrees of yaw rotation per pixel of mouse-X delta, before
+// cl_sensitivity is folded in. Exported so callers that build an
+// [InputSpeeds] by hand (rather than via [DefaultInputSpeeds]) can
+// pin the canonical value without re-deriving it.
+const DefaultMouseYaw float32 = 0.022
+
+// DefaultMousePitch is the upstream m_pitch default (NQ/cl_main.c):
+// 0.022 degrees of pitch rotation per pixel of mouse-Y delta. The
+// positive sign matches the upstream "non-inverted look" default
+// (mouse-down looks down); a negative value flips to "inverted
+// look" without any other code change.
+const DefaultMousePitch float32 = 0.022
 
 // DefaultInputSpeeds returns the C upstream cvar defaults.
 // tyrquake: cl_*speed cvar registrations in NQ/cl_input.c
 // (cl_forwardspeed=200, cl_backspeed=200, cl_sidespeed=350,
 // cl_upspeed=200, cl_yawspeed=140, cl_pitchspeed=150,
-// cl_anglespeedkey=1.5, cl_movespeedkey=2.0).
+// cl_anglespeedkey=1.5, cl_movespeedkey=2.0) plus the m_yaw /
+// m_pitch defaults from NQ/cl_main.c (both 0.022).
 func DefaultInputSpeeds() InputSpeeds {
 	return InputSpeeds{
 		Forward:       200,
@@ -125,6 +157,8 @@ func DefaultInputSpeeds() InputSpeeds {
 		Pitch:         150,
 		AngleSpeedKey: 1.5,
 		MoveSpeedKey:  2.0,
+		MouseYaw:      DefaultMouseYaw,
+		MousePitch:    DefaultMousePitch,
 	}
 }
 
@@ -173,7 +207,16 @@ type MovementButtons struct {
 // upstream's static in_strafe / in_klook kbuttons; this Go port
 // drops them for now -- the call sites that need them can wrap
 // [BaseMove] and re-mux their buttons before passing them in.
-func BaseMove(buttons MovementButtons, speeds InputSpeeds, dt float32) server.UserCmd {
+//
+// MUTATION CONTRACT: BaseMove takes a pointer because KeyState clears
+// the per-frame impulse bits as it samples them (tyrquake's CL_KeyState
+// does the same on the static kbutton_t globals). A by-value MovementButtons
+// would clear the impulses on a stack copy and the caller's persistent
+// state would keep the down-edge bit forever, collapsing KeyState to a
+// constant 0.5 every subsequent frame the key is held (and the player's
+// move axes to 50% of cl_*speed). Pass a pointer to the runloop's
+// persistent state -- the impulse drain MUST land on that struct.
+func BaseMove(buttons *MovementButtons, speeds InputSpeeds, dt float32) server.UserCmd {
 	_ = dt // upstream CL_BaseMove also ignores host_frametime here
 
 	var cmd server.UserCmd
@@ -205,29 +248,43 @@ func BaseMove(buttons MovementButtons, speeds InputSpeeds, dt float32) server.Us
 // common/in_sdl.c / in_x11.c / in_win.c.
 //
 // dx, dy are pixel deltas; sensitivity is the cl_sensitivity cvar
-// (default 3). The per-axis m_yaw / m_pitch multipliers (default
-// 0.022 each, see NQ/cl_main.c) are folded in here.
+// (default 3). The per-axis m_yaw / m_pitch multipliers (degrees
+// per pixel, BEFORE sensitivity is folded in) are passed in
+// explicitly so the caller can vary them per-session -- the
+// upstream defaults are [DefaultMouseYaw] / [DefaultMousePitch]
+// (both 0.022, see NQ/cl_main.c) and live on the [InputSpeeds]
+// bundle as MouseYaw / MousePitch; the runloop pulls them off
+// [InputSpeeds] before invoking us.
 //
 // Sign conventions, matching upstream exactly:
 //
-//	yaw   -= m_yaw   * sensitivity * dx   (mouse right => yaw decreases;
-//	                                       Q1's yaw grows CCW so this
-//	                                       turns the view right)
-//	pitch += m_pitch * sensitivity * dy   (mouse down  => pitch increases;
-//	                                       with default m_pitch=+0.022
-//	                                       this is "non-inverted look",
-//	                                       i.e. dragging down looks down)
+//	yaw   -= mYaw   * sensitivity * dx   (mouse right => yaw decreases;
+//	                                      Q1's yaw grows CCW so this
+//	                                      turns the view right)
+//	pitch += mPitch * sensitivity * dy   (mouse down  => pitch increases;
+//	                                      with the default mPitch=+0.022
+//	                                      this is "non-inverted look",
+//	                                      i.e. dragging down looks down;
+//	                                      a NEGATIVE mPitch flips to
+//	                                      "inverted look" without any
+//	                                      other code change)
 //
-// Roll is left alone. Pitch is clamped to [-90, +90] to match the
-// cl_minpitch / cl_maxpitch defaults from NQ/cl_main.c. The cvar
-// values aren't passed in here because the upstream defaults haven't
-// moved in ~25 years; if a future caller needs runtime configurability,
-// extend the signature rather than re-reading a global.
-func ApplyMouseMove(currentAngles [3]float32, dx, dy float32, sensitivity float32) [3]float32 {
-	const mYaw float32 = 0.022   // m_yaw default
-	const mPitch float32 = 0.022 // m_pitch default
-	const maxPitch float32 = 90
-	const minPitch float32 = -90
+// Roll is left alone. Pitch is clamped to [-89, +89] (one degree
+// inside the upstream cl_minpitch / cl_maxpitch [-90, +90] hard
+// limits, so the view never reaches the gimbal-lock singularity at
+// straight-up / straight-down where AngleVectors collapses the
+// forward basis onto the world Z axis). Yaw is wrapped into
+// [0, 360) via [mathlib.AngleMod] so prolonged mouse motion can't
+// drift the angle into the float-precision danger zone -- the
+// wire-side MSG_WriteAngle quantises into a single byte anyway, so
+// the wrap is loss-free across the on-wire round-trip.
+//
+// mYaw / mPitch == 0 is supported -- the upstream cvar zeroes
+// disable the respective axis entirely; the math falls out the
+// same way here (the delta term collapses to 0).
+func ApplyMouseMove(currentAngles [3]float32, dx, dy float32, sensitivity, mYaw, mPitch float32) [3]float32 {
+	const maxPitch float32 = 89
+	const minPitch float32 = -89
 
 	mx := dx * sensitivity
 	my := dy * sensitivity
@@ -242,6 +299,7 @@ func ApplyMouseMove(currentAngles [3]float32, dx, dy float32, sensitivity float3
 	if out[mathlib.Pitch] < minPitch {
 		out[mathlib.Pitch] = minPitch
 	}
+	out[mathlib.Yaw] = mathlib.AngleMod(out[mathlib.Yaw])
 	return out
 }
 
@@ -270,7 +328,10 @@ func ApplyMouseMove(currentAngles [3]float32, dx, dy float32, sensitivity float3
 // [-90, +90]; roll is clamped to +/-50. The cvar values are hard-
 // coded to the upstream defaults for the same reason as in
 // [ApplyMouseMove].
-func AdjustAngles(currentAngles [3]float32, buttons MovementButtons, speeds InputSpeeds, dt float32) [3]float32 {
+//
+// Like [BaseMove], buttons is passed by pointer so KeyState's
+// per-frame impulse drain lands on the runloop's persistent state.
+func AdjustAngles(currentAngles [3]float32, buttons *MovementButtons, speeds InputSpeeds, dt float32) [3]float32 {
 	const maxPitch float32 = 90
 	const minPitch float32 = -90
 	const maxRoll float32 = 50

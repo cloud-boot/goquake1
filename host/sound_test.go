@@ -29,12 +29,12 @@ func synthWAV(n int) []byte {
 	// fmt chunk (PCM, mono, 11025 Hz, 8-bit)
 	buf = append(buf, 'f', 'm', 't', ' ')
 	buf = appendU32(buf, 16)
-	buf = appendU16(buf, 1)           // PCM
-	buf = appendU16(buf, 1)           // mono
-	buf = appendU32(buf, 11025)       // sample rate
-	buf = appendU32(buf, 11025*1)     // byte rate
-	buf = appendU16(buf, 1)           // block align
-	buf = appendU16(buf, 8)           // bits per sample
+	buf = appendU16(buf, 1)       // PCM
+	buf = appendU16(buf, 1)       // mono
+	buf = appendU32(buf, 11025)   // sample rate
+	buf = appendU32(buf, 11025*1) // byte rate
+	buf = appendU16(buf, 1)       // block align
+	buf = appendU16(buf, 8)       // bits per sample
 	// data chunk
 	buf = append(buf, 'd', 'a', 't', 'a')
 	buf = appendU32(buf, uint32(n))
@@ -446,6 +446,249 @@ func TestSetSoundPool_NilDetach(t *testing.T) {
 	h.SetSoundPool(nil)
 	if h.SoundPool() != nil {
 		t.Error("pool not detached")
+	}
+}
+
+// --- Spatialization -------------------------------------------------------
+
+// TestSetListener_RoundTrip asserts SetListener / HasListener wire +
+// the nil-host guard returns false.
+func TestSetListener_RoundTrip(t *testing.T) {
+	var nilHost *Host
+	if nilHost.HasListener() {
+		t.Error("nil host should not report HasListener")
+	}
+	nilHost.SetListener([3]float32{}, [3]float32{}) // must not panic
+	h := hostForSoundTest(t)
+	if h.HasListener() {
+		t.Error("fresh host should not report HasListener")
+	}
+	h.SetListener([3]float32{1, 2, 3}, [3]float32{0, 1, 0})
+	if !h.HasListener() {
+		t.Error("HasListener should be true after SetListener")
+	}
+}
+
+// TestStartSoundAt_NoListenerFallsThrough asserts that without a wired
+// listener StartSoundAt degrades to the existing StartSound behaviour
+// (= L == R == master volume).
+func TestStartSoundAt_NoListenerFallsThrough(t *testing.T) {
+	h := hostForSoundTest(t)
+	h.SetSoundLoader(func(string) ([]byte, bool) { return synthWAV(64), true })
+	if _, err := h.PrecacheSound("zap.wav"); err != nil {
+		t.Fatalf("precache: %v", err)
+	}
+	pool := poolForSoundTest(t, 4)
+	h.SetSoundPool(pool)
+
+	slot, err := h.StartSoundAt(0, 0, "zap.wav", 200, sound.AttenuationNormal,
+		[3]float32{100, 0, 0})
+	if err != nil {
+		t.Fatalf("StartSoundAt: %v", err)
+	}
+	ch := &pool.Channels[slot]
+	if ch.LeftVol != 200 || ch.RightVol != 200 {
+		t.Errorf("no-listener fall-through: got L=%d R=%d want 200/200", ch.LeftVol, ch.RightVol)
+	}
+}
+
+// TestStartSoundAt_AttenuationNoneFallsThrough asserts that
+// AttenuationNone short-circuits the spatialize path even with a
+// wired listener (= UI / global sounds stay loud everywhere).
+func TestStartSoundAt_AttenuationNoneFallsThrough(t *testing.T) {
+	h := hostForSoundTest(t)
+	h.SetSoundLoader(func(string) ([]byte, bool) { return synthWAV(64), true })
+	if _, err := h.PrecacheSound("ui.wav"); err != nil {
+		t.Fatalf("precache: %v", err)
+	}
+	pool := poolForSoundTest(t, 4)
+	h.SetSoundPool(pool)
+	h.SetListener([3]float32{0, 0, 0}, [3]float32{0, 1, 0})
+
+	slot, err := h.StartSoundAt(0, 0, "ui.wav", 180, sound.AttenuationNone,
+		[3]float32{500, 0, 0})
+	if err != nil {
+		t.Fatalf("StartSoundAt: %v", err)
+	}
+	ch := &pool.Channels[slot]
+	if ch.LeftVol != 180 || ch.RightVol != 180 {
+		t.Errorf("AttenuationNone: got L=%d R=%d want 180/180", ch.LeftVol, ch.RightVol)
+	}
+}
+
+// TestStartSoundAt_SpatializeCentered asserts a sound directly in
+// front of the listener (along the forward axis -- orthogonal to
+// the right axis) gives balanced L/R volumes, both reduced by the
+// distance attenuation.
+func TestStartSoundAt_SpatializeCentered(t *testing.T) {
+	h := hostForSoundTest(t)
+	h.SetSoundLoader(func(string) ([]byte, bool) { return synthWAV(64), true })
+	if _, err := h.PrecacheSound("fwd.wav"); err != nil {
+		t.Fatalf("precache: %v", err)
+	}
+	pool := poolForSoundTest(t, 4)
+	h.SetSoundPool(pool)
+	// Listener at origin, right axis = +Y; source at +X (in front of
+	// the listener -- the dot(relative, right) projection is 0).
+	h.SetListener([3]float32{0, 0, 0}, [3]float32{0, 1, 0})
+
+	slot, err := h.StartSoundAt(0, 0, "fwd.wav", 200, sound.AttenuationNormal,
+		[3]float32{100, 0, 0})
+	if err != nil {
+		t.Fatalf("StartSoundAt: %v", err)
+	}
+	ch := &pool.Channels[slot]
+	// Balance == 0 -> leftScale == rightScale == 0.5 -> L == R.
+	if ch.LeftVol != ch.RightVol {
+		t.Errorf("centered source: L=%d R=%d want L==R", ch.LeftVol, ch.RightVol)
+	}
+	// Distance attenuation: master = 1 - 100*0.001*1 = 0.9 -> scaled
+	// base = 200*0.9 = 180; each ear gets 180 * 0.5 = 90.
+	if ch.LeftVol != 90 {
+		t.Errorf("centered source: L=%d want 90", ch.LeftVol)
+	}
+}
+
+// TestStartSoundAt_SpatializeRight asserts a sound to the right of
+// the listener (along the right axis) drives right > left.
+func TestStartSoundAt_SpatializeRight(t *testing.T) {
+	h := hostForSoundTest(t)
+	h.SetSoundLoader(func(string) ([]byte, bool) { return synthWAV(64), true })
+	if _, err := h.PrecacheSound("right.wav"); err != nil {
+		t.Fatalf("precache: %v", err)
+	}
+	pool := poolForSoundTest(t, 4)
+	h.SetSoundPool(pool)
+	h.SetListener([3]float32{0, 0, 0}, [3]float32{0, 1, 0})
+
+	slot, err := h.StartSoundAt(0, 0, "right.wav", 200, sound.AttenuationNormal,
+		[3]float32{0, 100, 0})
+	if err != nil {
+		t.Fatalf("StartSoundAt: %v", err)
+	}
+	ch := &pool.Channels[slot]
+	if ch.RightVol <= ch.LeftVol {
+		t.Errorf("right-of-listener: got L=%d R=%d want R>L", ch.LeftVol, ch.RightVol)
+	}
+}
+
+// TestStartSoundAt_FarSourceAttenuated asserts a sound at the
+// SoundFalloffDist threshold collapses to zero (1 - 1000*0.001*1 = 0).
+func TestStartSoundAt_FarSourceAttenuated(t *testing.T) {
+	h := hostForSoundTest(t)
+	h.SetSoundLoader(func(string) ([]byte, bool) { return synthWAV(64), true })
+	if _, err := h.PrecacheSound("far.wav"); err != nil {
+		t.Fatalf("precache: %v", err)
+	}
+	pool := poolForSoundTest(t, 4)
+	h.SetSoundPool(pool)
+	h.SetListener([3]float32{0, 0, 0}, [3]float32{0, 1, 0})
+
+	slot, err := h.StartSoundAt(0, 0, "far.wav", 200, sound.AttenuationNormal,
+		[3]float32{2000, 0, 0})
+	if err != nil {
+		t.Fatalf("StartSoundAt: %v", err)
+	}
+	ch := &pool.Channels[slot]
+	if ch.LeftVol != 0 || ch.RightVol != 0 {
+		t.Errorf("far source: got L=%d R=%d want 0/0", ch.LeftVol, ch.RightVol)
+	}
+}
+
+// TestStartSoundAt_NilPool surfaces ErrNoSoundPool (mirrors the
+// StartSound guard).
+func TestStartSoundAt_NilPool(t *testing.T) {
+	h := hostForSoundTest(t)
+	if _, err := h.StartSoundAt(0, 0, "x", 0, sound.AttenuationNormal,
+		[3]float32{}); !errors.Is(err, ErrNoSoundPool) {
+		t.Errorf("no pool: %v", err)
+	}
+	var nilHost *Host
+	if _, err := nilHost.StartSoundAt(0, 0, "x", 0, sound.AttenuationNormal,
+		[3]float32{}); !errors.Is(err, ErrNoSoundPool) {
+		t.Errorf("nil host: %v", err)
+	}
+}
+
+// TestAmbientSoundAt_NoListenerFallsThrough asserts the no-listener
+// branch parks the ambient at full master volume.
+func TestAmbientSoundAt_NoListenerFallsThrough(t *testing.T) {
+	h := hostForSoundTest(t)
+	h.SetSoundLoader(func(string) ([]byte, bool) { return synthWAV(64), true })
+	if _, err := h.PrecacheSound("amb.wav"); err != nil {
+		t.Fatalf("precache: %v", err)
+	}
+	pool := poolForSoundTest(t, 4)
+	h.SetSoundPool(pool)
+
+	slot, err := h.AmbientSoundAt(0, 0, "amb.wav", 150, [3]float32{100, 0, 0}, sound.AttenuationStatic)
+	if err != nil {
+		t.Fatalf("AmbientSoundAt: %v", err)
+	}
+	ch := &pool.Channels[slot]
+	if ch.LeftVol != 150 || ch.RightVol != 150 {
+		t.Errorf("no-listener fall-through: got L=%d R=%d want 150/150", ch.LeftVol, ch.RightVol)
+	}
+	if !ch.Master {
+		t.Error("ambient channel should have Master=true")
+	}
+}
+
+// TestAmbientSoundAt_Spatializes asserts the right-of-listener anchor
+// drives right > left on the ambient channel.
+func TestAmbientSoundAt_Spatializes(t *testing.T) {
+	h := hostForSoundTest(t)
+	h.SetSoundLoader(func(string) ([]byte, bool) { return synthWAV(64), true })
+	if _, err := h.PrecacheSound("water.wav"); err != nil {
+		t.Fatalf("precache: %v", err)
+	}
+	pool := poolForSoundTest(t, 4)
+	h.SetSoundPool(pool)
+	h.SetListener([3]float32{0, 0, 0}, [3]float32{0, 1, 0})
+
+	slot, err := h.AmbientSoundAt(1, 0, "water.wav", 200, [3]float32{0, 100, 0},
+		sound.AttenuationNormal)
+	if err != nil {
+		t.Fatalf("AmbientSoundAt: %v", err)
+	}
+	ch := &pool.Channels[slot]
+	if ch.RightVol <= ch.LeftVol {
+		t.Errorf("right-of-listener: got L=%d R=%d want R>L", ch.LeftVol, ch.RightVol)
+	}
+	if !ch.Master {
+		t.Error("ambient channel should retain Master=true")
+	}
+}
+
+// TestAmbientSoundAt_NilPool surfaces ErrNoSoundPool.
+func TestAmbientSoundAt_NilPool(t *testing.T) {
+	h := hostForSoundTest(t)
+	if _, err := h.AmbientSoundAt(0, 0, "x", 0, [3]float32{}, sound.AttenuationNormal); !errors.Is(err, ErrNoSoundPool) {
+		t.Errorf("no pool: %v", err)
+	}
+	var nilHost *Host
+	if _, err := nilHost.AmbientSoundAt(0, 0, "x", 0, [3]float32{}, sound.AttenuationNormal); !errors.Is(err, ErrNoSoundPool) {
+		t.Errorf("nil host: %v", err)
+	}
+}
+
+// TestAmbientSoundAt_PropagatesErrors asserts the spatializing variant
+// surfaces errors from the underlying AmbientSound call (e.g. bad
+// slot index).
+func TestAmbientSoundAt_PropagatesErrors(t *testing.T) {
+	h := hostForSoundTest(t)
+	h.SetSoundLoader(func(string) ([]byte, bool) { return synthWAV(64), true })
+	if _, err := h.PrecacheSound("a.wav"); err != nil {
+		t.Fatalf("precache: %v", err)
+	}
+	pool := poolForSoundTest(t, 4)
+	h.SetSoundPool(pool)
+	h.SetListener([3]float32{0, 0, 0}, [3]float32{0, 1, 0})
+
+	// Out-of-range slot: AmbientSound returns the formatted error.
+	if _, err := h.AmbientSoundAt(99, 0, "a.wav", 200, [3]float32{0, 100, 0},
+		sound.AttenuationNormal); err == nil {
+		t.Error("bad slot: expected error, got nil")
 	}
 }
 

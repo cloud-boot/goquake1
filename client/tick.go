@@ -16,9 +16,16 @@ import (
 // TickInput is the per-frame caller-supplied input bundle. Frontends
 // (SDL / Wayland / DirectFB / TamaGo IO) fill this from their input
 // source each tick. tyrquake: IN_Move + the in_* cvar reads.
+//
+// Buttons is a POINTER, not a copy: [KeyState] (called by [BaseMove]
+// and [AdjustAngles] downstream) clears the per-frame impulse bits as
+// it samples them, and the drain MUST land on the caller's persistent
+// kbutton state -- a stack copy would let the down-edge bit live on
+// forever and KeyState would report a constant 0.5 every frame the key
+// stayed held, collapsing the move axes to cl_*speed/2 on the wire.
 type TickInput struct {
-	Buttons       MovementButtons // current button state (with this-frame events merged in)
-	MouseDX       float32         // pixel delta since last tick
+	Buttons       *MovementButtons // current button state (with this-frame events merged in)
+	MouseDX       float32          // pixel delta since last tick
 	MouseDY       float32
 	Sensitivity   float32     // cl_sensitivity cvar (typical default 3)
 	Speeds        InputSpeeds // per-axis sensitivity bundle (DefaultInputSpeeds() ok)
@@ -74,7 +81,8 @@ const tickOutBufSize = 64
 //
 // OUTBOUND BUILD (skipped when state.Connection != [StateConnected]):
 //
-//   - angles := ApplyMouseMove(viewAngles, MouseDX, MouseDY, Sensitivity)
+//   - angles := ApplyMouseMove(viewAngles, MouseDX, MouseDY,
+//     Sensitivity, Speeds.MouseYaw, Speeds.MousePitch)
 //   - angles  = AdjustAngles(angles, Buttons, Speeds, Dt)
 //   - cmd    := BaseMove(Buttons, Speeds, Dt)
 //   - cmd.ViewAngles = angles
@@ -185,10 +193,25 @@ func Tick(
 		return out, nil
 	}
 
-	angles := ApplyMouseMove(viewAngles, in.MouseDX, in.MouseDY, in.Sensitivity)
-	angles = AdjustAngles(angles, in.Buttons, in.Speeds, in.Dt)
-
-	cmd := BaseMove(in.Buttons, in.Speeds, in.Dt)
+	// MouseYaw / MousePitch come off the per-tic InputSpeeds bundle so
+	// the player's m_yaw / m_pitch cvar values flow through without
+	// reaching into a global -- the runloop seeds DefaultInputSpeeds()
+	// (MouseYaw=MousePitch=0.022) at startup, an in-game menu binding
+	// would re-publish a new bundle on change.
+	angles := ApplyMouseMove(
+		viewAngles, in.MouseDX, in.MouseDY,
+		in.Sensitivity, in.Speeds.MouseYaw, in.Speeds.MousePitch,
+	)
+	// in.Buttons is a *MovementButtons -- pass through verbatim so
+	// KeyState's impulse drain (inside AdjustAngles + BaseMove) lands
+	// on the caller's persistent kbutton state, not a stack copy.
+	if in.Buttons != nil {
+		angles = AdjustAngles(angles, in.Buttons, in.Speeds, in.Dt)
+	}
+	var cmd server.UserCmd
+	if in.Buttons != nil {
+		cmd = BaseMove(in.Buttons, in.Speeds, in.Dt)
+	}
 	cmd.ViewAngles = angles
 	cmd.Buttons = in.ActionButtons
 	cmd.Impulse = in.Impulse

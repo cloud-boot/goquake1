@@ -39,6 +39,25 @@ type UserCmd struct {
 	Impulse     uint8 // "+impulse N" weapon / cheat number
 }
 
+// Per-tic trigger-button bitmask values that ride on
+// [UserCmd.Buttons]. Mirror tyrquake's NQ/keys.h BUTTON_* defines
+// and the matching client-side constants in `client.ButtonAttack /
+// client.ButtonJump`. The values are the canonical on-wire shape
+// the QC progs read as self.button0 / self.button2 floats; do not
+// renumber or every shipping mod breaks.
+//
+// Living here (next to the UserCmd struct that carries them) so the
+// server + host packages can interpret the bitmask without taking
+// a circular dep on the client package's input keymap.
+const (
+	// ButtonAttack is the +attack bit (= self.button0). tyrquake:
+	// BUTTON_ATTACK = 1.
+	ButtonAttack uint8 = 1
+	// ButtonJump is the +jump bit (= self.button2). tyrquake:
+	// BUTTON_JUMP = 2.
+	ButtonJump uint8 = 2
+)
+
 // Server is the per-map runtime state. Lives from SV_SpawnServer
 // (map load) through SV_SendClientMessages (per-tick frames) until
 // the next SV_SpawnServer wipes it. tyrquake: server_t in NQ/server.h.
@@ -68,8 +87,18 @@ type Server struct {
 
 	ModelPrecache []string       // [MaxModels], sentinel-terminated
 	Models        []*model.Model // parallel to ModelPrecache
-	SoundPrecache []string       // [MaxSounds], sentinel-terminated
-	LightStyles   []string       // [MaxLightStyles]
+	// BrushModels is the parallel-to-ModelPrecache slice of per-
+	// submodel [model.BrushModel] handles SpawnServer carves out of
+	// the worldmodel's `*N` submodels so SOLID_BSP entities (doors,
+	// lifts, train movers, breakables) can drive a per-entity
+	// clipping hull through [world.HullForBounds]. Slot 0 is the
+	// empty-string sentinel (nil); slot 1 is the worldmodel; slots
+	// 2..N hold the per-submodel BrushModels. Slots for non-brush
+	// precaches (.mdl alias / .spr sprite) stay nil -- the trace
+	// dispatcher checks for nil before reaching for Hulls.
+	BrushModels   []*model.BrushModel // parallel to ModelPrecache
+	SoundPrecache []string            // [MaxSounds], sentinel-terminated
+	LightStyles   []string            // [MaxLightStyles]
 
 	Edicts    []*progs.Edict // [MaxEdicts]
 	NumEdicts int            // first free slot
@@ -161,6 +190,7 @@ func NewServer() *Server {
 	return &Server{
 		ModelPrecache:    make([]string, MaxModels),
 		Models:           make([]*model.Model, MaxModels),
+		BrushModels:      make([]*model.BrushModel, MaxModels),
 		SoundPrecache:    make([]string, MaxSounds),
 		LightStyles:      make([]string, MaxLightStyles),
 		Datagram:         sizebuf.New(make([]byte, MaxDatagram)),

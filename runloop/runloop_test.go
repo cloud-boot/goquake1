@@ -882,3 +882,405 @@ func TestRunFrame_MovementButtonsFeedClcMove(t *testing.T) {
 		t.Fatalf("clc_move forwardmove = %d; want > 0 (KeyW should produce forward motion)", forwardMove)
 	}
 }
+
+// TestRunFrame_MouseDeltaFeedsViewAngles is the end-to-end proof that
+// a virtio-input mouse-rel delta (the value the per-tic
+// [backend.Backend.PollInput] snapshot carries in MouseDX / MouseDY)
+// flows through the full per-tic chain --
+//
+//	PollInput  -> snap.MouseDX / MouseDY
+//	         -> client.TickInput.MouseDX / MouseDY (Sensitivity=1)
+//	         -> client.Tick -> ApplyMouseMove
+//	         -> r.ViewAngles (pitch / yaw)
+//
+// -- and lands on r.ViewAngles with the canonical m_yaw / m_pitch =
+// 0.022 deg/px scaling. With Sensitivity=1, dx=100 must rotate yaw
+// by exactly 100 * 0.022 = 2.2 deg in the "decreases" direction
+// (Q1 sign convention; mouse-right turns view right because yaw
+// grows CCW), and dy=50 must rotate pitch by +50 * 0.022 = +1.1 deg
+// (non-inverted look; mouse-down looks down).
+//
+// Anchors the wiring contract that makes virtio-mouse drive the
+// in-game player view. Pre-fix the runloop's TickInput hardcoded
+// MouseDX/MouseDY to 0 and the snapshot delta was dropped on the
+// floor; this test guards against a regression of that drop.
+func TestRunFrame_MouseDeltaFeedsViewAngles(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	rec.Input = backend.InputSnapshot{
+		MouseDX: 100,
+		MouseDY: 50,
+	}
+	r, _ := newRunner(t, rec)
+	clientSide, _ := server.NewLoopbackConn()
+	r.Conn = clientSide
+	r.Client.Connection = client.StateConnected
+
+	// Seed a non-zero starting yaw so AngleMod's [0,360) wrap is a
+	// no-op for both the start and the post-tick value (start=50,
+	// expected end=47.8).
+	r.ViewAngles = [3]float32{0, 50, 0}
+
+	if err := r.RunFrame(1.0/60.0, 1.0); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+
+	// yaw: 50 - 0.022*100 = 47.8 (AdjustAngles' arrow-key path is a
+	// no-op with no Left/Right held, so this is purely the mouse
+	// contribution). Tolerance covers AngleMod's 360/65536
+	// (~0.0055 deg) fixed-point step on top of float32 round-off.
+	const wantYaw float32 = 47.8
+	gotYaw := r.ViewAngles[1]
+	if abs32(gotYaw-wantYaw) > 0.01 {
+		t.Errorf("ViewAngles[YAW]: got %v want %v (start=50, dx=100, m_yaw=0.022)",
+			gotYaw, wantYaw)
+	}
+
+	// pitch: 0 + 0.022*50 = +1.1 (mouse-down looks down). No AngleMod
+	// on pitch (clamp-only) so 1e-3 tolerance suffices.
+	const wantPitch float32 = 1.1
+	gotPitch := r.ViewAngles[0]
+	if abs32(gotPitch-wantPitch) > 1e-3 {
+		t.Errorf("ViewAngles[PITCH]: got %v want %v (start=0, dy=50, m_pitch=0.022)",
+			gotPitch, wantPitch)
+	}
+
+	// Roll is the rotational axis around the look direction; mouse
+	// must not touch it (Q1 has no mouse-driven roll).
+	if r.ViewAngles[2] != 0 {
+		t.Errorf("ViewAngles[ROLL]: got %v want 0 (mouse must not touch roll)",
+			r.ViewAngles[2])
+	}
+}
+
+// ----- particle pool per-tic step -----------------------------------
+
+func TestRunFrame_ParticlePoolNilSkipsAdvance(t *testing.T) {
+	// Sanity: nil ParticlePool path is the historical default + must
+	// not introduce a panic. Covered implicitly by every existing
+	// happy-path test, but pinned here to lock the guard.
+	r, _ := newRunner(t, backend.NewRecorder(0, 0))
+	if r.ParticlePool != nil {
+		t.Fatalf("expected nil ParticlePool by default")
+	}
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame nil-pool: %v", err)
+	}
+}
+
+func TestRunFrame_ParticlePoolStepAdvancesLiveSlots(t *testing.T) {
+	r, _ := newRunner(t, backend.NewRecorder(0, 0))
+	pool := render.NewPool()
+	// Seed two particles whose lifetimes straddle the per-tic now=1.
+	pool.Spawn(render.Particle{
+		Velocity: [3]float32{10, 0, 100},
+		Die:      10,
+		Type:     render.ParticleGrav,
+	}, 0)
+	pool.Spawn(render.Particle{
+		Velocity: [3]float32{0, 0, 0},
+		Die:      0.5, // < now -> expires this tic
+		Type:     render.ParticleStatic,
+	}, 0)
+	r.ParticlePool = pool
+	r.ParticleGravity = 800
+
+	if err := r.RunFrame(1, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	// First particle survived; Velocity[2] = 100 - dt*gravity*0.05
+	// = 100 - 1*800*0.05 = 60.
+	if got := pool.Particles[0].Velocity[2]; got != 60 {
+		t.Fatalf("alive particle Vel[2] = %v, want 60", got)
+	}
+	// Second particle expired -> Die reset to 0 + NumAlive 1.
+	if pool.Particles[1].Die != 0 {
+		t.Fatalf("expired particle Die = %v, want 0", pool.Particles[1].Die)
+	}
+	if pool.NumAlive != 1 {
+		t.Fatalf("pool.NumAlive = %d, want 1", pool.NumAlive)
+	}
+}
+
+// abs32 is the |x| helper for float32 (Go's math.Abs is float64).
+// Kept package-local to the runloop tests rather than promoted; the
+// numeric-tolerance check sites are all here.
+func abs32(x float32) float32 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// ----- Console tilde toggle + animate --------------------------------
+
+// TestRunFrame_KeyTildeTogglesConsoleOpen verifies the down-edge of
+// KeyTilde flips r.ConsoleOpen. A second down-edge flips it back.
+func TestRunFrame_KeyTildeTogglesConsoleOpen(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	rec.Input = backend.InputSnapshot{KeysDown: []backend.KeyCode{backend.KeyTilde}}
+	r, _ := newRunner(t, rec)
+	if r.ConsoleOpen {
+		t.Fatalf("ConsoleOpen = true on fresh runner; want false")
+	}
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	if !r.ConsoleOpen {
+		t.Fatalf("ConsoleOpen = false after KeyTilde down; want true")
+	}
+	// Second down-edge -> closes.
+	if err := r.RunFrame(0.05, 2); err != nil {
+		t.Fatalf("RunFrame 2: %v", err)
+	}
+	if r.ConsoleOpen {
+		t.Fatalf("ConsoleOpen still true after second KeyTilde down; want false")
+	}
+}
+
+// TestRunFrame_KeyTildeUpDoesNotToggle proves the up-edge alone does
+// NOT flip ConsoleOpen (matches Con_ToggleConsole_f bound on press only).
+func TestRunFrame_KeyTildeUpDoesNotToggle(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	rec.Input = backend.InputSnapshot{KeysUp: []backend.KeyCode{backend.KeyTilde}}
+	r, _ := newRunner(t, rec)
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	if r.ConsoleOpen {
+		t.Fatalf("ConsoleOpen = true after KeyTilde up-only; want false (up-edge is a no-op)")
+	}
+}
+
+// TestRunFrame_ConsoleAnimatesTowardConLinesWhenOpen drives ConsoleOpen=true
+// through one RunFrame and verifies Screen.ConCurrent advanced by exactly
+// ScrollSpeed pixels toward ConLines.
+func TestRunFrame_ConsoleAnimatesTowardConLinesWhenOpen(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	r, _ := newRunner(t, rec)
+	// Force a known ScrollSpeed so the assertion is exact.
+	r.Screen.ScrollSpeed = 4
+	r.Screen.ConCurrent = 0
+	r.ConsoleOpen = true
+
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	if r.Screen.ConCurrent != 4 {
+		t.Fatalf("Screen.ConCurrent = %d after one tick; want 4 (ScrollSpeed)", r.Screen.ConCurrent)
+	}
+}
+
+// TestRunFrame_ConsoleAnimatesTowardZeroWhenClosed: ConsoleOpen=false +
+// pre-opened ConCurrent must retreat toward 0 by ScrollSpeed.
+func TestRunFrame_ConsoleAnimatesTowardZeroWhenClosed(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	r, _ := newRunner(t, rec)
+	r.Screen.ScrollSpeed = 4
+	r.Screen.ConCurrent = 20
+	r.ConsoleOpen = false
+
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	if r.Screen.ConCurrent != 16 {
+		t.Fatalf("Screen.ConCurrent = %d; want 16 (20 - ScrollSpeed)", r.Screen.ConCurrent)
+	}
+}
+
+// TestRunFrame_CenterPrintPlumbedFromClientState verifies that a
+// pre-seeded client.State CenterPrintText / CenterPrintExpiry flows
+// into the renderer + lands on the framebuffer at the 40% anchor.
+func TestRunFrame_CenterPrintPlumbedFromClientState(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	r, _ := newRunner(t, rec)
+	// nowSec passed to RunFrame = 1; expiry well beyond.
+	r.Client.CenterPrintText = "X"
+	r.Client.CenterPrintExpiry = 100
+	// Palette needed so ExpandFrame doesn't trip nil-palette guard.
+	pal := &render.Palette{}
+	r.Palette = pal
+
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	// 'X' glyph at the 40% anchor in the renderer-composed framebuffer.
+	y := r.FrameBuffer.Height * 2 / 5
+	leftX := r.Screen.CenterX - render.CharWidth/2
+	if r.FrameBuffer.Pixels[y*r.FrameBuffer.Pitch+leftX] != 0x68 {
+		t.Fatalf("centerprint glyph pixel = %#x want 0x68 ('X' fill); RunFrame did not plumb centerprint into FrameContext",
+			r.FrameBuffer.Pixels[y*r.FrameBuffer.Pitch+leftX])
+	}
+}
+
+// --- intermissionLines (state-bank-driven scoreboard text) ----------
+
+// nil client returns nil.
+func TestIntermissionLines_NilClientReturnsNil(t *testing.T) {
+	if got := intermissionLines(nil, 0); got != nil {
+		t.Errorf("got %v want nil", got)
+	}
+}
+
+// Client without Intermission flag returns nil.
+func TestIntermissionLines_NoIntermissionReturnsNil(t *testing.T) {
+	cs := client.NewState()
+	if got := intermissionLines(cs, 5); got != nil {
+		t.Errorf("got %v want nil", got)
+	}
+}
+
+// Scoreboard mode (IntermissionText empty): three rows composed from
+// stat bank + elapsed seconds.
+func TestIntermissionLines_ScoreboardMode(t *testing.T) {
+	cs := client.NewState()
+	cs.Intermission = true
+	cs.IntermissionTime = 10.0
+	cs.Stats[protocol.StatSecrets] = 2
+	cs.Stats[protocol.StatTotalSecrets] = 5
+	cs.Stats[protocol.StatMonsters] = 17
+	cs.Stats[protocol.StatTotalMonsters] = 20
+	// elapsed = 75 -> 1:15
+	lines := intermissionLines(cs, 85.0)
+	if len(lines) != 3 {
+		t.Fatalf("len(lines) = %d, want 3", len(lines))
+	}
+	if lines[0] != "TIME: 1:15" {
+		t.Errorf("lines[0] = %q want %q", lines[0], "TIME: 1:15")
+	}
+	if lines[1] != "SECRETS: 2 / 5" {
+		t.Errorf("lines[1] = %q want %q", lines[1], "SECRETS: 2 / 5")
+	}
+	if lines[2] != "MONSTERS: 17 / 20" {
+		t.Errorf("lines[2] = %q want %q", lines[2], "MONSTERS: 17 / 20")
+	}
+}
+
+// Negative elapsed (nowSec < IntermissionTime) clamps to 0 -- mirror
+// of tyrquake's max(0, completed_time) guard.
+func TestIntermissionLines_NegativeElapsedClampedToZero(t *testing.T) {
+	cs := client.NewState()
+	cs.Intermission = true
+	cs.IntermissionTime = 100.0
+	lines := intermissionLines(cs, 5.0) // earlier than IntermissionTime
+	if lines[0] != "TIME: 0:00" {
+		t.Errorf("lines[0] = %q want %q (negative elapsed must clamp)", lines[0], "TIME: 0:00")
+	}
+}
+
+// Finale mode (IntermissionText non-empty): one slice entry per
+// '\n'-separated substring.
+func TestIntermissionLines_FinaleSplitOnNewline(t *testing.T) {
+	cs := client.NewState()
+	cs.Intermission = true
+	cs.IntermissionText = "Episode 1\ncomplete\n\nWell done"
+	lines := intermissionLines(cs, 0)
+	want := []string{"Episode 1", "complete", "", "Well done"}
+	if len(lines) != len(want) {
+		t.Fatalf("len = %d want %d (lines=%v)", len(lines), len(want), lines)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("lines[%d] = %q want %q", i, lines[i], want[i])
+		}
+	}
+}
+
+// Finale mode with empty IntermissionText is NOT reached (the guard
+// would route through scoreboard mode); cover splitLines directly via
+// a single-line credit body.
+func TestIntermissionLines_FinaleSingleLine(t *testing.T) {
+	cs := client.NewState()
+	cs.Intermission = true
+	cs.IntermissionText = "THE END"
+	lines := intermissionLines(cs, 0)
+	if len(lines) != 1 || lines[0] != "THE END" {
+		t.Errorf("got %v want [THE END]", lines)
+	}
+}
+
+// --- itoa + pad2 helpers ---------------------------------------------
+
+func TestItoa(t *testing.T) {
+	cases := []struct {
+		in   int
+		want string
+	}{
+		{0, "0"},
+		{1, "1"},
+		{9, "9"},
+		{10, "10"},
+		{-1, "-1"},
+		{-1234567, "-1234567"},
+		{1234567890, "1234567890"},
+	}
+	for _, c := range cases {
+		if got := itoa(c.in); got != c.want {
+			t.Errorf("itoa(%d) = %q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestPad2(t *testing.T) {
+	cases := []struct {
+		in   int
+		want string
+	}{
+		{0, "00"},
+		{5, "05"},
+		{9, "09"},
+		{10, "10"},
+		{99, "99"},
+		{-3, "00"},
+		{100, "100"},
+	}
+	for _, c := range cases {
+		if got := pad2(c.in); got != c.want {
+			t.Errorf("pad2(%d) = %q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSplitLines_EmptyYieldsSingleEmpty(t *testing.T) {
+	got := splitLines("")
+	if len(got) != 1 || got[0] != "" {
+		t.Errorf("got %v want [\"\"]", got)
+	}
+}
+
+// --- RunFrame intermission plumbing ----------------------------------
+
+// RunFrame: when client.State.Intermission is true, the scoreboard
+// text block lands in the framebuffer (and the in-game centerprint
+// banner is suppressed).
+func TestRunFrame_IntermissionPlumbedFromClientState(t *testing.T) {
+	rec := backend.NewRecorder(0, 0)
+	r, _ := newRunner(t, rec)
+	r.Client.Intermission = true
+	r.Client.IntermissionTime = 0
+	r.Client.Stats[protocol.StatSecrets] = 0
+	r.Client.Stats[protocol.StatTotalSecrets] = 0
+	r.Client.Stats[protocol.StatMonsters] = 0
+	r.Client.Stats[protocol.StatTotalMonsters] = 0
+	pal := &render.Palette{}
+	r.Palette = pal
+
+	if err := r.RunFrame(0.05, 1); err != nil {
+		t.Fatalf("RunFrame: %v", err)
+	}
+	// With three default lines ["TIME: 0:01", "SECRETS: 0 / 0",
+	// "MONSTERS: 0 / 0"], the block is centered around fb.Height/2.
+	// We just assert SOME glyph (not background) lands inside the
+	// vertical band around the middle.
+	mid := r.FrameBuffer.Height / 2
+	row := r.FrameBuffer.Pixels[mid*r.FrameBuffer.Pitch : (mid+1)*r.FrameBuffer.Pitch]
+	hit := false
+	for _, p := range row {
+		if p != r.BackgroundIdx {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		t.Fatalf("RunFrame did not plumb intermission into FrameContext: middle row has no non-background pixel")
+	}
+}

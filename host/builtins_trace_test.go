@@ -112,6 +112,7 @@ func progsForTraceTests() *progs.Progs {
 	maxsName := addStr("maxs")
 	solidName := addStr("solid")
 	chainName := addStr("chain")
+	modelindexName := addStr("modelindex")
 
 	taS := addStr("trace_allsolid")
 	tsS := addStr("trace_startsolid")
@@ -124,7 +125,8 @@ func progsForTraceTests() *progs.Progs {
 	tIwS := addStr("trace_inwater")
 
 	// Entity fields layout: origin@1..3, mins@4..6, maxs@7..9,
-	// solid@10, chain@11. 16 slots = 64 bytes per edict; plenty.
+	// solid@10, chain@11, modelindex@12. 16 slots = 64 bytes per
+	// edict; plenty.
 	const entityFields = 16
 
 	// Globals layout: OfsReturn@1..3, OfsParm0..3 @4..15. Place
@@ -154,6 +156,7 @@ func progsForTraceTests() *progs.Progs {
 			{Type: uint16(progs.EvVector), Ofs: 7, SName: maxsName},
 			{Type: uint16(progs.EvFloat), Ofs: 10, SName: solidName},
 			{Type: uint16(progs.EvEntity), Ofs: 11, SName: chainName},
+			{Type: uint16(progs.EvFloat), Ofs: 12, SName: modelindexName},
 		},
 		GlobalDefs: []progs.Def{
 			{Type: uint16(progs.EvFloat), Ofs: taOfs, SName: taS},
@@ -402,8 +405,11 @@ func TestTraceLine_SkipsSolidNotCandidate(t *testing.T) {
 	}
 }
 
-// Candidate marked SOLID_BSP is skipped (per-entity BrushModel not
-// available in the current port -- see code comment).
+// Candidate marked SOLID_BSP without a `modelindex` entvars field
+// (= the test progs has no such field) is dropped from the candidate
+// list rather than over-occluding via the entity bbox. With a real
+// progs the field is always present; see
+// TestTraceLine_SolidBSPClipsViaBrushModel for the SOLID_BSP hit-path.
 func TestTraceLine_SkipsSolidBSPCandidate(t *testing.T) {
 	h, p := newTraceHost(t, emptyBrushModel(), 4)
 	ed := h.Server.Edicts[1]
@@ -419,7 +425,7 @@ func TestTraceLine_SkipsSolidBSPCandidate(t *testing.T) {
 		t.Fatalf("TraceLine: %v", err)
 	}
 	if res.EntIdx != -1 {
-		t.Errorf("EntIdx: got %d want -1 (SOLID_BSP candidate skipped)", res.EntIdx)
+		t.Errorf("EntIdx: got %d want -1 (SOLID_BSP w/o modelindex skipped)", res.EntIdx)
 	}
 }
 
@@ -461,6 +467,40 @@ func TestTraceLine_NoProgsSkipsCandidates(t *testing.T) {
 	}
 	if res.EntIdx != -1 {
 		t.Errorf("EntIdx: got %d want -1 (no progs -> candidates skipped)", res.EntIdx)
+	}
+}
+
+// SOLID_BSP edict on a progs that has "solid" but no "modelindex"
+// field -> trace must skip rather than crash (covers the
+// ReadFloat("modelindex") err branch).
+func TestTraceLine_SkipsSolidBSPMissingModelindexField(t *testing.T) {
+	h, _ := newTraceHost(t, emptyBrushModel(), 4)
+	// Strings: \x00 + "solid\x00" => "solid" at offset 1.
+	stripped := &progs.Progs{
+		Header:  progs.Header{EntityFields: 16},
+		Strings: append([]byte{0}, []byte("solid\x00")...),
+		FieldDefs: []progs.Def{
+			{Type: uint16(progs.EvFloat), Ofs: 0, SName: 1},
+		},
+	}
+	h.SetProgs(stripped)
+	ed := h.Server.Edicts[1]
+	ev, err := progs.NewEntVars(stripped, ed)
+	if err != nil {
+		t.Fatalf("NewEntVars: %v", err)
+	}
+	if err := ev.WriteFloat("solid", float32(server.SolidBSP)); err != nil {
+		t.Fatalf("WriteFloat solid: %v", err)
+	}
+	h.World.LinkBounds(world.Key(1),
+		[3]float32{3, -2, -2}, [3]float32{7, 2, 2}, world.SolidKindSolid)
+
+	res, err := h.TraceLine([3]float32{-10, 0, 0}, [3]float32{10, 0, 0}, MoveNormal, nil)
+	if err != nil {
+		t.Fatalf("TraceLine: %v", err)
+	}
+	if res.EntIdx != -1 {
+		t.Errorf("EntIdx: got %d want -1 (SOLID_BSP w/o modelindex field skipped)", res.EntIdx)
 	}
 }
 
@@ -974,5 +1014,94 @@ func TestChainEdicts_FieldWriteError(t *testing.T) {
 	_, err := ChainEdicts(p, edicts, []int{1}, nil)
 	if !errors.Is(err, progs.ErrFieldOffset) {
 		t.Errorf("got %v want ErrFieldOffset", err)
+	}
+}
+
+// --- SOLID_BSP traceline ---------------------------------------------------
+
+// SOLID_BSP candidate WITH a populated BrushModels[modelindex] slot
+// clips the trace via the per-entity BrushModel hull (= the door/mover
+// occlusion path). The brushmodel here is a wallHull -- the trace
+// hitting it lands with Fraction < 1 + the hit-entity slot recorded
+// on EntIdx. This is the regression test for batch 92's SOLID_BSP
+// occlusion wiring.
+func TestTraceLine_SolidBSPClipsViaBrushModel(t *testing.T) {
+	h, p := newTraceHost(t, emptyBrushModel(), 4)
+
+	// Park a SOLID_BSP entity at slot 1 with modelindex 2; populate
+	// BrushModels[2] with a wallHull-based brushmodel so the trace
+	// clips against it. Origin is offset by +5 along X so the local
+	// wall's x=0 plane sits at world x=5 -- the trace from x=-10 to
+	// x=+10 should hit at fraction (5 - -10) / (10 - -10) = 0.75.
+	ed := h.Server.Edicts[1]
+	ev, _ := progs.NewEntVars(p, ed)
+	_ = ev.WriteVec3("origin", [3]float32{5, 0, 0})
+	_ = ev.WriteFloat("solid", float32(server.SolidBSP))
+	_ = ev.WriteFloat("modelindex", 2)
+	h.World.LinkBounds(world.Key(1),
+		[3]float32{-10, -64, -64}, [3]float32{20, 64, 64}, world.SolidKindSolid)
+
+	// BrushModel slot 2 = a wallHull. The hull splits on PlaneX at
+	// local x=0: x<0 empty, x>=0 solid.
+	h.Server.BrushModels[2] = wallBrushModel()
+
+	res, err := h.TraceLine([3]float32{-10, 0, 0}, [3]float32{10, 0, 0}, MoveNormal, nil)
+	if err != nil {
+		t.Fatalf("TraceLine: %v", err)
+	}
+	if res.Fraction >= 1 {
+		t.Errorf("Fraction: got %v want <1 (SOLID_BSP should clip)", res.Fraction)
+	}
+	if res.EntIdx != 1 {
+		t.Errorf("EntIdx: got %d want 1 (SOLID_BSP edict)", res.EntIdx)
+	}
+	// PlaneNormal should be the wall's normal (+X) when the door's
+	// brushmodel is the clipper.
+	if res.PlaneNormal == ([3]float32{0, 0, 0}) {
+		t.Errorf("PlaneNormal: got zero, want non-zero on a clipped trace")
+	}
+}
+
+// SOLID_BSP candidate with a modelindex slot that is nil (corrupt
+// submodel carving, or alias/sprite precache slot) is dropped rather
+// than over-occluding via the entity bbox.
+func TestTraceLine_SolidBSPSkipsWhenBrushModelNil(t *testing.T) {
+	h, p := newTraceHost(t, emptyBrushModel(), 4)
+	ed := h.Server.Edicts[1]
+	ev, _ := progs.NewEntVars(p, ed)
+	_ = ev.WriteVec3("origin", [3]float32{5, 0, 0})
+	_ = ev.WriteFloat("solid", float32(server.SolidBSP))
+	_ = ev.WriteFloat("modelindex", 7) // nil slot in fresh BrushModels
+	h.World.LinkBounds(world.Key(1),
+		[3]float32{3, -2, -2}, [3]float32{7, 2, 2}, world.SolidKindSolid)
+
+	res, err := h.TraceLine([3]float32{-10, 0, 0}, [3]float32{10, 0, 0}, MoveNormal, nil)
+	if err != nil {
+		t.Fatalf("TraceLine: %v", err)
+	}
+	if res.EntIdx != -1 {
+		t.Errorf("EntIdx: got %d want -1 (BrushModels[7]==nil)", res.EntIdx)
+	}
+}
+
+// SOLID_BSP candidate with a modelindex out of range of the
+// BrushModels slice is dropped.
+func TestTraceLine_SolidBSPSkipsWhenModelIndexOutOfRange(t *testing.T) {
+	h, p := newTraceHost(t, emptyBrushModel(), 4)
+	ed := h.Server.Edicts[1]
+	ev, _ := progs.NewEntVars(p, ed)
+	_ = ev.WriteVec3("origin", [3]float32{5, 0, 0})
+	_ = ev.WriteFloat("solid", float32(server.SolidBSP))
+	// 9999 is past server.MaxModels.
+	_ = ev.WriteFloat("modelindex", 9999)
+	h.World.LinkBounds(world.Key(1),
+		[3]float32{3, -2, -2}, [3]float32{7, 2, 2}, world.SolidKindSolid)
+
+	res, err := h.TraceLine([3]float32{-10, 0, 0}, [3]float32{10, 0, 0}, MoveNormal, nil)
+	if err != nil {
+		t.Fatalf("TraceLine: %v", err)
+	}
+	if res.EntIdx != -1 {
+		t.Errorf("EntIdx: got %d want -1 (modelindex out of range)", res.EntIdx)
 	}
 }

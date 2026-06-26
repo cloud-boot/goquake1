@@ -1,0 +1,177 @@
+# Top-level Taskfile for cross-cutting engine workflows.
+#
+# Per-target builds (bare-metal tamago) live in their own subdirectory
+# Taskfiles -- this file owns the toolchain-agnostic flows: the
+# browser-side wasm build + the tiny local file server that hosts it.
+#
+# Usage:
+#   task build-wasm     # compiles cmd/quake-wasm to cmd/quake-wasm/web/quake.wasm
+#   task serve-wasm     # binds localhost:8080 to cmd/quake-wasm/web/
+#   task wasm           # build-wasm then serve-wasm (one-step "play in browser")
+#
+# Requires:
+#   - GO pointing at a Go toolchain (defaults to "go" on PATH).
+#     GOOS=js GOARCH=wasm has been a stable Go cross-target since Go 1.11.
+#   - $(go env GOROOT)/lib/wasm/wasm_exec.js -- the runtime glue the
+#     HTML host page loads. Refreshed on every build-wasm so the JS
+#     shim always matches the wasm payload's runtime expectations.
+
+version: "3"
+
+vars:
+  GO:
+    sh: echo "${GO:-go}"
+  WASM_OUT: '{{.TASKFILE_DIR}}/cmd/quake-wasm/web/quake.wasm'
+  WASM_EXEC_DST: '{{.TASKFILE_DIR}}/cmd/quake-wasm/web/wasm_exec.js'
+  WASMBOX_DIR: '{{default "../../wasmdesk/wasmbox" .WASMBOX_DIR}}'
+  WASMBOX_QUAKE_OUT: '{{.WASMBOX_DIR}}/clients/quake/quake.wasm'
+  OCI_OUT: '{{default "/tmp/quake-oci" .OCI_OUT}}'
+  OCI_REGISTRY: '{{default "localhost:5000" .OCI_REGISTRY}}'
+  OCI_TAG: '{{default "quake-assets:1.0" .OCI_TAG}}'
+
+tasks:
+  build-wasm:
+    desc: Compile cmd/quake-wasm to a browser-loadable quake.wasm payload, then refresh the wasm_exec.js shim from the active Go toolchain so the runtime glue matches.
+    cmds:
+      - mkdir -p {{.TASKFILE_DIR}}/cmd/quake-wasm/web
+      - |
+        GOWORK=off GOOS=js GOARCH=wasm "{{.GO}}" build \
+          -trimpath -ldflags '-s -w' \
+          -o "{{.WASM_OUT}}" \
+          ./cmd/quake-wasm/
+
+  build-wasm-oci:
+    desc: Compile cmd/quake-wasm with -tags no_embed_assets so the pak + music ship as OCI layers instead of in the wasm payload (binary stays ~10 MB). $OCI_REFERENCE picks the registry origin baked in via -X main.OCIReference.
+    cmds:
+      - mkdir -p {{.TASKFILE_DIR}}/cmd/quake-wasm/web
+      - |
+        : "${OCI_REFERENCE:?set OCI_REFERENCE to the registry origin, e.g. http://localhost:8080/v2-mock/quake-assets:latest}"
+        GOWORK=off GOOS=js GOARCH=wasm "{{.GO}}" build \
+          -trimpath -tags no_embed_assets \
+          -ldflags "-s -w -X main.OCIReference=$OCI_REFERENCE" \
+          -o "{{.WASM_OUT}}" \
+          ./cmd/quake-wasm/
+      - |
+        WASM_EXEC_SRC=$("{{.GO}}" env GOROOT)/lib/wasm/wasm_exec.js
+        if [ ! -f "$WASM_EXEC_SRC" ]; then
+          WASM_EXEC_SRC=$("{{.GO}}" env GOROOT)/misc/wasm/wasm_exec.js
+        fi
+        cp "$WASM_EXEC_SRC" "{{.WASM_EXEC_DST}}"
+        echo "build-wasm-oci: wrote {{.WASM_OUT}} ($(wc -c < "{{.WASM_OUT}}") bytes); OCI_REFERENCE=$OCI_REFERENCE"
+      - |
+        WASM_EXEC_SRC=$("{{.GO}}" env GOROOT)/lib/wasm/wasm_exec.js
+        if [ ! -f "$WASM_EXEC_SRC" ]; then
+          WASM_EXEC_SRC=$("{{.GO}}" env GOROOT)/misc/wasm/wasm_exec.js
+        fi
+        if [ ! -f "$WASM_EXEC_SRC" ]; then
+          echo "build-wasm: wasm_exec.js missing from active Go toolchain" >&2
+          exit 1
+        fi
+        cp "$WASM_EXEC_SRC" "{{.WASM_EXEC_DST}}"
+      - |
+        echo "build-wasm: wrote {{.WASM_OUT}} ($(wc -c < "{{.WASM_OUT}}") bytes)"
+        echo "build-wasm: refreshed {{.WASM_EXEC_DST}}"
+
+  serve-wasm:
+    desc: Serve cmd/quake-wasm/web/ on localhost:8080 (blocks until Ctrl-C). Open http://localhost:8080/ in any modern browser to play.
+    cmds:
+      - |
+        echo "serve-wasm: open http://localhost:8080/"
+        GOWORK=off "{{.GO}}" run ./cmd/serve-wasm/
+
+  wasm:
+    desc: One-step browser-play -- build the wasm payload, then serve it on localhost:8080.
+    deps: [build-wasm]
+    cmds:
+      - task: serve-wasm
+
+  # ----- wasmbox windowed client (Quake fenêtré dans wasmdesk/wasmbox) -----
+
+  build-wasmbox-client:
+    desc: Build cmd/quake-wasmbox into {{.WASMBOX_QUAKE_OUT}} so wasmbox can spawn Quake as an external window-client (embeds the local pak + music, wasm ~200 MB).
+    cmds:
+      - mkdir -p "{{.WASMBOX_DIR}}/clients/quake"
+      - |
+        if [ ! -d "{{.WASMBOX_DIR}}" ]; then
+          echo "wasmbox dir not found: {{.WASMBOX_DIR}}" >&2
+          echo "set WASMBOX_DIR to the wasmbox checkout, e.g. WASMBOX_DIR=~/code/wasmbox" >&2
+          exit 1
+        fi
+      - |
+        GOWORK=off GOOS=js GOARCH=wasm "{{.GO}}" build \
+          -trimpath -ldflags '-s -w' \
+          -o "{{.WASMBOX_QUAKE_OUT}}" \
+          ./cmd/quake-wasmbox/
+      - 'echo "build-wasmbox-client: wrote {{.WASMBOX_QUAKE_OUT}} ($(wc -c < "{{.WASMBOX_QUAKE_OUT}}") bytes)"'
+
+  build-wasmbox-client-oci:
+    desc: Build cmd/quake-wasmbox with -tags no_embed_assets so wasm stays ~12 MB and assets are streamed from $OCI_REFERENCE (default http://{{.OCI_REGISTRY}}/{{.OCI_TAG}}). The /v2/ prefix is added by ociassets.Client at fetch time -- do NOT include it in the reference.
+    cmds:
+      - mkdir -p "{{.WASMBOX_DIR}}/clients/quake"
+      - |
+        OCI_REFERENCE="${OCI_REFERENCE:-http://{{.OCI_REGISTRY}}/{{.OCI_TAG}}}"
+        GOWORK=off GOOS=js GOARCH=wasm "{{.GO}}" build \
+          -trimpath -tags no_embed_assets \
+          -ldflags "-s -w -X main.OCIReference=$OCI_REFERENCE" \
+          -o "{{.WASMBOX_QUAKE_OUT}}" \
+          ./cmd/quake-wasmbox/
+        echo "build-wasmbox-client-oci: wrote {{.WASMBOX_QUAKE_OUT}} ($(wc -c < "{{.WASMBOX_QUAKE_OUT}}") bytes); OCI_REFERENCE=$OCI_REFERENCE"
+
+  demo-wasmbox:
+    desc: One-shot demo -- build quake-wasmbox client with embedded assets + start wasmbox at http://localhost:8080. Open the page then right-click desktop -> spawn quake (or run wasmboxSpawnExternal('clients/quake/worker.js') in console).
+    deps: [build-wasmbox-client]
+    cmds:
+      - 'echo "demo-wasmbox: starting wasmbox; open http://localhost:8080/ then spawn Quake"'
+      - task -d "{{.WASMBOX_DIR}}" serve
+
+  # ----- OCI asset streaming (full architecture) -----
+
+  oci-pack:
+    desc: Pack local embedpak/empty.pak + embedmusic/*.ogg into an OCI image layout at {{.OCI_OUT}} (ready for `oras push`).
+    env:
+      GOWORK: "off"
+    cmds:
+      - 'rm -rf "{{.OCI_OUT}}"'
+      - '"{{.GO}}" run ./cmd/oci-pack-quake/ -out "{{.OCI_OUT}}"'
+      - 'echo "oci-pack: wrote {{.OCI_OUT}} ($(du -sh "{{.OCI_OUT}}" | cut -f1)); next: task oci-registry-up + task oci-push"'
+
+  oci-registry-up:
+    desc: 'Spin up a local OCI registry on :5000 via Docker (requires Docker; reusable, --rm removes on stop). CORS + Cross-Origin-Resource-Policy headers let the wasmbox quake worker fetch under COEP=require-corp.'
+    cmds:
+      - |
+        if docker ps --format '{{`{{.Names}}`}}' | grep -q '^oci-registry$'; then
+          echo "oci-registry already running"
+        else
+          docker run -d -p 5000:5000 --rm --name oci-registry \
+            -e 'REGISTRY_HTTP_HEADERS_Access-Control-Allow-Origin=["*"]' \
+            -e 'REGISTRY_HTTP_HEADERS_Access-Control-Allow-Methods=[HEAD, GET, OPTIONS]' \
+            -e 'REGISTRY_HTTP_HEADERS_Access-Control-Allow-Headers=[Accept, Authorization, Content-Type]' \
+            -e 'REGISTRY_HTTP_HEADERS_Access-Control-Expose-Headers=[Docker-Content-Digest, Content-Length]' \
+            -e 'REGISTRY_HTTP_HEADERS_Cross-Origin-Resource-Policy=[cross-origin]' \
+            registry:2
+          echo "oci-registry: up on http://localhost:5000 (CORS + CORP enabled for wasmbox cross-origin fetch)"
+        fi
+
+  oci-registry-down:
+    desc: Stop + remove the local OCI registry container.
+    cmds:
+      - docker rm -f oci-registry 2>/dev/null || true
+
+  oci-push:
+    desc: Push the packed image layout at {{.OCI_OUT}} to {{.OCI_REGISTRY}}/{{.OCI_TAG}} via the bundled pure-Go pusher (no external CLI).
+    env:
+      GOWORK: "off"
+    cmds:
+      - '"{{.GO}}" run ./cmd/oci-push-quake/ -in "{{.OCI_OUT}}" -ref "{{.OCI_REGISTRY}}/{{.OCI_TAG}}"'
+
+  demo-wasmbox-oci:
+    desc: One-shot OCI demo -- pack pak+music, spin up local registry, push, build OCI client, start wasmbox. Requires Docker + oras CLI.
+    cmds:
+      - task: oci-pack
+      - task: oci-registry-up
+      - task: oci-push
+      - task: build-wasmbox-client-oci
+        vars:
+          OCI_REFERENCE: 'http://{{.OCI_REGISTRY}}/{{.OCI_TAG}}'
+      - 'echo "demo-wasmbox-oci: starting wasmbox; open http://localhost:8080/ -> spawn quake"'
+      - task -d "{{.WASMBOX_DIR}}" serve

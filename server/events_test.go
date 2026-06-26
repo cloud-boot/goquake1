@@ -66,6 +66,77 @@ func TestServer_StartParticle_NilDatagram(t *testing.T) {
 	}
 }
 
+// --- FireLightning ----------------------------------------------------------
+
+// Happy path: NewServer + FireLightning -> Datagram holds the 16-byte
+// svc_temp_entity TE_LIGHTNING2 wire shape and decodes back to the
+// inputs.
+func TestServer_FireLightning_HappyPath(t *testing.T) {
+	s := NewServer()
+	s.Protocol = protocol.VersionNQ
+	if err := s.FireLightning(protocol.TELightning2, 7,
+		[3]float32{1, 2, 3}, [3]float32{61, 2, 3}); err != nil {
+		t.Fatalf("FireLightning: %v", err)
+	}
+	if s.Datagram.Len() != 16 {
+		t.Fatalf("wire size: got %d want 16", s.Datagram.Len())
+	}
+	r := msg.NewReader(s.Datagram.Bytes())
+	if cmd := r.ReadU8(); cmd != protocol.SvcTempEntity {
+		t.Errorf("cmd: got %d want SvcTempEntity(%d)", cmd, protocol.SvcTempEntity)
+	}
+	if k := r.ReadU8(); k != protocol.TELightning2 {
+		t.Errorf("kind: got %d want TELightning2(%d)", k, protocol.TELightning2)
+	}
+	if e := r.ReadShort(); e != 7 {
+		t.Errorf("entity: got %d want 7", e)
+	}
+}
+
+// Datagram near full -> propagated ErrDatagramFull.
+func TestServer_FireLightning_DatagramFull(t *testing.T) {
+	s := NewServer()
+	filler := make([]byte, MaxDatagram-lightningReserve+1)
+	if err := s.Datagram.Write(filler); err != nil {
+		t.Fatal(err)
+	}
+	err := s.FireLightning(protocol.TELightning2, 1,
+		[3]float32{}, [3]float32{30, 0, 0})
+	if !errors.Is(err, ErrDatagramFull) {
+		t.Errorf("got %v want ErrDatagramFull", err)
+	}
+}
+
+// Nil receiver -> ErrNilServer.
+func TestServer_FireLightning_NilReceiver(t *testing.T) {
+	var s *Server
+	err := s.FireLightning(protocol.TELightning2, 0,
+		[3]float32{}, [3]float32{30, 0, 0})
+	if !errors.Is(err, ErrNilServer) {
+		t.Errorf("got %v want ErrNilServer", err)
+	}
+}
+
+// Server with no Datagram -> ErrNilDatagram.
+func TestServer_FireLightning_NilDatagram(t *testing.T) {
+	s := &Server{}
+	err := s.FireLightning(protocol.TELightning2, 0,
+		[3]float32{}, [3]float32{30, 0, 0})
+	if !errors.Is(err, ErrNilDatagram) {
+		t.Errorf("got %v want ErrNilDatagram", err)
+	}
+}
+
+// Bad kind -> ErrLightningKind propagates through the wrapper.
+func TestServer_FireLightning_BadKind(t *testing.T) {
+	s := NewServer()
+	err := s.FireLightning(0x42, 0,
+		[3]float32{}, [3]float32{30, 0, 0})
+	if !errors.Is(err, ErrLightningKind) {
+		t.Errorf("got %v want ErrLightningKind", err)
+	}
+}
+
 // --- StartSound -------------------------------------------------------------
 
 // withSound returns a NewServer whose Protocol is set and whose
